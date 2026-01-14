@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional, Literal
+from typing import Optional
 
-from pydantic import BaseModel, Field, conint
-
-
-ProjectName = Literal["haven", "onestream", "personal"]
-Energy = Literal["low", "med", "high"]
+from pydantic import BaseModel, Field
 
 
 class GoalCreate(BaseModel):
@@ -30,53 +26,44 @@ class GoalOut(BaseModel):
 
 class TaskCreate(BaseModel):
     title: str = Field(min_length=2, max_length=250)
-
     goal_id: Optional[int] = None
     notes: Optional[str] = None
     due_date: Optional[date] = None
-
-    priority: conint(ge=1, le=5) = 3
-    estimated_minutes: conint(ge=5, le=480) = 30
+    priority: int = Field(default=3, ge=1, le=5)
+    estimated_minutes: int = Field(default=30, ge=5, le=480)
     blocks_me: bool = False
 
-    # new metadata
-    project: Optional[ProjectName] = None
+    # new
+    project: Optional[str] = None
     tags: Optional[str] = None
     link: Optional[str] = None
     starter: Optional[str] = None
     dod: Optional[str] = None
-
-    impact_score: Optional[conint(ge=1, le=5)] = None
-    confidence: Optional[conint(ge=1, le=5)] = None
-    energy: Optional[Energy] = None
-
+    impact_score: Optional[int] = Field(default=None, ge=1, le=5)
+    confidence: Optional[int] = Field(default=None, ge=1, le=5)
+    energy: Optional[str] = None
     parent_task_id: Optional[int] = None
 
 
 class TaskUpdate(BaseModel):
     title: Optional[str] = Field(default=None, min_length=2, max_length=250)
-
     goal_id: Optional[int] = None
     notes: Optional[str] = None
     due_date: Optional[date] = None
-
-    priority: Optional[conint(ge=1, le=5)] = None
-    estimated_minutes: Optional[conint(ge=5, le=480)] = None
+    priority: Optional[int] = Field(default=None, ge=1, le=5)
+    estimated_minutes: Optional[int] = Field(default=None, ge=5, le=480)
     blocks_me: Optional[bool] = None
-
     completed: Optional[bool] = None
 
-    # new metadata
-    project: Optional[ProjectName] = None
+    # new
+    project: Optional[str] = None
     tags: Optional[str] = None
     link: Optional[str] = None
     starter: Optional[str] = None
     dod: Optional[str] = None
-
-    impact_score: Optional[conint(ge=1, le=5)] = None
-    confidence: Optional[conint(ge=1, le=5)] = None
-    energy: Optional[Energy] = None
-
+    impact_score: Optional[int] = Field(default=None, ge=1, le=5)
+    confidence: Optional[int] = Field(default=None, ge=1, le=5)
+    energy: Optional[str] = None
     parent_task_id: Optional[int] = None
 
 
@@ -93,6 +80,7 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime]
     created_at: datetime
 
+    # new
     project: Optional[str]
     tags: Optional[str]
     link: Optional[str]
