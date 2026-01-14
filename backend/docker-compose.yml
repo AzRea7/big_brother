@@ -1,0 +1,11 @@
+services:
+  goal_autopilot:
+    build: .
+    container_name: goal_autopilot
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
