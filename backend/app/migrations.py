@@ -10,7 +10,6 @@ def _has_column(engine: Engine, table: str, col: str) -> bool:
 
 
 def _add_column_sqlite(engine: Engine, table: str, col: str, col_ddl: str) -> None:
-    # SQLite supports ADD COLUMN (with limits). Good enough for your use case.
     with engine.begin() as conn:
         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_ddl}"))
 
@@ -21,42 +20,31 @@ def _ensure_table(engine: Engine, ddl: str) -> None:
 
 
 def ensure_schema(engine: Engine) -> None:
-    """
-    Lightweight migrations:
-    - Adds new Task columns if missing
-    - Creates task_dependencies + plan_runs tables if missing
-    Works on SQLite without Alembic.
-    """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
 
-    # ---- Task columns (Improvement 1/3/4) ----
+    # ---- Goal.project ----
+    if "goals" in tables:
+        if not _has_column(engine, "goals", "project"):
+            _add_column_sqlite(engine, "goals", "project", "VARCHAR(32)")
+
+    # ---- Task fields ----
     if "tasks" in tables:
-        # project/tags/link/starter/dod
-        if not _has_column(engine, "tasks", "project"):
-            _add_column_sqlite(engine, "tasks", "project", "VARCHAR(32)")
-        if not _has_column(engine, "tasks", "tags"):
-            _add_column_sqlite(engine, "tasks", "tags", "TEXT")
-        if not _has_column(engine, "tasks", "link"):
-            _add_column_sqlite(engine, "tasks", "link", "TEXT")
-        if not _has_column(engine, "tasks", "starter"):
-            _add_column_sqlite(engine, "tasks", "starter", "TEXT")
-        if not _has_column(engine, "tasks", "dod"):
-            _add_column_sqlite(engine, "tasks", "dod", "TEXT")
+        for col, ddl in [
+            ("project", "VARCHAR(32)"),
+            ("tags", "TEXT"),
+            ("link", "TEXT"),
+            ("starter", "TEXT"),
+            ("dod", "TEXT"),
+            ("impact_score", "INTEGER"),
+            ("confidence", "INTEGER"),
+            ("energy", "VARCHAR(16)"),
+            ("parent_task_id", "INTEGER"),
+        ]:
+            if not _has_column(engine, "tasks", col):
+                _add_column_sqlite(engine, "tasks", col, ddl)
 
-        # precision scoring
-        if not _has_column(engine, "tasks", "impact_score"):
-            _add_column_sqlite(engine, "tasks", "impact_score", "INTEGER")
-        if not _has_column(engine, "tasks", "confidence"):
-            _add_column_sqlite(engine, "tasks", "confidence", "INTEGER")
-        if not _has_column(engine, "tasks", "energy"):
-            _add_column_sqlite(engine, "tasks", "energy", "VARCHAR(16)")
-
-        # microtasks
-        if not _has_column(engine, "tasks", "parent_task_id"):
-            _add_column_sqlite(engine, "tasks", "parent_task_id", "INTEGER")
-
-    # ---- Dependencies table (Improvement 2) ----
+    # ---- Dependencies ----
     if "task_dependencies" not in tables:
         _ensure_table(
             engine,
@@ -71,7 +59,7 @@ def ensure_schema(engine: Engine) -> None:
             """,
         )
 
-    # ---- Plan runs table (Improvement 5) ----
+    # ---- Plan runs ----
     if "plan_runs" not in tables:
         _ensure_table(
             engine,

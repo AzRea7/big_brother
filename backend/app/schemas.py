@@ -10,6 +10,7 @@ class GoalCreate(BaseModel):
     title: str = Field(min_length=2, max_length=200)
     why: Optional[str] = None
     target_date: Optional[date] = None
+    project: Optional[str] = None  # haven | onestream | personal
 
 
 class GoalOut(BaseModel):
@@ -17,6 +18,7 @@ class GoalOut(BaseModel):
     title: str
     why: Optional[str]
     target_date: Optional[date]
+    project: Optional[str]
     is_archived: bool
     created_at: datetime
 
@@ -33,7 +35,6 @@ class TaskCreate(BaseModel):
     estimated_minutes: int = Field(default=30, ge=5, le=480)
     blocks_me: bool = False
 
-    # new
     project: Optional[str] = None
     tags: Optional[str] = None
     link: Optional[str] = None
@@ -55,7 +56,6 @@ class TaskUpdate(BaseModel):
     blocks_me: Optional[bool] = None
     completed: Optional[bool] = None
 
-    # new
     project: Optional[str] = None
     tags: Optional[str] = None
     link: Optional[str] = None
@@ -80,7 +80,6 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime]
     created_at: datetime
 
-    # new
     project: Optional[str]
     tags: Optional[str]
     link: Optional[str]
