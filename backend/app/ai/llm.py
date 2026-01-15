@@ -11,60 +11,72 @@ from .prompts import SYSTEM_PROMPT
 
 class LLMClient:
     """
-    OpenAI-compatible chat-completions client that works with:
-    - LM Studio local OpenAI-compatible server
-    - Any OpenAI-compatible endpoint
+    OpenAI-compatible chat-completions client.
 
-    Key fixes:
-    - Doesn't require a "real" API key (dummy works)
-    - Uses long read timeout so local generation won't disconnect
-    - Forces non-streaming responses for simpler clients
-    - Limits output length for speed
+    Works with:
+    - OpenAI
+    - LM Studio / local OpenAI-compatible servers
+
+    Key behavior:
+    - LLM must be intentionally enabled by configuration (if LLM_ENABLED exists)
+    - Uses a minimal payload for compatibility
+    - On HTTP error, includes response body to diagnose 400s
     """
 
     def __init__(self) -> None:
-        self.base_url = settings.OPENAI_BASE_URL.rstrip("/")
-        self.api_key = settings.OPENAI_API_KEY
-        self.model = settings.OPENAI_MODEL
+        self.base_url = (getattr(settings, "OPENAI_BASE_URL", "") or "").rstrip("/")
+        self.api_key = getattr(settings, "OPENAI_API_KEY", None)
+        self.model = (getattr(settings, "OPENAI_MODEL", "") or "").strip()
+        self.llm_enabled_flag = getattr(settings, "LLM_ENABLED", None)
 
     def enabled(self) -> bool:
-        # For LM Studio, API key can be 'dummy' (still counts as enabled),
-        # and model/base_url must exist.
+        # If the app has an explicit flag, respect it
+        if self.llm_enabled_flag is not None and not bool(self.llm_enabled_flag):
+            return False
+
+        # Otherwise: enabled only if base_url + model are present
         return bool(self.base_url) and bool(self.model)
 
     async def generate(self, user_prompt: str) -> str:
         if not self.enabled():
-            raise RuntimeError("LLM not enabled (missing OPENAI_BASE_URL or OPENAI_MODEL)")
+            raise RuntimeError("LLM not enabled (set LLM_ENABLED=true and/or OPENAI_BASE_URL + OPENAI_MODEL)")
 
         url = f"{self.base_url}/chat/completions"
 
         headers = {"Content-Type": "application/json"}
-        # LM Studio usually ignores auth, but keep for compatibility
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        # Minimal, widely compatible payload for LM Studio / OpenAI-compatible servers.
         payload: dict[str, Any] = {
             "model": self.model,
-            "stream": False,      # IMPORTANT: avoid streaming to prevent client issues
-            "temperature": 0.25,
-            "max_tokens": 350,    # IMPORTANT: keep it short so it finishes fast
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            "temperature": 0.2,
+            "max_tokens": 350,
         }
 
-        timeout = httpx.Timeout(
-            connect=10.0,
-            read=240.0,   # IMPORTANT: >30s so your local model can finish
-            write=30.0,
-            pool=10.0,
-        )
+        timeout = httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=10.0)
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, content=json.dumps(payload))
-            r.raise_for_status()
-            data = r.json()
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, content=json.dumps(payload))
+                r.raise_for_status()
+                data = r.json()
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text
+            except Exception:
+                body = ""
+            raise RuntimeError(
+                f"LLM HTTP error {e.response.status_code} from {url}. "
+                f"Response body: {body[:500]}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"LLM request failed to {url}: {e}") from e
 
         try:
             return data["choices"][0]["message"]["content"].strip()

@@ -1,9 +1,10 @@
+# backend/app/routes/tasks.py
 from __future__ import annotations
 
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Task
@@ -24,15 +25,15 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> TaskOut:
 
 @router.get("", response_model=list[TaskOut])
 def list_tasks(
-    include_completed: bool = Query(default=False),
     project: str | None = Query(default=None),
+    include_completed: bool = Query(default=False),
     db: Session = Depends(get_db),
 ) -> list[TaskOut]:
     stmt = select(Task)
-    if not include_completed:
-        stmt = stmt.where(Task.completed == False)  # noqa: E712
     if project:
         stmt = stmt.where(Task.project == project)
+    if not include_completed:
+        stmt = stmt.where(Task.completed == False)  # noqa: E712
     return list(db.scalars(stmt).all())
 
 
@@ -44,7 +45,6 @@ def update_task(task_id: int, payload: TaskUpdate, db: Session = Depends(get_db)
 
     data = payload.model_dump(exclude_unset=True)
 
-    # handle completed toggle
     if "completed" in data:
         new_val = bool(data["completed"])
         if new_val and not t.completed:
@@ -63,11 +63,28 @@ def update_task(task_id: int, payload: TaskUpdate, db: Session = Depends(get_db)
     return t
 
 
-@router.post("/{task_id}/complete")
-async def complete_task(task_id: int, db: Session = Depends(get_db)):
+@router.post("/{task_id}/complete", response_model=TaskOut)
+def complete_task(task_id: int, db: Session = Depends(get_db)) -> TaskOut:
+    t = db.get(Task, task_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not t.completed:
+        t.completed = True
+        t.completed_at = datetime.utcnow()
+        db.commit()
+        db.refresh(t)
+    return t
+
+
+@router.post("/{task_id}/complete_and_refresh")
+async def complete_and_refresh(
+    task_id: int,
+    project: str | None = Query(default=None),
+    mode: str = Query(default="single"),
+    db: Session = Depends(get_db),
+):
     """
-    Marks task complete AND returns the next plan for that task's lane.
-    This is what makes it feel like an autopilot instead of a dead to-do list.
+    Mark task complete, then regenerate the plan so the user gets the next steps instantly.
     """
     t = db.get(Task, task_id)
     if not t:
@@ -79,12 +96,12 @@ async def complete_task(task_id: int, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(t)
 
-    lane = t.project or "haven"
-    plan = await generate_daily_plan(db=db, focus_project=lane, mode="single")
-
+    # default to task's project if not provided
+    focus_project = project or t.project
+    out = await generate_daily_plan(db=db, focus_project=focus_project, mode=mode)
     return {
         "task": TaskOut.model_validate(t).model_dump(),
-        "next_plan": {"generated_at": plan.generated_at.isoformat(), "content": plan.content},
+        "new_plan": {"generated_at": out.generated_at.isoformat(), "content": out.content},
     }
 
 
