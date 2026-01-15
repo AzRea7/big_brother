@@ -11,12 +11,21 @@ class Settings(BaseSettings):
     TZ: str = "America/Detroit"
     PORT: int = 8000
 
+    # Used in email links. In dev you can leave it as localhost.
+    # In production, set to your real domain (https://goal.yourdomain.com).
+    PUBLIC_BASE_URL: str = "http://127.0.0.1:8000"
+
     DB_URL: str = "sqlite:///./data/app.db"
 
+    # Scheduler controls
     DAILY_PLAN_HOUR: int = 7
     DAILY_PLAN_MINUTE: int = 30
     MIDDAY_NUDGE_HOUR: int = 13
     MIDDAY_NUDGE_MINUTE: int = 0
+
+    # What the scheduler sends
+    DAILY_PLAN_MODE: str = "single"   # single | split
+    DAILY_PLAN_PROJECT: str = "onestream"  # haven | onestream | (ignored in split)
 
     WEBHOOK_URL: str | None = None
 
@@ -30,16 +39,6 @@ class Settings(BaseSettings):
     # --- LLM (OFF by default) ---
     LLM_ENABLED: bool = False
 
-    # If you enable it, you must set these appropriately.
-    # For OpenAI:
-    #   OPENAI_BASE_URL=https://api.openai.com/v1
-    #   OPENAI_API_KEY=...
-    #   OPENAI_MODEL=gpt-4o-mini (or whatever you want)
-    #
-    # For LM Studio (local OpenAI-compatible server):
-    #   OPENAI_BASE_URL=http://127.0.0.1:1234/v1
-    #   OPENAI_API_KEY=dummy
-    #   OPENAI_MODEL=your-local-model-name
     OPENAI_BASE_URL: str = ""
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = ""

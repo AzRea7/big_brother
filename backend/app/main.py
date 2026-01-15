@@ -15,7 +15,7 @@ from .routes.tasks import router as tasks_router
 from .routes.debug import router as debug_router
 from .routes.ui import router as ui_router
 from .services.scheduler import start_scheduler, shutdown_scheduler
-
+from .routes.dashboard import router as dashboard_router    
 
 app = FastAPI(title="Goal Autopilot")
 
@@ -60,3 +60,4 @@ app.include_router(goals_router)
 app.include_router(tasks_router)
 app.include_router(debug_router)
 app.include_router(ui_router)
+app.include_router(dashboard_router)
