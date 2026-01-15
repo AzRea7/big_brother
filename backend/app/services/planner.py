@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from ..models import Goal, Task, TaskDependency, PlanRun
 from ..schemas import PlanOut
@@ -61,9 +62,7 @@ def _dependency_blocked_ids(db: Session, task_ids: list[int]) -> set[int]:
         return set()
 
     deps = list(
-        db.scalars(
-            select(TaskDependency).where(TaskDependency.task_id.in_(task_ids))
-        ).all()
+        db.scalars(select(TaskDependency).where(TaskDependency.task_id.in_(task_ids))).all()
     )
     if not deps:
         return set()
@@ -109,6 +108,22 @@ def _deterministic_sort_key(t: Task):
     )
 
 
+def _extract_top_task_ids(plan_text: str, top_n: int) -> list[int]:
+    """
+    Parses IDs from the required output format:
+      - **[id]** Title @ ...
+    Returns up to top_n unique IDs, in order.
+    """
+    ids: list[int] = []
+    for m in re.finditer(r"\*\*\[(\d+)\]\*\*", plan_text):
+        tid = int(m.group(1))
+        if tid not in ids:
+            ids.append(tid)
+        if len(ids) >= top_n:
+            break
+    return ids
+
+
 def _fetch_lane(db: Session, project: str) -> tuple[list[Goal], list[Task]]:
     goals = list(
         db.scalars(
@@ -118,15 +133,20 @@ def _fetch_lane(db: Session, project: str) -> tuple[list[Goal], list[Task]]:
             )
         ).all()
     )
+    goal_ids = [g.id for g in goals]
 
-    tasks = list(
-        db.scalars(
-            select(Task).where(
-                Task.completed == False,  # noqa: E712
-                Task.project == project,
-            )
-        ).all()
+    # ✅ Backward compatible:
+    # - tasks explicitly tagged with lane
+    # - OR tasks with project NULL but whose goal is in lane
+    stmt = select(Task).where(
+        Task.completed == False,  # noqa: E712
+        or_(
+            Task.project == project,
+            (Task.project == None) & (Task.goal_id.in_(goal_ids)) if goal_ids else False,  # noqa: E711
+        ),
     )
+
+    tasks = list(db.scalars(stmt).all())
 
     blocked_ids = _dependency_blocked_ids(db, [t.id for t in tasks])
     tasks = [t for t in tasks if t.id not in blocked_ids]
@@ -150,14 +170,27 @@ async def _generate_lane_plan(db: Session, project: str, top_n: int) -> tuple[st
 
     if llm.enabled():
         content = await llm.generate(user_prompt)
+        chosen_ids = _extract_top_task_ids(content, top_n=top_n)
+
+        chosen_tasks: list[Task] = []
+        if chosen_ids:
+            for tid in chosen_ids:
+                t = db.get(Task, tid)
+                if t and not t.completed:
+                    chosen_tasks.append(t)
+
+        # Fallback: if parsing fails, use deterministic top_n from pool
+        if not chosen_tasks:
+            chosen_tasks = pool[:top_n]
+
     else:
         # deterministic fallback
-        top = pool[:top_n]
+        chosen_tasks = pool[:top_n]
         start_times = ["09:00", "10:00", "11:00"]
         lines: list[str] = []
         lines.append(f"Lane: {project}")
         lines.append("1) Top 3")
-        for i, t in enumerate(top):
+        for i, t in enumerate(chosen_tasks):
             lines.append(f"- **[{t.id}]** {t.title} @ {start_times[i]} ({t.estimated_minutes}m)")
             lines.append(f"  Starter (2 min): {t.starter or 'MISSING — create starter in task.'}")
             lines.append(f"  DoD: {t.dod or 'MISSING — define measurable outcome.'}")
@@ -168,11 +201,11 @@ async def _generate_lane_plan(db: Session, project: str, top_n: int) -> tuple[st
             lines.append("")
         content = "\n".join(lines).strip()
 
-    # microtasks for the chosen top tasks
-    for t in pool[:top_n]:
+    # ✅ Microtasks for the ACTUAL chosen tasks
+    for t in chosen_tasks:
         await generate_microtasks(db, t, llm)
 
-    return content, pool[:top_n]
+    return content, chosen_tasks
 
 
 async def generate_daily_plan(
@@ -183,10 +216,8 @@ async def generate_daily_plan(
     """
     mode:
       - single: one lane only (requires focus_project)
-      - split: 2 haven + 1 onestream (default split)
+      - split: 2 haven + 1 onestream
     """
-    today = date.today()
-
     if mode == "split":
         haven_content, haven_top = await _generate_lane_plan(db, "haven", top_n=2)
         os_content, os_top = await _generate_lane_plan(db, "onestream", top_n=1)
@@ -202,7 +233,6 @@ async def generate_daily_plan(
         ).strip()
 
         top_ids = ",".join([*(str(t.id) for t in haven_top), *(str(t.id) for t in os_top)])
-
         db.add(PlanRun(project="split", top_task_ids=top_ids, content=content))
         db.commit()
 
