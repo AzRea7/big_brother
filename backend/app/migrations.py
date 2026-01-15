@@ -1,3 +1,4 @@
+# backend/app/migrations.py
 from __future__ import annotations
 
 from sqlalchemy import Engine, inspect, text
@@ -73,3 +74,42 @@ def ensure_schema(engine: Engine) -> None:
             )
             """,
         )
+
+    # ---- Repo snapshots ----
+    if "repo_snapshots" not in tables:
+        _ensure_table(
+            engine,
+            """
+            CREATE TABLE IF NOT EXISTS repo_snapshots (
+              id INTEGER PRIMARY KEY,
+              repo VARCHAR(200) NOT NULL,
+              branch VARCHAR(80) NOT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              commit_sha VARCHAR(80),
+              file_count INTEGER DEFAULT 0,
+              stored_content_files INTEGER DEFAULT 0,
+              warnings_json TEXT
+            )
+            """,
+        )
+
+    if "repo_files" not in tables:
+        _ensure_table(
+            engine,
+            """
+            CREATE TABLE IF NOT EXISTS repo_files (
+              id INTEGER PRIMARY KEY,
+              snapshot_id INTEGER NOT NULL,
+              path VARCHAR(600) NOT NULL,
+              sha VARCHAR(80),
+              size INTEGER,
+              content TEXT,
+              content_kind VARCHAR(16) DEFAULT 'skipped',
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+
+        # indexes (SQLite friendly)
+        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_snapshot ON repo_files(snapshot_id)")
+        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(path)")
