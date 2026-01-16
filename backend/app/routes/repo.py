@@ -43,13 +43,35 @@ async def sync_repo(
     }
 
 
-# ✅ renamed to avoid shadowing latest_repo_snapshot import
+# NOTE:
+# Keep the route name distinct from the imported service function `latest_repo_snapshot`
+# to avoid shadowing and kwarg TypeErrors.
 @router.get("/latest_snapshot")
-def latest_snapshot_debug(db: Session = Depends(get_db)):
-    snap = db.execute(select(RepoSnapshot).order_by(RepoSnapshot.id.desc())).scalars().first()
+def latest_snapshot_debug(
+    db: Session = Depends(get_db),
+    repo: Optional[str] = Query(default=None),
+    branch: Optional[str] = Query(default=None),
+):
+    """
+    Returns the latest snapshot, optionally filtered by repo/branch.
+    This is useful for debugging without touching the UI.
+    """
+    if repo or branch:
+        snap = latest_repo_snapshot(db, repo=repo, branch=branch)
+    else:
+        snap = db.execute(select(RepoSnapshot).order_by(RepoSnapshot.id.desc())).scalars().first()
+
     if not snap:
         return {"snapshot_id": None}
-    return {"snapshot_id": snap.id, "repo": snap.repo, "branch": snap.branch, "commit_sha": snap.commit_sha}
+
+    return {
+        "snapshot_id": snap.id,
+        "repo": snap.repo,
+        "branch": snap.branch,
+        "commit_sha": snap.commit_sha,
+        "file_count": snap.file_count,
+        "stored_content_files": snap.stored_content_files,
+    }
 
 
 @router.get("/signal_counts", response_model=RepoSignalCountsOut)
@@ -98,11 +120,15 @@ def repo_status(
     repo: Optional[str] = Query(default=None),
     branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
+    """
+    Repo UI calls this to show the most recent snapshot and simple stats.
+    """
     snap = latest_repo_snapshot(db, repo=repo, branch=branch)
     if not snap:
         return {"has_snapshot": False}
 
     stats = snapshot_file_stats(db, snapshot_id=snap.id)
+
     warnings: list[str] = []
     if snap.warnings_json:
         try:
@@ -125,9 +151,14 @@ def repo_status(
         "stats": stats,
     }
 
+
+# --------------------------
+# UI (Repo page)
+# --------------------------
 ui_router = APIRouter(tags=["ui"])
 
-@status_router.get("/ui/repo", response_class=HTMLResponse)
+
+@ui_router.get("/ui/repo", response_class=HTMLResponse)
 def repo_page() -> HTMLResponse:
     # Minimal UI: buttons for sync + sync&generate and quick links
     html = """

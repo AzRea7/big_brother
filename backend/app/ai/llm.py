@@ -94,6 +94,24 @@ class LLMClient:
         except Exception as e:
             raise RuntimeError(f"Unexpected LLM response format: {data}") from e
 
+    async def chat_json(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> dict[str, Any]:
+        """
+        Calls chat(), then parses JSON with hard failure if it's not JSON.
+        This prevents silent 'seed' fallbacks and makes testing deterministic.
+        """
+        text = await self.chat(system=system, user=user, temperature=temperature, max_tokens=max_tokens)
+        try:
+            return json.loads(text)
+        except Exception as e:
+            raise RuntimeError(f"LLM did not return valid JSON. Got: {text[:800]}") from e
+
     async def generate(self, user_prompt: str) -> str:
         if not self.enabled():
             raise RuntimeError("LLM not enabled (set LLM_ENABLED=true and/or OPENAI_BASE_URL + OPENAI_MODEL)")

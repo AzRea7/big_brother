@@ -25,9 +25,8 @@ def ensure_schema(engine: Engine) -> None:
     tables = set(insp.get_table_names())
 
     # ---- Goal.project ----
-    if "goals" in tables:
-        if not _has_column(engine, "goals", "project"):
-            _add_column_sqlite(engine, "goals", "project", "VARCHAR(32)")
+    if "goals" in tables and not _has_column(engine, "goals", "project"):
+        _add_column_sqlite(engine, "goals", "project", "VARCHAR(32)")
 
     # ---- Task fields ----
     if "tasks" in tables:
@@ -105,11 +104,19 @@ def ensure_schema(engine: Engine) -> None:
               size INTEGER,
               content TEXT,
               content_kind VARCHAR(16) DEFAULT 'skipped',
+              skipped BOOLEAN DEFAULT 0,
+              is_text BOOLEAN DEFAULT 1,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
         )
-
-        # indexes (SQLite friendly)
         _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_snapshot ON repo_files(snapshot_id)")
         _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(path)")
+    else:
+        # upgrade existing repo_files table
+        for col, ddl in [
+            ("skipped", "BOOLEAN DEFAULT 0"),
+            ("is_text", "BOOLEAN DEFAULT 1"),
+        ]:
+            if not _has_column(engine, "repo_files", col):
+                _add_column_sqlite(engine, "repo_files", col, ddl)
