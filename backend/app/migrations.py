@@ -100,12 +100,14 @@ def ensure_schema(engine: Engine) -> None:
               id INTEGER PRIMARY KEY,
               snapshot_id INTEGER NOT NULL,
               path VARCHAR(600) NOT NULL,
-              sha VARCHAR(80),
+              sha VARCHAR(120),
               size INTEGER,
               content TEXT,
+              content_text TEXT,
               content_kind VARCHAR(16) DEFAULT 'skipped',
               skipped BOOLEAN DEFAULT 0,
               is_text BOOLEAN DEFAULT 1,
+              skip_reason TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """,
@@ -115,8 +117,13 @@ def ensure_schema(engine: Engine) -> None:
     else:
         # upgrade existing repo_files table
         for col, ddl in [
+            ("sha", "VARCHAR(120)"),
+            ("size", "INTEGER"),
+            ("content_kind", "VARCHAR(16) DEFAULT 'skipped'"),
             ("skipped", "BOOLEAN DEFAULT 0"),
             ("is_text", "BOOLEAN DEFAULT 1"),
+            ("content_text", "TEXT"),
+            ("skip_reason", "TEXT"),
         ]:
             if not _has_column(engine, "repo_files", col):
                 _add_column_sqlite(engine, "repo_files", col, ddl)

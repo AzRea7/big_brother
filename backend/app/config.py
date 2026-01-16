@@ -8,12 +8,6 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _csv(v: str | None) -> list[str]:
-    if not v:
-        return []
-    return [x.strip() for x in v.split(",") if x.strip()]
-
-
 class Settings(BaseSettings):
     # -----------------------
     # Core runtime
@@ -25,11 +19,6 @@ class Settings(BaseSettings):
     # In production, set to your real domain (https://goal.yourdomain.com).
     PUBLIC_BASE_URL: str = "http://127.0.0.1:8000"
 
-    ENV: str = "dev"
-
-    # -----------------------
-    # DB
-    # -----------------------
     DB_URL: str = "sqlite:///./data/app.db"
 
     # -----------------------
@@ -50,24 +39,11 @@ class Settings(BaseSettings):
     DAILY_PLAN_MODE: str = "single"  # single | split
     DAILY_PLAN_PROJECT: str = "onestream"  # haven | onestream | (ignored in split)
 
-    # -----------------------
-    # API auth
-    # -----------------------
-    API_KEY: str = "change-me"
-
-    # -----------------------
-    # --- LLM (OFF by default) ---
-    # Keep the old OpenAI fields exactly, because other modules may import them.
-    # -----------------------
-    LLM_ENABLED: bool = False
+    LLM_ENABLED: bool = True
 
     OPENAI_BASE_URL: str = ""
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = ""
-
-    # -----------------------
-    # --- Repo task rules ---
-    # -----------------------
     HAVEN_REPO_ONLY: bool = True
 
     # Preferred: local path scan (no tokens)
@@ -80,9 +56,6 @@ class Settings(BaseSettings):
     # -----------------------
     GITHUB_REPO: str = "AzRea7/OneHaven"
     GITHUB_BRANCH: str = "main"
-
-    # Optional (recommended): classic token or fine-grained token with read-only repo access.
-    # Public repos work without token but you will hit rate limits fast.
     GITHUB_TOKEN: str | None = None
 
     # Safety: don’t store huge/binary files in your DB.
@@ -97,25 +70,10 @@ class Settings(BaseSettings):
     GITHUB_READ_TIMEOUT_S: float = 60.0
 
     # -----------------------
-    # ✅ NEW (but compatible): include allowlist to stop “999 files” regressions
-    #
-    # If you want the old behavior (no include filter), set:
-    #   GITHUB_INCLUDE_PREFIXES=
-    #   GITHUB_INCLUDE_FILES=
-    #
-    # For OneHaven to get ~137 files, keep defaults:
-    #   GITHUB_INCLUDE_PREFIXES=onehaven/
-    #   GITHUB_INCLUDE_FILES=README.md,.gitignore
-    # -----------------------
-    GITHUB_INCLUDE_PREFIXES: list[str] = Field(default_factory=lambda: ["onehaven/"])
-    GITHUB_INCLUDE_FILES: list[str] = Field(default_factory=lambda: ["README.md", ".gitignore"])
-
-    # -----------------------
     # GitHub sync exclusions (restored from your old config)
     # Cleaned duplicates but preserved intent.
     # -----------------------
-    GITHUB_EXCLUDE_PREFIXES: list[str] = Field(
-        default_factory=lambda: [
+    GITHUB_EXCLUDE_PREFIXES: list[str] = [
             # OneHaven-specific
             "onehaven/node_modules/",
             "onehaven/.venv/",
@@ -150,10 +108,8 @@ class Settings(BaseSettings):
             "backend/app/routes/__pycache__/",
             "backend/app/models/__pycache__/",
         ]
-    )
 
-    GITHUB_EXCLUDE_DIR_NAMES: list[str] = Field(
-        default_factory=lambda: [
+    GITHUB_EXCLUDE_DIR_NAMES: list[str] = [
             "__pycache__",
             ".venv",
             "venv",
@@ -168,10 +124,8 @@ class Settings(BaseSettings):
             "build",
             "coverage",
         ]
-    )
 
-    GITHUB_EXCLUDE_EXTENSIONS: list[str] = Field(
-        default_factory=lambda: [
+    GITHUB_EXCLUDE_EXTENSIONS: list[str] = [
             "pyc",
             "pyo",
             "exe",
@@ -191,31 +145,10 @@ class Settings(BaseSettings):
             "gif",
             "webp",
         ]
-    )
 
-    # -----------------------
-    # Pydantic v2 config
-    # -----------------------
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    @classmethod
-    def _apply_list_overrides(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """
-        Allow comma-separated env overrides for list fields.
-        This is important for Docker: you can tune filters without rebuilding.
-        """
-        for key in [
-            "GITHUB_INCLUDE_PREFIXES",
-            "GITHUB_INCLUDE_FILES",
-            "GITHUB_EXCLUDE_PREFIXES",
-            "GITHUB_EXCLUDE_DIR_NAMES",
-            "GITHUB_EXCLUDE_EXTENSIONS",
-        ]:
-            v = os.getenv(key)
-            if v is not None:
-                data[key] = _csv(v)
-        return data
+class Config:
+        env_file = ".env"
+        extra = "ignore"
 
 
-# Instantiate settings (and apply env overrides for list fields)
-settings = Settings(**Settings._apply_list_overrides({}))
+settings = Settings()
