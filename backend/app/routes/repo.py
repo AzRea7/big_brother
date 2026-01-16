@@ -6,18 +6,26 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import RepoSnapshot
-from ..services.github_sync import create_repo_snapshot, latest_snapshot, snapshot_file_stats
+from ..schemas import RepoSignalCountsOut, RepoSyncOut, RepoTaskGenOut
+from ..services.github_sync import (
+    create_repo_snapshot,
+    latest_snapshot as latest_repo_snapshot,
+    snapshot_file_stats,
+)
 from ..services.repo_taskgen import compute_signal_counts, generate_tasks_from_snapshot
 
+# --------------------------
+# Debug router (repo sync + task gen)
+# --------------------------
 router = APIRouter(prefix="/debug/repo", tags=["repo"])
 
 
-@router.post("/sync")
+@router.post("/sync", response_model=RepoSyncOut)
 async def sync_repo(
     repo: str | None = Query(default=None),
     branch: str | None = Query(default=None),
@@ -43,13 +51,19 @@ def latest_snapshot_debug(db: Session = Depends(get_db)):
     return {"snapshot_id": snap.id, "repo": snap.repo, "branch": snap.branch, "commit_sha": snap.commit_sha}
 
 
-@router.get("/signal_counts")
+@router.get("/signal_counts", response_model=RepoSignalCountsOut)
 def signal_counts(snapshot_id: int, db: Session = Depends(get_db)):
     s = compute_signal_counts(db, snapshot_id)
-    return {"snapshot_id": snapshot_id, **s}
+    return {
+        "snapshot_id": snapshot_id,
+        "total_files": s["total_files"],
+        "files_with_todo": s["files_with_todo"],
+        "files_with_fixme": s["files_with_fixme"],
+        "files_with_impl_signals": s["files_with_impl_signals"],
+    }
 
 
-@router.post("/generate_tasks")
+@router.post("/generate_tasks", response_model=RepoTaskGenOut)
 async def generate_tasks(
     snapshot_id: int,
     project: str = Query(default="haven"),
@@ -59,7 +73,7 @@ async def generate_tasks(
     return {"snapshot_id": snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
 
 
-@router.post("/sync_and_generate")
+@router.post("/sync_and_generate", response_model=RepoTaskGenOut)
 async def sync_and_generate(
     project: str = Query(default="haven"),
     repo: str | None = Query(default=None),
@@ -71,6 +85,9 @@ async def sync_and_generate(
     return {"snapshot_id": res.snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
 
 
+# --------------------------
+# Status endpoint used by the Repo UI (/ui/repo)
+# --------------------------
 status_router = APIRouter(tags=["repo"])
 
 
@@ -80,7 +97,7 @@ def repo_status(
     repo: Optional[str] = Query(default=None),
     branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
-    snap = latest_snapshot(db, repo=repo, branch=branch)
+    snap = latest_repo_snapshot(db, repo=repo, branch=branch)
     if not snap:
         return {"has_snapshot": False}
 
@@ -212,7 +229,10 @@ $("syncGenBtn").onclick = async () => {
 };
 
 $("refreshBtn").onclick = refreshStatus;
-refreshStatus().catch(e => { document.body.innerHTML = `<pre style="color:#b00;">Repo UI failed: ${e}</pre>`; });
+
+refreshStatus().catch(e => {
+  document.body.innerHTML = `<pre style="color:#b00;">Repo UI failed: ${e}</pre>`;
+});
 </script>
 </body>
 </html>
