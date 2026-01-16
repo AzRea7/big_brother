@@ -1,111 +1,168 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from typing import Any
 
+from ..config import settings
 from .llm import LLMClient
+
 
 SYSTEM = """You are a senior engineer + technical program manager.
 Convert repo state into a small, high-leverage task list.
 
 Rules:
 - Output must be STRICT JSON (no markdown).
-- Output format must be: {"tasks":[{...}, ...]}
-- Each task object MUST include:
+- Output format: {"tasks":[{...}, ...]}
+- Each task must include:
   - "title" (string, imperative verb start)
-  - "notes" (string, include why + what + acceptance criteria)
-  - "priority" (int 1-5, 5 highest)
+  - "notes" (string, includes why + what + acceptance criteria)
+  - "priority" (int 1-5, 5 is highest)
   - "estimated_minutes" (int)
-  - "link" (string)  // repo://<path>#Lx-Ly  OR repo://<path>
-  - "tags" (string)  // must include "repo" and 1-3 topical tags
-- Keep it 5–20 tasks. Prefer fewer, higher leverage.
-- DO NOT invent files. Use only the provided paths.
+  - "blocks_me" (bool)
+  - "tags" (string)  // must include "repo"
+  - "link" (string)  // repo://...#path
+  - "starter" (string)
+  - "dod" (string)
+- Keep it to 5–12 tasks max.
+- Do NOT invent files that don't exist. Use provided paths only.
+- Tasks must be grounded in the provided excerpts. If excerpt is missing, keep it generic and point to the file path.
 """
 
 
-def build_user_prompt(
-    *,
-    repo: str,
+@dataclass(frozen=True)
+class PromptBudgets:
+    max_files: int = 18
+    max_chars_per_file: int = 650
+    max_total_chars: int = 14_000  # ~3.5k tokens-ish
+
+
+def _signal_score(s: dict[str, Any]) -> int:
+    """
+    Higher score => more likely to include the file in the prompt.
+    We bias toward "real work surfaces": API routes, services, DB, infra, auth, tests.
+    """
+    path = (s.get("path") or "").lower()
+    score = 0
+
+    # explicit markers
+    score += 5 * int(bool(s.get("todo_count")))
+    score += 6 * int(bool(s.get("fixme_count")))
+    score += 3 * int(bool(s.get("hack_count")))
+
+    # “surface area” heuristics
+    if "/routes/" in path or path.endswith("main.py"):
+        score += 10
+    if "/services/" in path:
+        score += 7
+    if "docker" in path or "compose" in path:
+        score += 4
+    if "auth" in path or "security" in path:
+        score += 6
+    if "/tests/" in path or path.startswith("tests/"):
+        score += 4
+    if "db" in path or "models" in path or "migrations" in path:
+        score += 6
+
+    return score
+
+
+def _trim(s: str, n: int) -> str:
+    s = s or ""
+    s = s.replace("\r\n", "\n")
+    return s if len(s) <= n else (s[: n - 20] + "\n...<truncated>...")
+
+
+def build_prompt(
+    repo_name: str,
     branch: str,
+    commit_sha: str | None,
     snapshot_id: int,
-    signals: dict[str, Any],
+    signal_counts: dict[str, Any],
     file_summaries: list[dict[str, Any]],
 ) -> str:
     """
-    file_summaries items should look like:
-      {"path": "...", "why_relevant": "...", "snippets":[...], "signals":[...]}
-    Keep snippets short; you already store all content in DB if you need deeper.
+    Build an LLM prompt that CANNOT exceed a safe size for small-context local models.
+    The #1 job is to avoid context overflows while preserving the highest-value evidence.
     """
-    return (
-        f"Repo: {repo}\n"
-        f"Branch: {branch}\n"
-        f"Snapshot ID: {snapshot_id}\n\n"
-        f"Signals summary: {signals}\n\n"
-        "Here are relevant files (paths and short context). "
-        "Generate repo tasks that directly reference these paths in link.\n\n"
-        f"FILES:\n{file_summaries}\n"
+    budgets = PromptBudgets(
+        max_files=getattr(settings, "REPO_TASKGEN_MAX_FILES", 18),
+        max_chars_per_file=getattr(settings, "REPO_TASKGEN_MAX_CHARS_PER_FILE", 650),
+        max_total_chars=getattr(settings, "REPO_TASKGEN_MAX_TOTAL_CHARS", 14_000),
     )
 
+    # Sort files by signal score (descending), then keep top N
+    ranked = sorted(file_summaries, key=_signal_score, reverse=True)
+    ranked = ranked[: budgets.max_files]
 
-async def suggest_repo_tasks_llm(
+    # Build compact evidence list
+    evidence: list[dict[str, Any]] = []
+    running_chars = 0
+
+    for f in ranked:
+        path = f.get("path") or ""
+        excerpt = _trim(f.get("excerpt") or "", budgets.max_chars_per_file)
+
+        item = {
+            "path": path,
+            "signals": {
+                "todo": int(f.get("todo_count") or 0),
+                "fixme": int(f.get("fixme_count") or 0),
+                "hack": int(f.get("hack_count") or 0),
+            },
+            "excerpt": excerpt,
+        }
+
+        item_json = json.dumps(item, ensure_ascii=False)
+        if running_chars + len(item_json) > budgets.max_total_chars:
+            break
+
+        evidence.append(item)
+        running_chars += len(item_json)
+
+    payload = {
+        "repo": repo_name,
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "snapshot_id": snapshot_id,
+        "signal_counts": signal_counts,
+        "evidence_files": evidence,
+        "instructions": [
+            "Generate 5–12 tasks.",
+            "Prefer tasks that improve reliability, security, DX, tests, and production-readiness.",
+            "For each task: include a repo:// link that points to one of the evidence file paths.",
+        ],
+    }
+
+    # Compact JSON to reduce tokens
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+async def generate_repo_tasks_json(
     *,
-    repo: str,
+    repo_name: str,
     branch: str,
+    commit_sha: str | None,
     snapshot_id: int,
-    signals: dict[str, Any],
+    signal_counts: dict[str, Any],
     file_summaries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    """
+    Calls the local/OpenAI-compatible model and returns parsed JSON.
+    """
     client = LLMClient()
-    payload = await client.chat_json(
-        system=SYSTEM,
-        user=build_user_prompt(
-            repo=repo,
-            branch=branch,
-            snapshot_id=snapshot_id,
-            signals=signals,
-            file_summaries=file_summaries,
-        ),
-        temperature=0.2,
-        max_tokens=1400,
+    user_prompt = build_prompt(
+        repo_name=repo_name,
+        branch=branch,
+        commit_sha=commit_sha,
+        snapshot_id=snapshot_id,
+        signal_counts=signal_counts,
+        file_summaries=file_summaries,
     )
 
-    tasks = payload.get("tasks")
-    if not isinstance(tasks, list):
-        raise RuntimeError(f"LLM JSON missing 'tasks' list. Got keys: {list(payload.keys())}")
+    raw = await client.chat(system=SYSTEM, user=user_prompt, temperature=0.2, max_tokens=1200)
 
-    cleaned: list[dict[str, Any]] = []
-    for t in tasks:
-        if not isinstance(t, dict):
-            continue
-        title = str(t.get("title") or "").strip()
-        notes = str(t.get("notes") or "").strip()
-        link = str(t.get("link") or "").strip()
-        tags = str(t.get("tags") or "").strip()
-        try:
-            priority = int(t.get("priority"))
-        except Exception:
-            priority = 3
-        try:
-            est = int(t.get("estimated_minutes"))
-        except Exception:
-            est = 45
-
-        if not title or not notes or not link:
-            continue
-        if "repo" not in tags:
-            tags = (tags + ",repo").strip(",")
-        cleaned.append(
-            {
-                "title": title,
-                "notes": notes,
-                "priority": max(1, min(5, priority)),
-                "estimated_minutes": max(5, est),
-                "link": link,
-                "tags": tags,
-            }
-        )
-
-    # Hard guard: if LLM returns empty tasks, treat as error (so you notice)
-    if not cleaned:
-        raise RuntimeError("LLM returned 0 valid tasks after validation.")
-
-    return cleaned
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"Repo task LLM returned non-JSON. First 400 chars: {raw[:400]}") from e

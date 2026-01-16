@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     GITHUB_CONNECT_TIMEOUT_S: float = 10.0
     GITHUB_READ_TIMEOUT_S: float = 60.0
 
+
+    REPO_TASKGEN_MAX_FILES: int = 18
+    REPO_TASKGEN_MAX_CHARS_PER_FILE: int = 650
+    REPO_TASKGEN_MAX_TOTAL_CHARS: int = 14000
+
     # -----------------------
     # GitHub sync exclusions (restored from your old config)
     # Cleaned duplicates but preserved intent.
