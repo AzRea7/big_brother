@@ -6,7 +6,6 @@ import traceback
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .config import settings
 from .db import init_db
 from .routes.health import router as health_router
 from .routes.goals import router as goals_router
@@ -15,8 +14,8 @@ from .routes.debug import router as debug_router
 from .routes.ui import router as ui_router
 from .routes.dashboard import router as dashboard_router
 from .routes.repo import router as repo_router
+from .routes.repo import status_router as repo_status_router
 from .services.scheduler import start_scheduler, shutdown_scheduler
-
 
 app = FastAPI(title="Goal Autopilot")
 
@@ -31,16 +30,11 @@ async def timing_middleware(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    if settings.APP_ENV == "dev":
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(exc),
-                "type": exc.__class__.__name__,
-                "traceback": traceback.format_exc(),
-            },
-        )
-    return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "error": str(exc)},
+    )
 
 
 @app.on_event("startup")
@@ -60,4 +54,7 @@ app.include_router(tasks_router)
 app.include_router(debug_router)
 app.include_router(ui_router)
 app.include_router(dashboard_router)
-app.include_router(repo_router)
+
+# repo routes
+app.include_router(repo_router)         # /debug/repo/*
+app.include_router(repo_status_router)  # /api/repo/status + /ui/repo

@@ -8,18 +8,17 @@ from pydantic import BaseModel, Field
 
 class GoalCreate(BaseModel):
     title: str = Field(min_length=2, max_length=200)
-    why: Optional[str] = None
-    target_date: Optional[date] = None
-    project: Optional[str] = None  # haven | onestream | personal
+    why: str | None = None
+    target_date: date | None = None
+    project: str | None = None  # haven | onestream | personal
 
 
 class GoalOut(BaseModel):
     id: int
     title: str
-    why: Optional[str]
-    target_date: Optional[date]
-    project: Optional[str]
-    is_archived: bool
+    why: str | None
+    target_date: date | None
+    project: str | None
     created_at: datetime
 
     class Config:
@@ -97,3 +96,26 @@ class TaskOut(BaseModel):
 class PlanOut(BaseModel):
     generated_at: datetime
     content: str
+
+class RepoSyncOut(BaseModel):
+    snapshot_id: int
+    repo: str
+    branch: str
+    commit_sha: Optional[str] = None
+    file_count: int
+    stored_content_files: int
+    warnings: list[str] = []
+
+
+class RepoSignalCountsOut(BaseModel):
+    snapshot_id: int
+    total_files: int
+    files_with_todo: int
+    files_with_fixme: int
+    files_with_impl_signals: int
+
+
+class RepoTaskGenOut(BaseModel):
+    snapshot_id: int
+    created_tasks: int
+    skipped_duplicates: int

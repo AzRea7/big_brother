@@ -6,72 +6,88 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
-from ..db import get_db
-from ..services.github_sync import create_repo_snapshot, latest_snapshot, snapshot_file_stats
-from ..services.code_signals import materialize_suggestions_as_tasks
 from ..config import settings
+from ..db import get_db
+from ..models import RepoSnapshot
+from ..schemas import RepoSyncOut, RepoSignalCountsOut, RepoTaskGenOut
+from ..services.github_sync import create_repo_snapshot, latest_snapshot, snapshot_file_stats
+from ..services.repo_taskgen import compute_signal_counts, generate_tasks_from_snapshot
 
-router = APIRouter()
+# --------------------------
+# NEW: debug router (exact endpoints you want)
+# --------------------------
+router = APIRouter(prefix="/debug/repo", tags=["repo"])
 
-@router.get("/debug/repo/signal_counts", response_class=JSONResponse)
-def repo_signal_counts(
+@router.post("/sync", response_model=RepoSyncOut)
+async def sync_repo(
+    repo: str | None = Query(default=None),
+    branch: str | None = Query(default=None),
     db: Session = Depends(get_db),
-    snapshot_id: int = Query(..., ge=1),
-) -> dict[str, Any]:
-    # crude but effective: count TODO/FIXME occurrences in stored content
-    row = db.execute(
-        text("""
-        SELECT
-          SUM(CASE WHEN content LIKE '%TODO%'  THEN 1 ELSE 0 END) AS files_with_todo,
-          SUM(CASE WHEN content LIKE '%FIXME%' THEN 1 ELSE 0 END) AS files_with_fixme,
-          COUNT(*) AS total_files
-        FROM repo_files
-        WHERE snapshot_id = :sid
-          AND content_kind = 'text'
-          AND content IS NOT NULL
-        """),
-        {"sid": snapshot_id},
-    ).mappings().first()
-
-    return dict(row) if row else {"total_files": 0}
-
-
-@router.get("/debug/repo/github_auth", response_class=JSONResponse)
-def github_auth_debug():
-    token = settings.GITHUB_TOKEN or ""
+):
+    res = await create_repo_snapshot(db=db, repo=repo, branch=branch)
     return {
-        "has_token": bool(token),
-        "token_prefix": token[:6] + "..." if token else None,
-        "repo": settings.GITHUB_REPO,
-        "branch": settings.GITHUB_BRANCH,
+        "snapshot_id": res.snapshot_id,
+        "repo": res.repo,
+        "branch": res.branch,
+        "commit_sha": res.commit_sha,
+        "file_count": res.file_count,
+        "stored_content_files": res.stored_content_files,
+        "warnings": res.warnings,
     }
 
 
-@router.get("/debug/repo/db_counts", response_class=JSONResponse)
-def repo_db_counts(db: Session = Depends(get_db)):
-    # raw SQL so we see if tables exist + have rows
-    try:
-        snap = db.execute(text("SELECT COUNT(*) FROM repo_snapshots")).scalar_one()
-    except Exception as e:
-        snap = f"ERR: {e}"
-
-    try:
-        files = db.execute(text("SELECT COUNT(*) FROM repo_files")).scalar_one()
-    except Exception as e:
-        files = f"ERR: {e}"
-
-    return {"repo_snapshots": snap, "repo_files": files}
+@router.get("/latest_snapshot")
+def latest_snapshot(db: Session = Depends(get_db)):
+    snap = db.execute(select(RepoSnapshot).order_by(RepoSnapshot.id.desc())).scalars().first()
+    if not snap:
+        return {"snapshot_id": None}
+    return {"snapshot_id": snap.id, "repo": snap.repo, "branch": snap.branch, "commit_sha": snap.commit_sha}
 
 
-@router.get("/debug/repo/db_url", response_class=JSONResponse)
-def repo_db_url():
-    return {"DB_URL": settings.DB_URL}
+@router.get("/signal_counts", response_model=RepoSignalCountsOut)
+def signal_counts(snapshot_id: int, db: Session = Depends(get_db)):
+    s = compute_signal_counts(db, snapshot_id)
+    return {
+        "snapshot_id": snapshot_id,
+        "total_files": s["total_files"],
+        "files_with_todo": s["files_with_todo"],
+        "files_with_fixme": s["files_with_fixme"],
+        "files_with_impl_signals": s["files_with_impl_signals"],
+    }
 
 
-@router.get("/api/repo/status", response_class=JSONResponse)
+@router.post("/generate_tasks", response_model=RepoTaskGenOut)
+async def generate_tasks(
+    snapshot_id: int,
+    project: str = Query(default="haven"),
+    db: Session = Depends(get_db),
+):
+    created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=snapshot_id, project=project)
+    return {"snapshot_id": snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
+
+
+@router.post("/sync_and_generate", response_model=RepoTaskGenOut)
+async def sync_and_generate(
+    project: str = Query(default="haven"),
+    repo: str | None = Query(default=None),
+    branch: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    res = await create_repo_snapshot(db=db, repo=repo, branch=branch)
+    created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=res.snapshot_id, project=project)
+    return {"snapshot_id": res.snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
+
+
+# --------------------------
+# Existing “status/UI” endpoints (kept)
+# --------------------------
+status_router = APIRouter(tags=["repo"])
+
+
+@status_router.get("/api/repo/status", response_class=JSONResponse)
 def repo_status(
     db: Session = Depends(get_db),
     repo: Optional[str] = Query(default=None),
@@ -105,35 +121,9 @@ def repo_status(
     }
 
 
-@router.post("/debug/repo/sync", response_class=JSONResponse)
-async def repo_sync(
-    db: Session = Depends(get_db),
-    repo: Optional[str] = Query(default=None),
-    branch: Optional[str] = Query(default=None),
-) -> dict[str, Any]:
-    result = await create_repo_snapshot(db, repo=repo, branch=branch)
-    return {
-        "snapshot_id": result.snapshot_id,
-        "repo": result.repo,
-        "branch": result.branch,
-        "file_count": result.file_count,
-        "stored_content_files": result.stored_content_files,
-        "warnings": result.warnings,
-    }
-
-
-@router.post("/debug/repo/suggest_tasks", response_class=JSONResponse)
-def repo_suggest_tasks(
-    db: Session = Depends(get_db),
-    snapshot_id: int = Query(..., ge=1),
-    project: str = Query(default="haven"),
-    limit: int = Query(default=30, ge=1, le=200),
-) -> dict[str, Any]:
-    return materialize_suggestions_as_tasks(db, snapshot_id=snapshot_id, project=project, limit=limit)
-
-
-@router.get("/ui/repo", response_class=HTMLResponse)
+@status_router.get("/ui/repo", response_class=HTMLResponse)
 def repo_page() -> HTMLResponse:
+    # Minimal UI: buttons for sync + sync&generate and quick links
     html = """
 <!doctype html>
 <html>
@@ -156,8 +146,8 @@ def repo_page() -> HTMLResponse:
 <body>
   <div class="row" style="justify-content:space-between; align-items:flex-end;">
     <div>
-      <div class="title">Repo Context (Read-only)</div>
-      <div class="muted">Sync GitHub → snapshot DB → suggest tasks from code signals.</div>
+      <div class="title">Repo → Tasks</div>
+      <div class="muted">Sync repo snapshot, generate tasks, and view them in the dashboard.</div>
     </div>
     <div class="muted"><a href="/ui/dashboard" style="text-decoration:none;">Dashboard</a> · <a href="/docs" style="text-decoration:none;">API Docs</a></div>
   </div>
@@ -165,17 +155,13 @@ def repo_page() -> HTMLResponse:
   <div class="row" style="margin: 14px 0;">
     <input id="repo" style="min-width:320px" placeholder="repo (owner/name) e.g. AzRea7/OneHaven" />
     <input id="branch" style="min-width:160px" placeholder="branch e.g. main" />
+    <input id="project" style="min-width:160px" value="haven" />
     <button id="syncBtn">Sync</button>
+    <button id="syncGenBtn">Sync + Generate</button>
     <button id="refreshBtn">Refresh Status</button>
   </div>
 
   <div id="status" class="card"></div>
-
-  <div class="row" style="margin-top:12px;">
-    <input id="project" style="min-width:160px" value="haven" />
-    <input id="limit" style="min-width:120px" value="30" />
-    <button id="suggestBtn" disabled>Suggest Tasks (TODO/FIXME)</button>
-  </div>
 
   <div class="card" style="margin-top:12px;">
     <div class="muted">Output</div>
@@ -183,8 +169,6 @@ def repo_page() -> HTMLResponse:
   </div>
 
 <script>
-let latestSnapshotId = null;
-
 function $(id){ return document.getElementById(id); }
 
 async function apiGet(url) {
@@ -193,7 +177,6 @@ async function apiGet(url) {
   if (!r.ok) throw new Error(JSON.stringify(j));
   return j;
 }
-
 async function apiPost(url) {
   const r = await fetch(url, { method: "POST" });
   const j = await r.json();
@@ -201,91 +184,54 @@ async function apiPost(url) {
   return j;
 }
 
-function renderStatus(data) {
-  const el = $("status");
+async function refreshStatus() {
+  const repo = $("repo").value.trim();
+  const branch = $("branch").value.trim();
+  const url = repo || branch
+    ? `/api/repo/status?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`
+    : `/api/repo/status`;
+  const data = await apiGet(url);
+
   if (!data.has_snapshot) {
-    el.innerHTML = `<div><b>No snapshot yet.</b></div><div class="muted">Click Sync to create one.</div>`;
-    $("suggestBtn").disabled = true;
-    latestSnapshotId = null;
+    $("status").innerHTML = `<b>No snapshot yet.</b><div class="muted">Click Sync.</div>`;
     return;
   }
 
   const s = data.snapshot;
-  latestSnapshotId = s.id;
-  $("suggestBtn").disabled = false;
-
   const stats = data.stats || {};
-  const warnings = (s.warnings || []).slice(0, 8).map(w => `<li>${w}</li>`).join("");
-  el.innerHTML = `
-    <div><b>Latest snapshot:</b> #${s.id}</div>
-    <div class="muted">${s.repo}@${s.branch} · ${s.created_at}</div>
-    <div style="margin-top:8px;">
-      <div><b>Files:</b> ${stats.total_files || s.file_count} (text: ${stats.text_files || 0}, binary: ${stats.binary_files || 0}, skipped: ${stats.skipped_files || 0})</div>
-      <div><b>Stored content:</b> ${s.stored_content_files}</div>
-    </div>
-    <div style="margin-top:8px;">
-      <div class="muted"><b>Top folders</b></div>
-      <div class="muted">${(stats.top_folders||[]).map(x => `${x.folder}(${x.count})`).join(" · ")}</div>
-    </div>
-    <div style="margin-top:8px;">
-      <div class="muted"><b>Warnings</b></div>
-      <ul class="muted">${warnings || "<li>none</li>"}</ul>
-    </div>
+  $("status").innerHTML = `
+    <div><b>Snapshot #${s.id}</b> — ${s.repo}@${s.branch}</div>
+    <div class="muted">files=${s.file_count} stored_text=${s.stored_content_files}</div>
+    <div class="muted">top_folders=${(stats.top_folders || []).map(x => x.folder+":"+x.count).join(", ")}</div>
   `;
 }
 
-async function refresh() {
+$("syncBtn").onclick = async () => {
   const repo = $("repo").value.trim();
   const branch = $("branch").value.trim();
-  let url = "/api/repo/status";
-  const qs = [];
-  if (repo) qs.push("repo="+encodeURIComponent(repo));
-  if (branch) qs.push("branch="+encodeURIComponent(branch));
-  if (qs.length) url += "?" + qs.join("&");
-  const data = await apiGet(url);
-  renderStatus(data);
-  $("out").textContent = JSON.stringify(data, null, 2);
-}
-
-$("refreshBtn").onclick = async () => {
-  try { await refresh(); } catch(e) { $("out").textContent = String(e); }
+  const url = `/debug/repo/sync?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`;
+  const out = await apiPost(url);
+  $("out").textContent = JSON.stringify(out, null, 2);
+  await refreshStatus();
 };
 
-$("syncBtn").onclick = async () => {
-  try {
-    const repo = $("repo").value.trim();
-    const branch = $("branch").value.trim();
-    let url = "/debug/repo/sync";
-    const qs = [];
-    if (repo) qs.push("repo="+encodeURIComponent(repo));
-    if (branch) qs.push("branch="+encodeURIComponent(branch));
-    if (qs.length) url += "?" + qs.join("&");
-
-    const data = await apiPost(url);
-    $("out").textContent = JSON.stringify(data, null, 2);
-    await refresh();
-  } catch(e) {
-    $("out").textContent = String(e);
-  }
+$("syncGenBtn").onclick = async () => {
+  const repo = $("repo").value.trim();
+  const branch = $("branch").value.trim();
+  const project = $("project").value.trim() || "haven";
+  const url = `/debug/repo/sync_and_generate?project=${encodeURIComponent(project)}&repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`;
+  const out = await apiPost(url);
+  $("out").textContent = JSON.stringify(out, null, 2);
+  await refreshStatus();
 };
 
-$("suggestBtn").onclick = async () => {
-  try {
-    if (!latestSnapshotId) throw new Error("No snapshot id");
-    const project = $("project").value.trim() || "haven";
-    const limit = parseInt($("limit").value || "30", 10);
+$("refreshBtn").onclick = refreshStatus;
 
-    const url = `/debug/repo/suggest_tasks?snapshot_id=${latestSnapshotId}&project=${encodeURIComponent(project)}&limit=${limit}`;
-    const data = await apiPost(url);
-    $("out").textContent = JSON.stringify(data, null, 2);
-  } catch(e) {
-    $("out").textContent = String(e);
-  }
-};
-
-refresh().catch(()=>{});
+refreshStatus().catch(e => {
+  document.body.innerHTML = `<pre style="color:#b00;">Repo UI failed: ${e}</pre>`;
+});
 </script>
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, status_code=200)
