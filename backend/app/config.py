@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     REPO_SYNC_HOUR: int = 6
     REPO_SYNC_MINUTE: int = 0
     REPO_SYNC_PROJECT: str = "haven"
+    REPO_TASK_SEEDS: str = "security,e2e,observability"
 
     # What the scheduler sends
     DAILY_PLAN_MODE: str = "single"  # single | split

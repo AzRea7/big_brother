@@ -36,6 +36,63 @@ class LLMClient:
 
         # Otherwise: enabled only if base_url + model are present
         return bool(self.base_url) and bool(self.model)
+    
+    async def chat(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        max_tokens: int = 600,
+    ) -> str:
+        """
+        Generic chat call used by repo task generation (and anything else).
+        """
+        if not self.enabled():
+            raise RuntimeError(
+                "LLM not enabled (set LLM_ENABLED=true and/or OPENAI_BASE_URL + OPENAI_MODEL)"
+            )
+
+        url = f"{self.base_url}/chat/completions"
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+
+        timeout = httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=10.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, content=json.dumps(payload))
+                r.raise_for_status()
+                data = r.json()
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text
+            except Exception:
+                body = ""
+            raise RuntimeError(
+                f"LLM HTTP error {e.response.status_code} from {url}. "
+                f"Response body: {body[:500]}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"LLM request failed to {url}: {e}") from e
+
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            raise RuntimeError(f"Unexpected LLM response format: {data}") from e
 
     async def generate(self, user_prompt: str) -> str:
         if not self.enabled():
