@@ -6,20 +6,24 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..db import get_db
 from ..models import RepoSnapshot
-from ..schemas import RepoSyncOut, RepoSignalCountsOut, RepoTaskGenOut
-from ..services.github_sync import create_repo_snapshot, latest_snapshot, snapshot_file_stats
+from ..schemas import RepoSignalCountsOut, RepoSyncOut, RepoTaskGenOut
+from ..services.github_sync import (
+    create_repo_snapshot,
+    latest_snapshot as latest_repo_snapshot,
+    snapshot_file_stats,
+)
 from ..services.repo_taskgen import compute_signal_counts, generate_tasks_from_snapshot
 
 # --------------------------
-# NEW: debug router (exact endpoints you want)
+# Debug router (repo sync + task gen)
 # --------------------------
 router = APIRouter(prefix="/debug/repo", tags=["repo"])
+
 
 @router.post("/sync", response_model=RepoSyncOut)
 async def sync_repo(
@@ -39,8 +43,9 @@ async def sync_repo(
     }
 
 
+# ✅ renamed to avoid shadowing latest_repo_snapshot import
 @router.get("/latest_snapshot")
-def latest_snapshot(db: Session = Depends(get_db)):
+def latest_snapshot_debug(db: Session = Depends(get_db)):
     snap = db.execute(select(RepoSnapshot).order_by(RepoSnapshot.id.desc())).scalars().first()
     if not snap:
         return {"snapshot_id": None}
@@ -82,7 +87,7 @@ async def sync_and_generate(
 
 
 # --------------------------
-# Existing “status/UI” endpoints (kept)
+# Status endpoint used by the Repo UI (/ui/repo)
 # --------------------------
 status_router = APIRouter(tags=["repo"])
 
@@ -93,12 +98,12 @@ def repo_status(
     repo: Optional[str] = Query(default=None),
     branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
-    snap = latest_snapshot(db, repo=repo, branch=branch)
+    snap = latest_repo_snapshot(db, repo=repo, branch=branch)
     if not snap:
         return {"has_snapshot": False}
 
     stats = snapshot_file_stats(db, snapshot_id=snap.id)
-    warnings = []
+    warnings: list[str] = []
     if snap.warnings_json:
         try:
             warnings = json.loads(snap.warnings_json)
@@ -111,15 +116,16 @@ def repo_status(
             "id": snap.id,
             "repo": snap.repo,
             "branch": snap.branch,
-            "created_at": snap.created_at.isoformat(),
             "commit_sha": snap.commit_sha,
             "file_count": snap.file_count,
             "stored_content_files": snap.stored_content_files,
+            "created_at": str(snap.created_at),
             "warnings": warnings,
         },
         "stats": stats,
     }
 
+ui_router = APIRouter(tags=["ui"])
 
 @status_router.get("/ui/repo", response_class=HTMLResponse)
 def repo_page() -> HTMLResponse:

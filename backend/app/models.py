@@ -19,9 +19,11 @@ class Goal(Base):
     target_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    tasks: Mapped[list["Task"]] = relationship("Task", back_populates="goal")
+
     # lane/project for goal filtering
     project: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # haven | onestream | personal
+
+    tasks: Mapped[list["Task"]] = relationship("Task", back_populates="goal")
 
 
 class Task(Base):
@@ -58,7 +60,9 @@ class Task(Base):
 
     # microtasks
     parent_task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     goal: Mapped[Goal | None] = relationship("Goal", back_populates="tasks")
+
 
 class TaskDependency(Base):
     __tablename__ = "task_dependencies"
@@ -96,22 +100,40 @@ class RepoSnapshot(Base):
 
     warnings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    files: Mapped[list["RepoFile"]] = relationship("RepoFile", back_populates="snapshot")
+
+    # ✅ SQLAlchemy needs an FK to infer RepoSnapshot.files join
+    files: Mapped[list["RepoFile"]] = relationship(
+        "RepoFile",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+
 
 class RepoFile(Base):
     __tablename__ = "repo_files"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    snapshot_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    # ✅ this is the missing piece
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("repo_snapshots.id"),
+        index=True,
+        nullable=False,
+    )
 
     path: Mapped[str] = mapped_column(String(1024))
     sha: Mapped[str | None] = mapped_column(String(120), nullable=True)
     size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     is_text: Mapped[bool] = mapped_column(Boolean, default=True)
     skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # keeping both fields since your migrations/table have "content" and "content_kind"
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_kind: Mapped[str] = mapped_column(String(30), default="skipped")  # text|binary|skipped
     content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
     snapshot: Mapped[RepoSnapshot] = relationship("RepoSnapshot", back_populates="files")

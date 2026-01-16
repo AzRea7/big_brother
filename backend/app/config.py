@@ -121,9 +121,5 @@ class Settings(BaseSettings):
         "gif",
         "webp",
     ]
- 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
 
 settings = Settings()

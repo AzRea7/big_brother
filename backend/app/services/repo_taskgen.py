@@ -1,3 +1,4 @@
+# app/services/repo_taskgen.py
 from __future__ import annotations
 
 import json
@@ -12,16 +13,16 @@ from ..ai.llm import LLMClient
 from ..config import settings
 from ..models import RepoFile, RepoSnapshot, Task
 
-
-_TODO_RE = re.compile(r"\bTODO\b", re.IGNORECASE)
-_FIXME_RE = re.compile(r"\bFIXME\b", re.IGNORECASE)
-_STUB_RE = re.compile(r"\b(pass|TODO:|IMPLEMENT|IMPLEMENTATION)\b", re.IGNORECASE)
+# Basic signal regexes
+_TODO_RE = re.compile(r"\bTODO\b[:]?", re.IGNORECASE)
+_FIXME_RE = re.compile(r"\bFIXME\b[:]?", re.IGNORECASE)
+_STUB_RE = re.compile(r"\b(pass|TODO\(\)|raise NotImplementedError|NotImplementedError)\b")
 
 
 def _parse_csv_list(s: str | None) -> list[str]:
     if not s:
         return []
-    return [x.strip() for x in s.split(",") if x.strip()]
+    return [p.strip() for p in (s or "").split(",") if p.strip()]
 
 
 @dataclass
@@ -37,24 +38,65 @@ class RepoTaskDraft:
     dod: str | None = None
 
 
-def _repo_summary(db: Session, snapshot_id: int) -> dict[str, Any]:
-    snap = db.execute(select(RepoSnapshot).where(RepoSnapshot.id == snapshot_id)).scalars().first()
-    if not snap:
-        raise ValueError(f"RepoSnapshot {snapshot_id} not found")
+def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, int]:
+    """
+    Used by /repo UI to show how noisy the repo is (TODO/FIXME/stubs).
+    Your routes/repo.py imports this directly, so it must exist.
+    """
+    files = (
+        db.execute(
+            select(RepoFile).where(
+                RepoFile.snapshot_id == snapshot_id,
+                RepoFile.skipped == False,  # noqa: E712
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = len(files)
+    todo = 0
+    fixme = 0
+    impl = 0
 
-    # quick folder histogram
-    top_folders: dict[str, int] = {}
-    files = db.execute(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).scalars().all()
     for f in files:
-        parts = (f.path or "").split("/")
-        folder = parts[0] if parts else ""
-        if folder:
-            top_folders[folder] = top_folders.get(folder, 0) + 1
+        if not f.content:
+            continue
+        if _TODO_RE.search(f.content):
+            todo += 1
+        if _FIXME_RE.search(f.content):
+            fixme += 1
+        if _STUB_RE.search(f.content):
+            impl += 1
+
+    return {
+        "total_files": total,
+        "files_with_todo": todo,
+        "files_with_fixme": fixme,
+        "files_with_impl_signals": impl,
+    }
+
+
+def _repo_summary(db: Session, snapshot_id: int) -> dict[str, Any]:
+    snap = db.get(RepoSnapshot, snapshot_id)
+    if not snap:
+        return {"snapshot_id": snapshot_id, "repo": None, "branch": None, "file_count": 0, "top_folders": []}
+
+    files = db.execute(select(RepoFile.path).where(RepoFile.snapshot_id == snapshot_id)).scalars().all()
+    folder_counts: dict[str, int] = {}
+    for p in files:
+        parts = p.split("/")
+        top = parts[0] if parts else "<root>"
+        folder_counts[top] = folder_counts.get(top, 0) + 1
+
+    top_folders = sorted(
+        [{"folder": k, "count": v} for k, v in folder_counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:10]
 
     warnings: list[str] = []
     try:
-        if snap.warnings_json:
-            warnings = json.loads(snap.warnings_json) or []
+        warnings = list(snap.warnings or [])
     except Exception:
         warnings = []
 
@@ -123,7 +165,7 @@ def _extract_signal_hits(db: Session, snapshot_id: int, limit_files: int = 60) -
 
 def _deterministic_seed_tasks(snapshot_id: int, seeds: list[str], summary: dict[str, Any]) -> list[RepoTaskDraft]:
     """
-    Used when LLM is off or fails. Creates useful tasks that still pass HAVEN_REPO_ONLY.
+    Used when LLM is off or fails. Creates useful tasks that still work end-to-end.
     """
     repo = summary.get("repo") or "repo"
     branch = summary.get("branch") or "main"
@@ -148,7 +190,7 @@ def _deterministic_seed_tasks(snapshot_id: int, seeds: list[str], summary: dict[
             blocks_me=True,
             tags="repo,seed,e2e",
             link=f"repo://seed/e2e?snapshot={snapshot_id}&repo={repo}&branch={branch}",
-            starter="Write a pytest that spins app + DB, triggers sync_and_generate, then uses /tasks and /complete.",
+            starter="Write a pytest that triggers sync_and_generate, then uses /tasks and /complete endpoints.",
             dod="One E2E test passes in CI. Includes assertions on repo:// links and repo tags.",
         ),
         "observability": RepoTaskDraft(
@@ -162,17 +204,6 @@ def _deterministic_seed_tasks(snapshot_id: int, seeds: list[str], summary: dict[
             starter="Add request_id middleware + log fields; ensure exception handler sanitizes.",
             dod="Logs show request_id consistently; errors are sanitized; add 1 test for error response shape.",
         ),
-        "ci_hardening": RepoTaskDraft(
-            title="CI hardening: lint + tests + minimal API smoke check",
-            notes="Ensure CI runs formatting/linting, unit tests, and a minimal API smoke check (/health ok).",
-            priority=4,
-            estimated_minutes=90,
-            blocks_me=False,
-            tags="repo,seed,ci",
-            link=f"repo://seed/ci_hardening?snapshot={snapshot_id}&repo={repo}&branch={branch}",
-            starter="Add CI steps: install deps, run tests, curl /health in container.",
-            dod="CI fails on lint/test regressions and passes on main.",
-        ),
     }
 
     drafts: list[RepoTaskDraft] = []
@@ -181,14 +212,14 @@ def _deterministic_seed_tasks(snapshot_id: int, seeds: list[str], summary: dict[
         if key in mapping:
             drafts.append(mapping[key])
 
-    # fallback if unknown seed provided
+    # fallback: unknown seeds become generic tasks
     for seed in seeds:
         key = seed.strip().lower()
         if key and key not in mapping:
             drafts.append(
                 RepoTaskDraft(
                     title=f"Repo improvement: {key}",
-                    notes=f"Seed-driven improvement task: {key}. Convert this into concrete work items tied to code areas.",
+                    notes=f"Seed-driven improvement task: {key}. Convert into concrete work items tied to code areas.",
                     priority=3,
                     estimated_minutes=60,
                     blocks_me=False,
@@ -199,10 +230,27 @@ def _deterministic_seed_tasks(snapshot_id: int, seeds: list[str], summary: dict[
                 )
             )
 
+    # if no seeds, still create something
+    if not drafts:
+        drafts.append(
+            RepoTaskDraft(
+                title="Repo health pass: resolve top TODO/FIXME signals",
+                notes="Scan for TODO/FIXME/NotImplementedError hotspots and convert the highest-impact items into tracked tasks with links.",
+                priority=3,
+                estimated_minutes=60,
+                blocks_me=False,
+                tags="repo,autogen",
+                link=f"repo://snapshot/{snapshot_id}",
+                starter="Use repo signal counts and top hits to pick 3 items.",
+                dod="3 tasks exist with repo:// links and clear DoD.",
+            )
+        )
+
     return drafts
 
 
 def _task_exists(db: Session, project: str, link: str, title: str) -> bool:
+    # Dedupe by link OR by (project,title) for safety
     existing = (
         db.execute(
             select(Task).where(
@@ -228,7 +276,7 @@ async def _llm_generate_seed_tasks(
     system = (
         "You are an expert software engineering tech lead. "
         "Generate actionable engineering tasks from repo context. "
-        "Return strict JSON: {tasks:[{title,notes,priority,estimated_minutes,blocks_me,tags,link,starter,dod}]} "
+        "Return strict JSON: {tasks:[{title,notes,priority,estimated_minutes,blocks_me,tags,link,starter,dod}]}. "
         "No markdown."
     )
 
@@ -245,7 +293,12 @@ async def _llm_generate_seed_tasks(
         },
     }
 
-    raw = await llm.chat(system=system, user=json.dumps(user_payload, ensure_ascii=False), temperature=0.2, max_tokens=900)
+    raw = await llm.chat(
+        system=system,
+        user=json.dumps(user_payload, ensure_ascii=False),
+        temperature=0.2,
+        max_tokens=900,
+    )
 
     # Parse strict JSON (with a salvage attempt)
     try:
@@ -271,7 +324,7 @@ async def _llm_generate_seed_tasks(
                     estimated_minutes=int(t.get("estimated_minutes", 60)),
                     blocks_me=bool(t.get("blocks_me", False)),
                     tags=str(t.get("tags") or "repo,autogen"),
-                    link=str(t.get("link") or f"repo://(snapshot:{snapshot_id})"),
+                    link=str(t.get("link") or f"repo://snapshot/{snapshot_id}"),
                     starter=t.get("starter"),
                     dod=t.get("dod"),
                 )
@@ -294,7 +347,7 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
     hits = _extract_signal_hits(db, snapshot_id)
     seeds = _parse_csv_list(getattr(settings, "REPO_TASK_SEEDS", ""))
 
-    drafts: list[RepoTaskDraft] = []
+    drafts: list[RepoTaskDraft]
     if settings.LLM_ENABLED:
         try:
             drafts = await _llm_generate_seed_tasks(snapshot_id=snapshot_id, seeds=seeds, summary=summary, hits=hits)
@@ -313,8 +366,7 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
         tagset.add("autogen")
         d.tags = ",".join(sorted(tagset))
 
-        if settings.HAVEN_REPO_ONLY and project == "haven":
-            # Simple guard: if HAVEN_REPO_ONLY, require repo:// links
+        if getattr(settings, "HAVEN_REPO_ONLY", False) and project == "haven":
             if not (d.link or "").startswith("repo://"):
                 skipped += 1
                 continue
@@ -323,22 +375,23 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
             skipped += 1
             continue
 
-        t = Task(
-            goal_id=None,
-            title=d.title,
-            notes=d.notes,
-            due_date=None,
-            priority=max(1, min(5, int(d.priority))),
-            estimated_minutes=max(5, int(d.estimated_minutes)),
-            blocks_me=bool(d.blocks_me),
-            completed=False,
-            project=project,
-            tags=d.tags,
-            link=d.link,
-            starter=d.starter,
-            dod=d.dod,
+        db.add(
+            Task(
+                goal_id=None,
+                title=d.title,
+                notes=d.notes,
+                due_date=None,
+                priority=max(1, min(5, int(d.priority))),
+                estimated_minutes=max(5, int(d.estimated_minutes)),
+                blocks_me=bool(d.blocks_me),
+                completed=False,
+                project=project,
+                tags=d.tags,
+                link=d.link,
+                starter=d.starter,
+                dod=d.dod,
+            )
         )
-        db.add(t)
         created += 1
 
     db.commit()
