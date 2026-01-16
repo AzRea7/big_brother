@@ -30,37 +30,31 @@ def _norm_path(p: str) -> str:
 
 
 def _is_excluded_path(path: str) -> bool:
-    """
-    Exclusion rules:
-      - extension exclusion (fast)
-      - prefix exclusion that is directory-boundary aware
-        e.g. prefix "node_modules/" excludes:
-          - "node_modules"
-          - "node_modules/..."
-        but NOT "node_modules_something"
-    """
     p = _norm_path(path)
 
-    # extension exclusions
+    # 1) Exclude by directory name anywhere in the path
+    # This kills __pycache__, .venv, etc no matter where they appear
+    parts = p.split("/")
+    if any(seg in set(settings.GITHUB_EXCLUDE_DIR_NAMES) for seg in parts):
+        return True
+
+    # 2) Exclude by file extension
     if "." in p:
         ext = p.rsplit(".", 1)[-1].lower()
         if ext in {x.lower() for x in settings.GITHUB_EXCLUDE_EXTENSIONS}:
             return True
 
-    # prefix exclusions (directory boundary aware)
+    # 3) Exclude by path prefix (repo-relative, boundary-aware)
     for pref in settings.GITHUB_EXCLUDE_PREFIXES:
-        pref_n = _norm_path(pref).rstrip("/")  # normalize to no trailing slash
+        pref_n = _norm_path(pref).rstrip("/")
         if not pref_n:
             continue
 
-        if p == pref_n:
-            return True
-
-        # match "pref/" boundary (so "node_modules/..." matches, but "node_modulesX" doesn't)
-        if p.startswith(pref_n + "/"):
+        if p == pref_n or p.startswith(pref_n + "/"):
             return True
 
     return False
+
 
 
 def _github_headers() -> dict[str, str]:

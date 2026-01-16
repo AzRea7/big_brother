@@ -65,6 +65,16 @@ class Settings(BaseSettings):
 
     # GitHub sync exclusions
     GITHUB_EXCLUDE_PREFIXES: list[str] = [
+        "onehaven/node_modules/",
+        "onehaven/.venv/",
+        "onehaven/venv/",
+        "onehaven/dist/",
+        "onehaven/build/",
+        "onehaven/.pytest_cache/",
+        "onehaven/__pycache__/",
+        "node_modules/",
+        ".venv/",
+        "__pycache__/",
         ".git/",
         ".github/",
         "node_modules/",
@@ -87,16 +97,51 @@ class Settings(BaseSettings):
         ".git/",
         "dist/", 
         "build/",
-
+        "backend/.venv/",
+        "backend/__pycache__/",
+        "backend/.pytest_cache/",
+        "backend/.mypy_cache/",
+        "backend/.ruff_cache/",
+        "backend/.git/",
+        ".git/",
+        "backend/app/__pycache__/",
+        "backend/app/services/__pycache__/",
+        "backend/app/routes/__pycache__/",
+        "backend/app/models/__pycache__/",
     ]
+
+    GITHUB_EXCLUDE_DIR_NAMES: list[str] = [
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ]
+
 
     GITHUB_EXCLUDE_EXTENSIONS: list[str] = [
-        "png", "jpg", "jpeg", "gif", "webp", "pdf",
-        "zip", "gz", "tar", "7z",
-        "exe", "dll", "so", "dylib",
-        "mp4", "mov", "mp3", "wav",
-        "woff", "woff2", "ttf", "eot",
-    ]
+    "pyc",
+    "pyo",
+    "exe",
+    "dll",
+    "db",
+    "pem",
+    "key",
+    "p12",
+    "pfx",
+    "zip",
+    "gz",
+    "tar",
+    "7z",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+]
+
 
 
 

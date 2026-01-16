@@ -16,6 +16,28 @@ from ..config import settings
 
 router = APIRouter()
 
+@router.get("/debug/repo/signal_counts", response_class=JSONResponse)
+def repo_signal_counts(
+    db: Session = Depends(get_db),
+    snapshot_id: int = Query(..., ge=1),
+) -> dict[str, Any]:
+    # crude but effective: count TODO/FIXME occurrences in stored content
+    row = db.execute(
+        text("""
+        SELECT
+          SUM(CASE WHEN content LIKE '%TODO%'  THEN 1 ELSE 0 END) AS files_with_todo,
+          SUM(CASE WHEN content LIKE '%FIXME%' THEN 1 ELSE 0 END) AS files_with_fixme,
+          COUNT(*) AS total_files
+        FROM repo_files
+        WHERE snapshot_id = :sid
+          AND content_kind = 'text'
+          AND content IS NOT NULL
+        """),
+        {"sid": snapshot_id},
+    ).mappings().first()
+
+    return dict(row) if row else {"total_files": 0}
+
 
 @router.get("/debug/repo/github_auth", response_class=JSONResponse)
 def github_auth_debug():
