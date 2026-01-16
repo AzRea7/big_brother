@@ -1,13 +1,14 @@
+# backend/app/services/github_sync.py
 from __future__ import annotations
 
 import base64
 import json
-import os
+import mimetypes
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
-from sqlalchemy import desc
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -15,18 +16,142 @@ from ..models import RepoFile, RepoSnapshot
 
 
 @dataclass(frozen=True)
-class SnapshotStats:
-    total_files: int
-    text_files: int
-    binary_files: int
-    skipped_files: int
-    top_folders: list[dict[str, Any]]
+class SyncResult:
+    snapshot_id: int
+    repo: str
+    branch: str
+    commit_sha: str | None
+    file_count: int
+    stored_content_files: int
+    warnings: list[str]
 
 
-def _json_list(x: list[str] | None) -> str | None:
-    if not x:
-        return None
-    return json.dumps(x)
+def _norm_path(p: str) -> str:
+    return (p or "").lstrip("/").replace("\\", "/")
+
+
+def _is_excluded_path(path: str) -> bool:
+    p = _norm_path(path)
+
+    # Exclude by dir name anywhere
+    parts = [x for x in p.split("/") if x]
+    if any(seg in set(settings.GITHUB_EXCLUDE_DIR_NAMES) for seg in parts):
+        return True
+
+    # Exclude by ext
+    if "." in p:
+        ext = p.rsplit(".", 1)[-1].lower()
+        if ext in {x.lower() for x in settings.GITHUB_EXCLUDE_EXTENSIONS}:
+            return True
+
+    # Exclude by prefix (boundary-aware)
+    for pref in settings.GITHUB_EXCLUDE_PREFIXES:
+        pref_n = _norm_path(pref).rstrip("/")
+        if not pref_n:
+            continue
+        if p == pref_n or p.startswith(pref_n + "/"):
+            return True
+
+    return False
+
+
+def _is_included_path(path: str) -> bool:
+    """
+    ✅ NEW: include allowlist.
+    If include prefixes/files is empty => include everything.
+    """
+    p = _norm_path(path)
+
+    inc_pref = [(_norm_path(x).rstrip("/") + "/") for x in settings.GITHUB_INCLUDE_PREFIXES if x.strip()]
+    inc_files = set(_norm_path(x) for x in settings.GITHUB_INCLUDE_FILES if x.strip())
+
+    if not inc_pref and not inc_files:
+        return True
+
+    if p in inc_files:
+        return True
+
+    for pref in inc_pref:
+        if p.startswith(pref):
+            return True
+
+    return False
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "goal-autopilot-repo-sync",
+    }
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
+    return headers
+
+
+def _looks_textual(path: str, raw_bytes: bytes) -> bool:
+    ext = (path.rsplit(".", 1)[-1].lower() if "." in path else "")
+    if ext in {"png", "jpg", "jpeg", "gif", "webp", "pdf", "zip", "gz", "tar", "7z", "exe", "dll"}:
+        return False
+
+    mt, _ = mimetypes.guess_type(path)
+    if mt and (mt.startswith("image/") or mt in {"application/pdf", "application/zip"}):
+        return False
+
+    if b"\x00" in raw_bytes[:4000]:
+        return False
+
+    try:
+        raw_bytes.decode("utf-8")
+        return True
+    except Exception:
+        return False
+
+
+async def _github_get_json(url: str) -> Any:
+    timeout = httpx.Timeout(connect=settings.GITHUB_CONNECT_TIMEOUT_S, read=settings.GITHUB_READ_TIMEOUT_S)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(url, headers=_github_headers())
+        r.raise_for_status()
+        return r.json()
+
+
+async def _github_get_content(owner_repo: str, path: str, ref: str) -> tuple[bytes | None, str | None]:
+    """
+    Returns raw bytes (decoded from GitHub API base64) and sha.
+    """
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}?ref={ref}"
+    j = await _github_get_json(url)
+
+    if isinstance(j, dict) and j.get("type") == "file":
+        sha = j.get("sha")
+        content_b64 = j.get("content")
+        enc = j.get("encoding")
+        if enc == "base64" and content_b64:
+            raw = base64.b64decode(content_b64)
+            return raw, sha
+    return None, None
+
+
+async def _github_list_tree(owner_repo: str, ref: str) -> tuple[list[dict[str, Any]], str | None]:
+    """
+    Use git/trees API to list all files in one shot.
+    """
+    # Get commit sha for branch/ref
+    ref_url = f"https://api.github.com/repos/{owner_repo}/git/refs/heads/{ref}"
+    try:
+        ref_json = await _github_get_json(ref_url)
+        commit_sha = ref_json.get("object", {}).get("sha")
+    except Exception:
+        commit_sha = None
+
+    # Fallback: allow calling tree on branch name
+    tree_ref = commit_sha or ref
+
+    tree_url = f"https://api.github.com/repos/{owner_repo}/git/trees/{tree_ref}?recursive=1"
+    tree_json = await _github_get_json(tree_url)
+
+    items = tree_json.get("tree", []) if isinstance(tree_json, dict) else []
+    return items, commit_sha
 
 
 def latest_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> RepoSnapshot | None:
@@ -38,202 +163,139 @@ def latest_snapshot(db: Session, repo: str | None = None, branch: str | None = N
     return q.order_by(desc(RepoSnapshot.id)).first()
 
 
-def _excluded_path(path: str) -> bool:
-    p = path.replace("\\", "/")
+def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
+    files = db.scalars(select(RepoFile.path, RepoFile.content_kind, RepoFile.skipped).where(RepoFile.snapshot_id == snapshot_id)).all()
+    total = len(files)
+    text_files = sum(1 for _p, kind, _s in files if kind == "text")
+    binary_files = sum(1 for _p, kind, _s in files if kind == "binary")
+    skipped_files = sum(1 for _p, _k, s in files if s)
 
-    for pref in settings.GITHUB_EXCLUDE_PREFIXES:
-        if p.startswith(pref):
-            return True
-
-    # extension check
-    if "." in p:
-        ext = p.rsplit(".", 1)[-1].lower()
-        if ext in set(settings.GITHUB_EXCLUDE_EXTENSIONS):
-            return True
-
-    # directory name check
-    parts = [x for x in p.split("/") if x]
-    for dn in settings.GITHUB_EXCLUDE_DIR_NAMES:
-        if dn in parts:
-            return True
-
-    return False
-
-
-def _folder_counts(paths: Iterable[str]) -> list[dict[str, Any]]:
+    # top folder
     counts: dict[str, int] = {}
-    for p in paths:
-        folder = p.split("/", 1)[0] if "/" in p else p
-        counts[folder] = counts.get(folder, 0) + 1
-    return [{"folder": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
+    for p, _k, _s in files:
+        root = p.split("/", 1)[0] if "/" in p else p
+        counts[root] = counts.get(root, 0) + 1
+    top_folders = [{"folder": k, "count": v} for k, v in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
+
+    return {
+        "total_files": total,
+        "text_files": text_files,
+        "binary_files": binary_files,
+        "skipped_files": skipped_files,
+        "top_folders": top_folders,
+    }
 
 
-async def _github_api_json(url: str) -> Any:
-    headers = {"Accept": "application/vnd.github+json"}
-    if settings.GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
-
-    timeout = httpx.Timeout(connect=settings.GITHUB_CONNECT_TIMEOUT_S, read=settings.GITHUB_READ_TIMEOUT_S)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.json()
-
-
-async def _github_api_bytes(url: str) -> bytes:
-    headers = {"Accept": "application/vnd.github+json"}
-    if settings.GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
-
-    timeout = httpx.Timeout(connect=settings.GITHUB_CONNECT_TIMEOUT_S, read=settings.GITHUB_READ_TIMEOUT_S)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.content
-
-
-async def create_snapshot(db: Session, *, repo: str, branch: str) -> tuple[RepoSnapshot, SnapshotStats]:
+async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> SyncResult:
     """
-    Creates a RepoSnapshot + RepoFile rows.
-    Uses either:
-      - settings.REPO_LOCAL_PATH (fast, no GitHub token), OR
-      - GitHub REST API (requires token for private repos)
+    This is the function your routes + scheduler import.
     """
+    owner_repo = repo or "AzRea7/OneHaven"
+    ref = branch or "main"
 
     warnings: list[str] = []
 
-    snap = RepoSnapshot(repo=repo, branch=branch, commit_sha=None, file_count=0, stored_content_files=0,
-                        warnings_json=_json_list([]))
+    items, commit_sha = await _github_list_tree(owner_repo, ref=ref)
+
+    snap = RepoSnapshot(
+        repo=owner_repo,
+        branch=ref,
+        commit_sha=commit_sha,
+        file_count=0,
+        stored_content_files=0,
+        warnings_json=None,
+    )
     db.add(snap)
     db.commit()
     db.refresh(snap)
 
-    # ---- Local scan mode ----
-    if settings.REPO_LOCAL_PATH:
-        root = settings.REPO_LOCAL_PATH
-        if not os.path.isdir(root):
-            warnings.append(f"REPO_LOCAL_PATH not found: {root}")
-            snap.warnings_json = _json_list(warnings)
-            db.commit()
-            return snap, SnapshotStats(0, 0, 0, 0, [])
+    # Filter only "blob" entries (files)
+    blobs = [x for x in items if x.get("type") == "blob"]
 
-        file_paths: list[str] = []
-        for dirpath, _, filenames in os.walk(root):
-            for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root).replace("\\", "/")
-                if _excluded_path(rel):
-                    continue
-                file_paths.append(rel)
-                if len(file_paths) >= settings.GITHUB_MAX_FILES_PER_SYNC:
-                    warnings.append(f"Hit GITHUB_MAX_FILES_PER_SYNC={settings.GITHUB_MAX_FILES_PER_SYNC} in local scan.")
-                    break
+    # Apply include/exclude
+    kept: list[dict[str, Any]] = []
+    for x in blobs:
+        p = _norm_path(x.get("path", ""))
+        if not p:
+            continue
+        if not _is_included_path(p):
+            continue
+        if _is_excluded_path(p):
+            continue
+        kept.append(x)
 
-        stored = 0
-        for p in file_paths:
-            full = os.path.join(root, p)
-            try:
-                b = open(full, "rb").read()
-            except Exception:
-                db.add(RepoFile(snapshot_id=snap.id, path=p, sha=None, size=None, content=None,
-                                content_kind="skipped", skipped=True, is_text=True))
-                continue
+    if len(kept) > settings.GITHUB_MAX_FILES:
+        warnings.append(f"Too many files after filtering ({len(kept)}). Truncating to {settings.GITHUB_MAX_FILES}.")
+        kept = kept[: settings.GITHUB_MAX_FILES]
 
-            if len(b) > settings.GITHUB_MAX_FILE_BYTES:
-                db.add(RepoFile(snapshot_id=snap.id, path=p, sha=None, size=len(b), content=None,
-                                content_kind="skipped", skipped=True, is_text=True))
-                continue
+    stored_text = 0
 
-            try:
-                text = b.decode("utf-8", errors="strict")
-                db.add(RepoFile(snapshot_id=snap.id, path=p, sha=None, size=len(b), content=text,
-                                content_kind="text", skipped=False, is_text=True))
-                stored += 1
-            except Exception:
-                db.add(RepoFile(snapshot_id=snap.id, path=p, sha=None, size=len(b), content=None,
-                                content_kind="binary", skipped=True, is_text=False))
+    for x in kept:
+        path = _norm_path(x.get("path", ""))
+        size = x.get("size")
+        sha = x.get("sha")
 
-        snap.file_count = len(file_paths)
-        snap.stored_content_files = stored
-        snap.warnings_json = _json_list(warnings)
-        db.commit()
+        # Default: skipped until proven text
+        content_kind = "skipped"
+        content = None
+        skipped = False
+        skip_reason = None
+        is_text = True
 
-        stats = SnapshotStats(
-            total_files=len(file_paths),
-            text_files=stored,
-            binary_files=len(file_paths) - stored,
-            skipped_files=len(file_paths) - stored,
-            top_folders=_folder_counts(file_paths),
+        if size is not None and size > settings.GITHUB_MAX_TEXT_BYTES:
+            skipped = True
+            skip_reason = f"too_large>{settings.GITHUB_MAX_TEXT_BYTES}"
+            content_kind = "skipped"
+        else:
+            raw, sha2 = await _github_get_content(owner_repo, path=path, ref=ref)
+            if raw is None:
+                skipped = True
+                skip_reason = "no_content"
+                content_kind = "skipped"
+            else:
+                if not _looks_textual(path, raw):
+                    content_kind = "binary"
+                    is_text = False
+                    skipped = True
+                    skip_reason = "binary"
+                else:
+                    # Store UTF-8 content (truncate if huge)
+                    txt = raw.decode("utf-8", errors="replace")
+                    if len(txt) > settings.GITHUB_MAX_TEXT_BYTES:
+                        txt = txt[: settings.GITHUB_MAX_TEXT_BYTES]
+                        skip_reason = "truncated"
+                    content = txt
+                    content_kind = "text"
+                    stored_text += 1
+                    sha = sha2 or sha
+
+        db.add(
+            RepoFile(
+                snapshot_id=snap.id,
+                path=path,
+                sha=sha,
+                size=size,
+                is_text=is_text,
+                skipped=skipped,
+                skip_reason=skip_reason,
+                content=content,
+                content_kind=content_kind,
+                content_text=content,  # optional mirror
+            )
         )
-        return snap, stats
 
-    # ---- GitHub API mode ----
-    # List tree
-    tree_url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
-    tree = await _github_api_json(tree_url)
+    snap.file_count = len(kept)
+    snap.stored_content_files = stored_text
+    snap.warnings_json = json.dumps(warnings) if warnings else None
 
-    entries = tree.get("tree") or []
-    paths: list[dict[str, Any]] = []
-    excluded = 0
-
-    for e in entries:
-        if e.get("type") != "blob":
-            continue
-        path = e.get("path") or ""
-        if not path:
-            continue
-        if _excluded_path(path):
-            excluded += 1
-            continue
-        paths.append(e)
-        if len(paths) >= settings.GITHUB_MAX_FILES_PER_SYNC:
-            warnings.append(f"Hit GITHUB_MAX_FILES_PER_SYNC={settings.GITHUB_MAX_FILES_PER_SYNC}.")
-            break
-
-    if excluded:
-        warnings.append(f"Excluded {excluded} paths via GITHUB_EXCLUDE_* rules.")
-
-    stored = 0
-    for e in paths:
-        path = e.get("path")
-        sha = e.get("sha")
-        size = e.get("size")
-
-        # fetch blob
-        try:
-            blob = await _github_api_json(f"https://api.github.com/repos/{repo}/git/blobs/{sha}")
-            enc = blob.get("encoding")
-            content = blob.get("content") or ""
-            raw = base64.b64decode(content) if enc == "base64" else content.encode("utf-8", errors="ignore")
-        except Exception:
-            db.add(RepoFile(snapshot_id=snap.id, path=path, sha=sha, size=size, content=None,
-                            content_kind="skipped", skipped=True, is_text=True))
-            continue
-
-        if size and size > settings.GITHUB_MAX_FILE_BYTES:
-            db.add(RepoFile(snapshot_id=snap.id, path=path, sha=sha, size=size, content=None,
-                            content_kind="skipped", skipped=True, is_text=True))
-            continue
-
-        try:
-            text = raw.decode("utf-8", errors="strict")
-            db.add(RepoFile(snapshot_id=snap.id, path=path, sha=sha, size=size, content=text,
-                            content_kind="text", skipped=False, is_text=True))
-            stored += 1
-        except Exception:
-            db.add(RepoFile(snapshot_id=snap.id, path=path, sha=sha, size=size, content=None,
-                            content_kind="binary", skipped=True, is_text=False))
-
-    snap.file_count = len(paths)
-    snap.stored_content_files = stored
-    snap.warnings_json = _json_list(warnings)
     db.commit()
 
-    stats = SnapshotStats(
-        total_files=len(paths),
-        text_files=stored,
-        binary_files=len(paths) - stored,
-        skipped_files=len(paths) - stored,
-        top_folders=_folder_counts([p["path"] for p in paths if p.get("path")]),
+    return SyncResult(
+        snapshot_id=snap.id,
+        repo=snap.repo,
+        branch=snap.branch,
+        commit_sha=snap.commit_sha,
+        file_count=snap.file_count,
+        stored_content_files=snap.stored_content_files,
+        warnings=warnings,
     )
-    return snap, stats

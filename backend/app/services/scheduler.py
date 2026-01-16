@@ -1,12 +1,13 @@
 # backend/app/services/scheduler.py
 from __future__ import annotations
 
+import os
 import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ..config import settings
-from ..db import SessionLocal
+from ..db import get_db, SessionLocal
 from .planner import generate_daily_plan
 from .notifier import send_webhook, send_email
 from .github_sync import create_repo_snapshot
@@ -17,35 +18,26 @@ _scheduler: BackgroundScheduler | None = None
 
 def start_scheduler() -> None:
     global _scheduler
-    if _scheduler:
+    if _scheduler is not None:
         return
 
-    _scheduler = BackgroundScheduler(timezone="America/Detroit")
+    enabled = (os.getenv("SCHEDULER_ENABLED") or "false").lower() == "true"
+    if not enabled:
+        return
 
-    # Daily Plan
-    _scheduler.add_job(
-        _run_daily_plan_job,
-        CronTrigger(hour=settings.DAILY_PLAN_HOUR, minute=settings.DAILY_PLAN_MINUTE),
-        id="daily_plan",
-        replace_existing=True,
-    )
+    _scheduler = BackgroundScheduler()
 
-    # Midday Nudge
-    _scheduler.add_job(
-        _run_midday_nudge_job,
-        CronTrigger(hour=settings.MIDDAY_NUDGE_HOUR, minute=settings.MIDDAY_NUDGE_MINUTE),
-        id="midday_nudge",
-        replace_existing=True,
-    )
+    repo = os.getenv("GITHUB_DEFAULT_REPO")
+    branch = os.getenv("GITHUB_DEFAULT_BRANCH") or "main"
+    project = os.getenv("REPO_TASK_PROJECT") or "haven"
 
-    # Repo -> tasks pipeline (Haven)
-    _scheduler.add_job(
-        _run_repo_pipeline_job,
-        CronTrigger(hour=settings.REPO_SYNC_HOUR, minute=settings.REPO_SYNC_MINUTE),
-        id="repo_pipeline",
-        replace_existing=True,
-    )
+    async def _job():
+        db = next(get_db())
+        res = await create_repo_snapshot(db=db, repo=repo, branch=branch)
+        await generate_tasks_from_snapshot(db=db, snapshot_id=res["snapshot_id"], project=project)
 
+    # every 6 hours by default
+    _scheduler.add_job(_job, "interval", hours=int(os.getenv("REPO_TASK_INTERVAL_HOURS") or "6"))
     _scheduler.start()
 
 

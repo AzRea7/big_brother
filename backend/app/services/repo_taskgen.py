@@ -1,203 +1,267 @@
+# backend/app/services/repo_taskgen.py
 from __future__ import annotations
 
+import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
+import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import RepoFile, RepoSnapshot, Task
-from ..ai.repo_tasks import suggest_repo_tasks_llm
+from ..models import RepoFile, Task
+
+
+@dataclass
+class RepoTask:
+    title: str
+    notes: str
+    starter: str | None
+    dod: str | None
+    tags: str
+    link: str
+
+
+_TODO_RE = re.compile(r"\b(TODO|FIXME|HACK)\b[:\-\s]*(.*)", re.IGNORECASE)
 
 
 def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, int]:
-    total = db.query(RepoFile).filter(RepoFile.snapshot_id == snapshot_id).count()
+    files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
+    total = len(files)
+    with_todo = 0
+    with_fixme = 0
+    with_impl = 0
 
-    # look in text content only
-    rows = db.query(RepoFile.path, RepoFile.content).filter(
-        RepoFile.snapshot_id == snapshot_id,
-        RepoFile.content_kind == "text",
-        RepoFile.content.isnot(None),
-    ).all()
+    impl_signals = ("router", "service", "adapter", "repo", "model", "schema", "migration", "scheduler", "docker", "compose")
 
-    todo = 0
-    fixme = 0
-    impl = 0
-
-    impl_patterns = [
-        r"\bTODO\b",
-        r"\bFIXME\b",
-        r"pass\s*(#\s*TODO|#\s*FIXME)?",
-        r"raise\s+NotImplementedError",
-        r"NotImplementedError\(",
-        r"IMPLEMENT\s+ME",
-    ]
-
-    for _, content in rows:
-        c = content or ""
-        if "TODO" in c:
-            todo += 1
-        if "FIXME" in c:
-            fixme += 1
-        if any(re.search(p, c) for p in impl_patterns):
-            impl += 1
+    for f in files:
+        txt = f.content or ""
+        if _TODO_RE.search(txt):
+            if "todo" in txt.lower():
+                with_todo += 1
+            if "fixme" in txt.lower():
+                with_fixme += 1
+        p = (f.path or "").lower()
+        if any(s in p for s in impl_signals):
+            with_impl += 1
 
     return {
         "total_files": total,
-        "files_with_todo": todo,
-        "files_with_fixme": fixme,
-        "files_with_impl_signals": impl,
+        "files_with_todo": with_todo,
+        "files_with_fixme": with_fixme,
+        "files_with_impl_signals": with_impl,
     }
 
 
-def _select_relevant_files(db: Session, snapshot_id: int, limit: int = 20) -> list[RepoFile]:
+def _rank_paths(paths: list[str]) -> list[str]:
     """
-    Heuristic: grab a small set of files that contain strong signals.
-    Your current signal_counts shows 9 impl-signal files; we pull around that.
+    Prefer code + architecture files. This is crude but works well.
     """
-    candidates = db.query(RepoFile).filter(
-        RepoFile.snapshot_id == snapshot_id,
-        RepoFile.content_kind == "text",
-        RepoFile.skipped == False,  # noqa: E712
-        RepoFile.content.isnot(None),
+    def score(p: str) -> int:
+        pl = p.lower()
+        s = 0
+        if "backend" in pl or "/app/" in pl:
+            s += 40
+        if any(x in pl for x in ["/routes/", "/services/", "/adapters/", "/models", "/schemas", "/db", "dockerfile", "compose", "pyproject", "readme"]):
+            s += 30
+        if pl.endswith((".py", ".md", ".yml", ".yaml", ".toml")):
+            s += 10
+        if "test" in pl:
+            s += 5
+        return s
+
+    return sorted(paths, key=score, reverse=True)
+
+
+def _build_prompt(repo: str, branch: str, files: list[RepoFile]) -> str:
+    max_chars = settings.REPO_TASKGEN_MAX_CHARS_PER_FILE
+
+    blobs: list[str] = []
+    for f in files:
+        body = (f.content or "")[:max_chars]
+        blobs.append(f"---\nFILE: {f.path}\n---\n{body}\n")
+
+    instruction = f"""
+You are generating engineering tasks from a code repository snapshot.
+
+Repo: {repo}
+Branch: {branch}
+
+Output MUST be valid JSON with this schema:
+
+{{
+  "tasks": [
+    {{
+      "title": "...",
+      "notes": "...",
+      "starter": "...",
+      "dod": "...",
+      "tags": "repo,autogen,<other_tags>",
+      "link": "repo://{repo}?branch={branch}#<path>"
+    }}
+  ]
+}}
+
+Rules:
+- Produce {settings.REPO_TASKGEN_LIMIT} tasks max.
+- Every task must include tags containing BOTH "repo" and "autogen".
+- Every link must point to a real file path seen below (use #<path>).
+- Tasks must be specific, concrete, and testable (mention what to change + where + acceptance checks).
+- Prefer tasks that improve correctness, security, performance, observability, and developer UX.
+- Avoid vague tasks like "review X" unless you specify exact checks and outputs.
+"""
+
+    return instruction.strip() + "\n\n" + "\n".join(blobs)
+
+
+async def _openai_json(prompt: str) -> dict[str, Any]:
+    if not settings.LLM_API_KEY:
+        raise RuntimeError("LLM enabled but LLM_API_KEY is missing")
+
+    url = settings.LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {settings.LLM_API_KEY}", "Content-Type": "application/json"}
+
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a senior staff software engineer. Be precise and practical."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+    timeout = httpx.Timeout(connect=10.0, read=60.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        j = r.json()
+
+    content = j["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+
+def _validate_tasks(tasks: list[dict[str, Any]], valid_paths: set[str], repo: str, branch: str) -> list[RepoTask]:
+    out: list[RepoTask] = []
+
+    for t in tasks:
+        title = (t.get("title") or "").strip()
+        notes = (t.get("notes") or "").strip()
+        starter = (t.get("starter") or "").strip() or None
+        dod = (t.get("dod") or "").strip() or None
+        tags = (t.get("tags") or "").strip()
+        link = (t.get("link") or "").strip()
+
+        if not title or not notes or not tags or not link:
+            continue
+        tl = tags.lower()
+        if "repo" not in tl or "autogen" not in tl:
+            continue
+
+        prefix = f"repo://{repo}?branch={branch}#"
+        if not link.startswith(prefix):
+            continue
+        path = link.split("#", 1)[-1]
+        if path not in valid_paths:
+            continue
+
+        out.append(RepoTask(title=title, notes=notes, starter=starter, dod=dod, tags=tags, link=link))
+
+    return out
+
+
+def _fallback_todo_tasks(db: Session, snapshot_id: int, limit: int) -> list[RepoTask]:
+    files = db.scalars(
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot_id)
+        .where(RepoFile.content_kind == "text")
     ).all()
 
-    scored: list[tuple[int, RepoFile]] = []
-    for rf in candidates:
-        c = rf.content or ""
-        score = 0
-        score += 3 if "TODO" in c else 0
-        score += 3 if "FIXME" in c else 0
-        score += 4 if "NotImplementedError" in c else 0
-        score += 1 if "test" in rf.path.lower() else 0
-        score += 1 if rf.path.endswith(".py") else 0
-        if score > 0:
-            scored.append((score, rf))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [rf for _, rf in scored[:limit]]
-
-
-def _file_summary(rf: RepoFile, max_chars: int = 1200) -> dict[str, Any]:
-    c = (rf.content or "")
-    c = c[:max_chars]
-    signals: list[str] = []
-    if "TODO" in c:
-        signals.append("TODO")
-    if "FIXME" in c:
-        signals.append("FIXME")
-    if "NotImplementedError" in c:
-        signals.append("NotImplementedError")
-    return {
-        "path": rf.path,
-        "signals": signals,
-        "snippet": c,
-    }
+    tasks: list[RepoTask] = []
+    for f in files:
+        if not f.content:
+            continue
+        for i, line in enumerate(f.content.splitlines()[:2000]):
+            m = _TODO_RE.search(line)
+            if not m:
+                continue
+            msg = (m.group(2) or "").strip() or "Unspecified"
+            msg = msg[:160]
+            title = f"{m.group(1).upper()}: {msg}"
+            notes = f"Found {m.group(1).upper()} in `{f.path}` line ~{i+1}:\n\n{line.strip()}"
+            link = f"repo://snapshot/{snapshot_id}#{f.path}"
+            tasks.append(RepoTask(title=title, notes=notes, starter="Open the file and locate the TODO.", dod="TODO resolved or converted into tracked work + tests.", tags="repo,autogen,todo", link=link))
+            if len(tasks) >= limit:
+                return tasks
+    return tasks
 
 
-def _seed_tasks(repo: str, branch: str, snapshot_id: int, seeds: list[str]) -> list[dict[str, Any]]:
-    # deterministic “starter pack” if LLM disabled
-    base = [
-        {
-            "title": "Security pass: tighten auth + secrets hygiene",
-            "notes": "Review debug endpoints, API-key handling, headers, CORS, and ensure secrets are never logged. Add rate limiting where appropriate. Acceptance: no secret logs, debug endpoints guarded.",
-            "priority": 5,
-            "estimated_minutes": 90,
-            "link": f"repo://seed/security?snapshot={snapshot_id}&repo={repo}&branch={branch}",
-            "tags": "repo,security,autogen,seed",
-        },
-        {
-            "title": "Add E2E test: repo sync → task gen → complete persists",
-            "notes": "Add an end-to-end test that triggers sync_and_generate, asserts tasks exist, completes one, and confirms persistence. Acceptance: test passes in CI.",
-            "priority": 5,
-            "estimated_minutes": 120,
-            "link": f"repo://seed/e2e?snapshot={snapshot_id}&repo={repo}&branch={branch}",
-            "tags": "repo,e2e,autogen,seed",
-        },
-        {
-            "title": "Observability: request IDs + structured logs + safe errors",
-            "notes": "Add request_id correlation, structured logging, and ensure error responses don't leak secrets. Acceptance: request_id present, errors sanitized, add regression test.",
-            "priority": 4,
-            "estimated_minutes": 90,
-            "link": f"repo://seed/observability?snapshot={snapshot_id}&repo={repo}&branch={branch}",
-            "tags": "repo,observability,autogen,seed",
-        },
-    ]
-    wanted = set([s.strip().lower() for s in seeds if s.strip()])
-    if not wanted:
-        return base
-    out = []
-    for t in base:
-        if any(w in t["tags"].lower() or w in t["title"].lower() for w in wanted):
-            out.append(t)
-    return out or base
-
-
-def generate_tasks_from_snapshot(db: Session, *, snapshot_id: int, project: str) -> tuple[int, int]:
+async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: str = "haven") -> tuple[int, int]:
     """
-    Returns (created_tasks, skipped_duplicates)
-    Dedupe key = (project, title, link)
+    Returns (created, skipped_duplicates)
     """
-    snap = db.query(RepoSnapshot).filter(RepoSnapshot.id == snapshot_id).first()
+    snap = db.execute(select(RepoSnapshot).where(RepoSnapshot.id == snapshot_id)).scalars().first()
     if not snap:
-        raise ValueError(f"snapshot_id not found: {snapshot_id}")
+        raise ValueError(f"snapshot_id={snapshot_id} not found")
 
-    # guardrail: only allow haven repo tasks unless you disable
-    if settings.HAVEN_REPO_ONLY and project != "haven":
-        raise RuntimeError("Repo task generation restricted to project=haven (set HAVEN_REPO_ONLY=false to change).")
+    files = db.scalars(
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot_id)
+        .where(RepoFile.content_kind == "text")
+    ).all()
 
-    signals = compute_signal_counts(db, snapshot_id)
-    relevant = _select_relevant_files(db, snapshot_id, limit=20)
-    summaries = [_file_summary(rf) for rf in relevant]
+    paths = [f.path for f in files if f.path]
+    ranked = _rank_paths(paths)
+    pick = ranked[: settings.REPO_TASKGEN_MAX_FILES_IN_PROMPT]
+    picked_files = [f for f in files if f.path in set(pick)]
 
-    tasks_payload: list[dict[str, Any]]
+    valid_paths = set(paths)
+
+    repo = snap.repo
+    branch = snap.branch
+
+    tasks: list[RepoTask] = []
+
     if settings.LLM_ENABLED:
-        tasks_payload = (
-            # LLM-first: if it fails, you WANT it to fail loudly during dev
-            # so you fix prompt/response instead of silently seeding forever.
-            __import__("asyncio").run(suggest_repo_tasks_llm(  # type: ignore
-                repo=snap.repo,
-                branch=snap.branch,
-                snapshot_id=snap.id,
-                signals=signals,
-                file_summaries=summaries,
-            ))
-        )
-    else:
-        seeds = [s.strip() for s in (settings.REPO_TASK_SEEDS or "").split(",")]
-        tasks_payload = _seed_tasks(snap.repo, snap.branch, snap.id, seeds)
+        prompt = _build_prompt(repo=repo, branch=branch, files=picked_files)
+        try:
+            j = await _openai_json(prompt)
+            raw_tasks = j.get("tasks", [])
+            if isinstance(raw_tasks, list):
+                tasks = _validate_tasks(raw_tasks, valid_paths=valid_paths, repo=repo, branch=branch)
+        except Exception:
+            tasks = []
+
+    if not tasks:
+        tasks = _fallback_todo_tasks(db, snapshot_id=snapshot_id, limit=settings.REPO_TASKGEN_LIMIT)
+
+    # De-dupe on (title, project)
+    existing = set(
+        db.scalars(select(Task.title).where(Task.project == project)).all()
+    )
 
     created = 0
     skipped = 0
 
-    for t in tasks_payload:
-        title = (t.get("title") or "").strip()
-        link = (t.get("link") or "").strip()
-        if not title:
-            continue
-
-        # dedupe
-        exists = db.query(Task).filter(
-            Task.project == project,
-            Task.title == title,
-            Task.link == link,
-        ).first()
-        if exists:
+    for t in tasks[: settings.REPO_TASKGEN_LIMIT]:
+        if t.title in existing:
             skipped += 1
             continue
 
         db.add(
             Task(
-                title=title,
-                notes=t.get("notes"),
-                priority=int(t.get("priority") or 3),
-                estimated_minutes=int(t.get("estimated_minutes") or 45),
+                title=t.title,
+                notes=t.notes,
                 project=project,
-                tags=t.get("tags") or "repo,autogen",
-                link=link,
-                blocks_me=bool(t.get("blocks_me") or False),
-                starter=t.get("starter"),
-                dod=t.get("dod"),
+                tags=t.tags,
+                link=t.link,
+                starter=t.starter,
+                dod=t.dod,
+                priority=4,
+                estimated_minutes=90,
+                blocks_me=False,
+                completed=False,
             )
         )
         created += 1

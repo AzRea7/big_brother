@@ -128,7 +128,7 @@ class RepoFile(Base):
 
     is_text: Mapped[bool] = mapped_column(Boolean, default=True)
     skipped: Mapped[bool] = mapped_column(Boolean, default=False)
-
+    skip_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # keeping both fields since your migrations/table have "content" and "content_kind"
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_kind: Mapped[str] = mapped_column(String(30), default="skipped")  # text|binary|skipped
