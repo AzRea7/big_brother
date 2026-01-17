@@ -101,21 +101,44 @@ class RepoSyncOut(BaseModel):
     snapshot_id: int
     repo: str
     branch: str
-    commit_sha: Optional[str] = None
+    commit_sha: str
     file_count: int
     stored_content_files: int
-    warnings: list[str] = []
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RepoSignalCountsOut(BaseModel):
     snapshot_id: int
-    total_files: int
-    files_with_todo: int
-    files_with_fixme: int
-    files_with_impl_signals: int
+    signals: dict[str, int]
+
+
+class RepoFindingOut(BaseModel):
+    id: int
+    snapshot_id: int
+    category: str
+    severity: str
+    title: str
+    file_path: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    evidence: Optional[str] = None
+    recommendation: Optional[str] = None
+    acceptance: Optional[str] = None
+    fingerprint: str
+    created_at: datetime
+    is_resolved: bool
+
+    class Config:
+        from_attributes = True
+
+
+class RepoScanOut(BaseModel):
+    snapshot_id: int
+    inserted: int
+    total_findings: int
 
 
 class RepoTaskGenOut(BaseModel):
     snapshot_id: int
-    created_tasks: int
-    skipped_duplicates: int
+    generated_at: datetime
+    tasks: list[TaskCreate]

@@ -4,7 +4,16 @@ from __future__ import annotations
 from datetime import datetime, date
 from typing import Optional
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -20,7 +29,6 @@ class Goal(Base):
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    # lane/project for goal filtering
     project: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # haven | onestream | personal
 
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="goal")
@@ -46,19 +54,16 @@ class Task(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    # task metadata
     project: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     starter: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dod: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # precision scoring
     impact_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     confidence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     energy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
 
-    # microtasks
     parent_task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     goal: Mapped[Goal | None] = relationship("Goal", back_populates="tasks")
@@ -101,9 +106,14 @@ class RepoSnapshot(Base):
     warnings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    # ✅ SQLAlchemy needs an FK to infer RepoSnapshot.files join
     files: Mapped[list["RepoFile"]] = relationship(
         "RepoFile",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+
+    findings: Mapped[list["RepoFinding"]] = relationship(
+        "RepoFinding",
         back_populates="snapshot",
         cascade="all, delete-orphan",
     )
@@ -114,7 +124,6 @@ class RepoFile(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    # ✅ this is the missing piece
     snapshot_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("repo_snapshots.id"),
@@ -129,7 +138,7 @@ class RepoFile(Base):
     is_text: Mapped[bool] = mapped_column(Boolean, default=True)
     skipped: Mapped[bool] = mapped_column(Boolean, default=False)
     skip_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # keeping both fields since your migrations/table have "content" and "content_kind"
+
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_kind: Mapped[str] = mapped_column(String(30), default="skipped")  # text|binary|skipped
     content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -137,3 +146,42 @@ class RepoFile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     snapshot: Mapped[RepoSnapshot] = relationship("RepoSnapshot", back_populates="files")
+
+
+# ---------------------------
+# Level 2: LLM Findings (virtual TODO/FIXME)
+# ---------------------------
+
+class RepoFinding(Base):
+    __tablename__ = "repo_findings"
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "fingerprint", name="uq_finding_fingerprint"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("repo_snapshots.id"),
+        index=True,
+        nullable=False,
+    )
+
+    # where
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    line: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # what
+    category: Mapped[str] = mapped_column(String(48), nullable=False)  # security|reliability|db|api|tests|ops|perf|style
+    severity: Mapped[int] = mapped_column(Integer, default=3, nullable=False)  # 1..5
+
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)        # excerpt / why
+    recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # what to do
+
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)        # stable dedupe key
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    snapshot: Mapped[RepoSnapshot] = relationship("RepoSnapshot", back_populates="findings")

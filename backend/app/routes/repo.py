@@ -1,283 +1,311 @@
 # backend/app/routes/repo.py
 from __future__ import annotations
 
-import json
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import get_db
-from ..models import RepoSnapshot
-from ..schemas import RepoSignalCountsOut, RepoSyncOut, RepoTaskGenOut
-from ..services.github_sync import (
-    create_repo_snapshot,
-    latest_snapshot as latest_repo_snapshot,
-    snapshot_file_stats,
-)
+from ..models import RepoFile, RepoSnapshot
 from ..services.repo_taskgen import compute_signal_counts, generate_tasks_from_snapshot
+from ..services.repo_findings import run_llm_scan, list_findings, tasks_from_findings
 
-# --------------------------
-# Debug router (repo sync + task gen)
-# --------------------------
+# ---- github_sync import: support multiple names defensively ----
+try:
+    from ..services.github_sync import sync_repo_snapshot  # preferred
+except Exception:
+    sync_repo_snapshot = None  # type: ignore
+
+try:
+    from ..services.github_sync import sync_snapshot  # fallback
+except Exception:
+    sync_snapshot = None  # type: ignore
+
+try:
+    from ..services.github_sync import sync_repo  # fallback
+except Exception:
+    sync_repo = None  # type: ignore
+
+
 router = APIRouter(prefix="/debug/repo", tags=["repo"])
+status_router = APIRouter(tags=["repo-ui"])
 
 
-@router.post("/sync", response_model=RepoSyncOut)
-async def sync_repo(
+def _snapshot_or_404(db: Session, snapshot_id: int) -> RepoSnapshot:
+    snap = db.get(RepoSnapshot, snapshot_id)
+    if not snap:
+        raise HTTPException(status_code=404, detail=f"snapshot_id={snapshot_id} not found")
+    return snap
+
+
+def _sync(db: Session, repo: str, branch: str) -> dict[str, Any]:
+    """
+    Some earlier versions exported different function names.
+    Try a few in order.
+    """
+    if sync_repo_snapshot:
+        return sync_repo_snapshot(db=db, repo=repo, branch=branch)  # type: ignore[misc]
+    if sync_snapshot:
+        return sync_snapshot(db=db, repo=repo, branch=branch)  # type: ignore[misc]
+    if sync_repo:
+        return sync_repo(db=db, repo=repo, branch=branch)  # type: ignore[misc]
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "github_sync does not export a supported sync function. Tried: "
+            "sync_repo_snapshot, sync_snapshot, sync_repo."
+        ),
+    )
+
+
+@router.post("/sync", response_class=JSONResponse)
+def repo_sync(
     repo: str | None = Query(default=None),
     branch: str | None = Query(default=None),
     db: Session = Depends(get_db),
-):
-    res = await create_repo_snapshot(db=db, repo=repo, branch=branch)
-    return {
-        "snapshot_id": res.snapshot_id,
-        "repo": res.repo,
-        "branch": res.branch,
-        "commit_sha": res.commit_sha,
-        "file_count": res.file_count,
-        "stored_content_files": res.stored_content_files,
-        "warnings": res.warnings,
-    }
-
-
-@router.get("/latest_snapshot")
-def latest_snapshot_debug(db: Session = Depends(get_db)):
-    snap = db.execute(select(RepoSnapshot).order_by(RepoSnapshot.id.desc())).scalars().first()
-    if not snap:
-        return {"snapshot_id": None}
-    return {"snapshot_id": snap.id, "repo": snap.repo, "branch": snap.branch, "commit_sha": snap.commit_sha}
-
-
-@router.get("/signal_counts", response_model=RepoSignalCountsOut)
-def signal_counts(snapshot_id: int, db: Session = Depends(get_db)):
-    """
-    Backwards-compatible signal endpoint: only returns fields your schema expects.
-    """
-    s = compute_signal_counts(db, snapshot_id)
-    return {
-        "snapshot_id": snapshot_id,
-        "total_files": s["total_files"],
-        "files_with_todo": s["files_with_todo"],
-        "files_with_fixme": s["files_with_fixme"],
-        "files_with_impl_signals": s["files_with_impl_signals"],
-    }
+) -> dict[str, Any]:
+    repo = repo or settings.GITHUB_REPO
+    branch = branch or settings.GITHUB_BRANCH
+    return _sync(db=db, repo=repo, branch=branch)
 
 
 @router.get("/signal_counts_full", response_class=JSONResponse)
-def signal_counts_full(snapshot_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """
-    Full production-grade signal breakdown.
-
-    This endpoint avoids breaking RepoSignalCountsOut while letting the UI (and you)
-    see what the snapshot actually contains: auth/timeout/retry/rate-limit/validation/etc.
-    """
-    s = compute_signal_counts(db, snapshot_id)
-    return {"snapshot_id": snapshot_id, "signals": s}
-
-
-@router.post("/generate_tasks", response_model=RepoTaskGenOut)
-async def generate_tasks(
-    snapshot_id: int,
-    project: str = Query(default="haven"),
+def signal_counts_full(
+    snapshot_id: int = Query(..., ge=1),
     db: Session = Depends(get_db),
-):
-    created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=snapshot_id, project=project)
-    return {"snapshot_id": snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
-
-
-@router.post("/sync_and_generate", response_model=RepoTaskGenOut)
-async def sync_and_generate(
-    project: str = Query(default="haven"),
-    repo: str | None = Query(default=None),
-    branch: str | None = Query(default=None),
-    db: Session = Depends(get_db),
-):
-    res = await create_repo_snapshot(db=db, repo=repo, branch=branch)
-    created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=res.snapshot_id, project=project)
-    return {"snapshot_id": res.snapshot_id, "created_tasks": created, "skipped_duplicates": skipped}
-
-
-# --------------------------
-# Status endpoint used by the Repo UI (/ui/repo)
-# --------------------------
-status_router = APIRouter(tags=["repo"])
-
-
-@status_router.get("/api/repo/status", response_class=JSONResponse)
-def repo_status(
-    db: Session = Depends(get_db),
-    repo: Optional[str] = Query(default=None),
-    branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
-    snap = latest_repo_snapshot(db, repo=repo, branch=branch)
-    if not snap:
-        return {"has_snapshot": False}
+    _snapshot_or_404(db, snapshot_id)
+    return {"snapshot_id": snapshot_id, "signals": compute_signal_counts(db, snapshot_id)}
 
-    stats = snapshot_file_stats(db, snapshot_id=snap.id)
-    warnings: list[str] = []
-    if snap.warnings_json:
-        try:
-            warnings = json.loads(snap.warnings_json)
-        except Exception:
-            warnings = ["(failed to parse warnings_json)"]
+
+@router.get("/search", response_class=JSONResponse)
+def search_snapshot(
+    snapshot_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=1, max_length=120),
+    limit: int = Query(default=25, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    needle = q.lower()
+
+    files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
+
+    hits: list[dict[str, Any]] = []
+    for rf in files:
+        if rf.content_kind != "text":
+            continue
+        text = (getattr(rf, "content_text", None) or rf.content or "")
+        if not text:
+            continue
+
+        idx = text.lower().find(needle)
+        if idx == -1:
+            continue
+
+        start = max(0, idx - 140)
+        end = min(len(text), idx + 240)
+        snippet = text[start:end].replace("\r\n", "\n")
+
+        hits.append(
+            {
+                "path": rf.path,
+                "content_kind": rf.content_kind,
+                "size": rf.size,
+                "snippet": snippet,
+            }
+        )
+        if len(hits) >= limit:
+            break
+
+    return {"snapshot_id": snapshot_id, "q": q, "hit_count": len(hits), "hits": hits}
+
+
+@router.post("/tasks_from_snapshot", response_class=JSONResponse)
+async def tasks_from_snapshot(
+    snapshot_id: int = Query(..., ge=1),
+    project: str = Query(default="haven"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=snapshot_id, project=project)
+    return {"snapshot_id": snapshot_id, "project": project, "created": created, "skipped": skipped}
+
+
+# --------------------------
+# NEW: LLM scan -> findings
+# --------------------------
+
+@router.post("/scan_llm", response_class=JSONResponse)
+async def scan_llm(
+    snapshot_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Run a bounded LLM scan and store RepoFinding rows.
+    """
+    _snapshot_or_404(db, snapshot_id)
+    out = await run_llm_scan(db=db, snapshot_id=snapshot_id)
+    return out
+
+
+@router.get("/findings", response_class=JSONResponse)
+def findings(
+    snapshot_id: int = Query(..., ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    rows = list_findings(db=db, snapshot_id=snapshot_id, limit=limit)
 
     return {
-        "has_snapshot": True,
-        "snapshot": {
-            "id": snap.id,
-            "repo": snap.repo,
-            "branch": snap.branch,
-            "commit_sha": snap.commit_sha,
-            "file_count": snap.file_count,
-            "stored_content_files": snap.stored_content_files,
-            "created_at": str(snap.created_at),
-            "warnings": warnings,
+        "snapshot_id": snapshot_id,
+        "count": len(rows),
+        "findings": [
+            {
+                "id": r.id,
+                "path": r.path,
+                "line": r.line,
+                "category": r.category,
+                "severity": r.severity,
+                "title": r.title,
+                "evidence": r.evidence,
+                "recommendation": r.recommendation,
+                "fingerprint": r.fingerprint,
+                "created_at": str(r.created_at) if getattr(r, "created_at", None) else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/tasks_from_findings", response_class=JSONResponse)
+def tasks_from_findings_route(
+    snapshot_id: int = Query(..., ge=1),
+    project: str = Query(default="haven"),
+    limit: int = Query(default=12, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    out = tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project, limit=limit)
+    return out
+
+
+# --------------------------
+# UI helpers
+# --------------------------
+
+@status_router.get("/api/repo/status", response_class=JSONResponse)
+def repo_status(db: Session = Depends(get_db)) -> dict[str, Any]:
+    latest = db.scalars(select(RepoSnapshot).order_by(RepoSnapshot.id.desc()).limit(1)).first()
+    if not latest:
+        return {"latest_snapshot": None}
+
+    total_files = db.scalar(select(func.count(RepoFile.id)).where(RepoFile.snapshot_id == latest.id)) or 0
+    stored_text = db.scalar(
+        select(func.count(RepoFile.id))
+        .where(RepoFile.snapshot_id == latest.id)
+        .where(RepoFile.content_kind == "text")
+    ) or 0
+
+    return {
+        "latest_snapshot": {
+            "id": latest.id,
+            "repo": latest.repo,
+            "branch": latest.branch,
+            "commit_sha": latest.commit_sha,
+            "file_count": latest.file_count,
+            "stored_content_files": latest.stored_content_files,
         },
-        "stats": stats,
+        "counts": {"total_files": int(total_files), "stored_text_files": int(stored_text)},
     }
 
 
 @status_router.get("/ui/repo", response_class=HTMLResponse)
-def repo_page() -> HTMLResponse:
+def repo_ui() -> HTMLResponse:
     html = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Goal Autopilot — Repo</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Repo Status</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-    .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 14px; min-width: 280px; }
-    .title { font-size: 20px; font-weight: 800; margin: 0 0 10px 0; }
-    .muted { color:#666; font-size: 13px; }
-    button, input { padding: 8px 10px; border-radius: 10px; border: 1px solid #ddd; background: white; }
+    .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 14px; max-width: 980px; }
+    pre { background: #fafafa; padding: 12px; border-radius: 12px; overflow:auto; }
+    input, button { padding: 8px 10px; border-radius: 10px; border: 1px solid #ddd; background: white; }
     button { cursor:pointer; }
-    pre { white-space: pre-wrap; word-break: break-word; background:#fafafa; padding:12px; border-radius:12px; border:1px solid #eee; }
-    a { color: inherit; }
-    .pill { display:inline-block; padding:4px 10px; border:1px solid #eee; border-radius:999px; margin:4px 6px 0 0; font-size:12px; background:#fafafa; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .muted { color:#666; font-size:13px; }
   </style>
 </head>
 <body>
-  <div class="row" style="justify-content:space-between; align-items:flex-end;">
-    <div>
-      <div class="title">Repo → Tasks</div>
-      <div class="muted">Sync repo snapshot, generate tasks, and view them in the dashboard.</div>
+  <h2>Repo status</h2>
+  <div class="card">
+    <div class="row">
+      <button onclick="loadStatus()">Refresh status</button>
+      <span class="muted">Also try: /debug/repo/search?snapshot_id=...&q=TODO</span>
     </div>
-    <div class="muted"><a href="/ui/dashboard" style="text-decoration:none;">Dashboard</a> · <a href="/docs" style="text-decoration:none;">API Docs</a></div>
-  </div>
+    <pre id="status">Loading...</pre>
 
-  <div class="row" style="margin: 14px 0;">
-    <input id="repo" style="min-width:320px" placeholder="repo (owner/name) e.g. AzRea7/OneHaven" />
-    <input id="branch" style="min-width:160px" placeholder="branch e.g. main" />
-    <input id="project" style="min-width:160px" value="haven" />
-    <button id="syncBtn">Sync</button>
-    <button id="syncGenBtn">Sync + Generate</button>
-    <button id="refreshBtn">Refresh Status</button>
-  </div>
+    <h3>Search snapshot content</h3>
+    <div class="row">
+      <input id="snapshotId" placeholder="snapshot_id" />
+      <input id="query" placeholder="TODO / FIXME / rate_limit / etc" />
+      <button onclick="runSearch()">Search</button>
+    </div>
+    <pre id="search"></pre>
 
-  <div id="status" class="card"></div>
-
-  <div class="card" style="margin-top:12px;">
-    <div class="muted">Signals (production-oriented)</div>
-    <div id="signals"></div>
-  </div>
-
-  <div class="card" style="margin-top:12px;">
-    <div class="muted">Output</div>
-    <pre id="out">{}</pre>
+    <h3>LLM scan</h3>
+    <div class="row">
+      <button onclick="runScan()">Run /scan_llm</button>
+      <button onclick="loadFindings()">Load /findings</button>
+      <button onclick="makeTasks()">Make tasks from findings</button>
+    </div>
+    <pre id="findings"></pre>
   </div>
 
 <script>
-function $(id){ return document.getElementById(id); }
-
-async function apiGet(url) {
-  const r = await fetch(url);
+async function loadStatus() {
+  const r = await fetch('/api/repo/status');
   const j = await r.json();
-  if (!r.ok) throw new Error(JSON.stringify(j));
-  return j;
-}
-async function apiPost(url) {
-  const r = await fetch(url, { method: "POST" });
-  const j = await r.json();
-  if (!r.ok) throw new Error(JSON.stringify(j));
-  return j;
-}
-
-function renderSignals(signals) {
-  const keys = [
-    "files_with_auth","files_with_timeout","files_with_retry","files_with_rate_limit",
-    "files_with_validation","files_with_logging","files_with_metrics","files_with_db",
-    "files_with_tests","files_with_ci","files_with_docker","files_with_config",
-    "files_with_secrets","files_with_nplus1","files_with_cors","files_with_csrf",
-    "files_with_todo","files_with_fixme","files_with_impl_signals"
-  ];
-  const el = $("signals");
-  if (!signals) { el.innerHTML = `<span class="muted">No signals loaded.</span>`; return; }
-  el.innerHTML = keys.map(k => `<span class="pill">${k}: <b>${signals[k] ?? 0}</b></span>`).join("");
-}
-
-async function refreshStatus() {
-  const repo = $("repo").value.trim();
-  const branch = $("branch").value.trim();
-  const url = repo || branch
-    ? `/api/repo/status?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`
-    : `/api/repo/status`;
-  const data = await apiGet(url);
-
-  if (!data.has_snapshot) {
-    $("status").innerHTML = `<b>No snapshot yet.</b><div class="muted">Click Sync.</div>`;
-    renderSignals(null);
-    return;
-  }
-
-  const s = data.snapshot;
-  const stats = data.stats || {};
-  $("status").innerHTML = `
-    <div><b>Snapshot #${s.id}</b> — ${s.repo}@${s.branch}</div>
-    <div class="muted">files=${s.file_count} stored_text=${s.stored_content_files}</div>
-    <div class="muted">top_folders=${(stats.top_folders || []).map(x => x.folder+":"+x.count).join(", ")}</div>
-  `;
-
-  // Load full signals
-  try {
-    const sig = await apiGet(`/debug/repo/signal_counts_full?snapshot_id=${encodeURIComponent(s.id)}`);
-    renderSignals(sig.signals || {});
-  } catch(e) {
-    renderSignals(null);
+  document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+  if (j.latest_snapshot && j.latest_snapshot.id) {
+    document.getElementById('snapshotId').value = j.latest_snapshot.id;
   }
 }
-
-$("syncBtn").onclick = async () => {
-  const repo = $("repo").value.trim();
-  const branch = $("branch").value.trim();
-  const url = `/debug/repo/sync?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`;
-  const out = await apiPost(url);
-  $("out").textContent = JSON.stringify(out, null, 2);
-  await refreshStatus();
-};
-
-$("syncGenBtn").onclick = async () => {
-  const repo = $("repo").value.trim();
-  const branch = $("branch").value.trim();
-  const project = $("project").value.trim() || "haven";
-  const url = `/debug/repo/sync_and_generate?project=${encodeURIComponent(project)}&repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch || "main")}`;
-  const out = await apiPost(url);
-  $("out").textContent = JSON.stringify(out, null, 2);
-  await refreshStatus();
-};
-
-$("refreshBtn").onclick = refreshStatus;
-
-refreshStatus().catch(e => {
-  document.body.innerHTML = `<pre style="color:#b00;">Repo UI failed: ${e}</pre>`;
-});
+async function runSearch() {
+  const sid = document.getElementById('snapshotId').value;
+  const q = document.getElementById('query').value;
+  const r = await fetch(`/debug/repo/search?snapshot_id=${encodeURIComponent(sid)}&q=${encodeURIComponent(q)}&limit=25`);
+  const j = await r.json();
+  document.getElementById('search').textContent = JSON.stringify(j, null, 2);
+}
+async function runScan() {
+  const sid = document.getElementById('snapshotId').value;
+  const r = await fetch(`/debug/repo/scan_llm?snapshot_id=${encodeURIComponent(sid)}`, { method: "POST" });
+  const j = await r.json();
+  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
+}
+async function loadFindings() {
+  const sid = document.getElementById('snapshotId').value;
+  const r = await fetch(`/debug/repo/findings?snapshot_id=${encodeURIComponent(sid)}&limit=50`);
+  const j = await r.json();
+  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
+}
+async function makeTasks() {
+  const sid = document.getElementById('snapshotId').value;
+  const r = await fetch(`/debug/repo/tasks_from_findings?snapshot_id=${encodeURIComponent(sid)}&project=haven&limit=12`, { method: "POST" });
+  const j = await r.json();
+  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
+}
+loadStatus();
 </script>
 </body>
 </html>
 """
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(content=html)

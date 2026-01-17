@@ -37,6 +37,51 @@ class LLMClient:
         # Otherwise: enabled only if base_url + model are present
         return bool(self.base_url) and bool(self.model)
     
+
+class LLMError(RuntimeError):
+    pass
+
+    
+async def chat_completion_json(system: str, user: str) -> dict[str, Any]:
+    if not settings.LLM_ENABLED:
+        raise LLMError("LLM is disabled (LLM_ENABLED=false).")
+
+    if not settings.OPENAI_BASE_URL or not settings.OPENAI_MODEL:
+        raise LLMError("Missing OPENAI_BASE_URL or OPENAI_MODEL.")
+
+    url = settings.OPENAI_BASE_URL.rstrip("/") + "/chat/completions"
+    headers = {}
+    if settings.OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.OPENAI_API_KEY}"
+
+    payload = {
+        "model": settings.OPENAI_MODEL,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=settings.LLM_READ_TIMEOUT_S,
+        write=20.0,
+        pool=20.0,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as e:
+        raise LLMError(f"Failed to parse LLM JSON: {e}")
+    
     async def chat(
         self,
         *,

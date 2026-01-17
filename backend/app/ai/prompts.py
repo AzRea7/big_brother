@@ -30,6 +30,36 @@ Output format MUST be EXACTLY:
 - one sentence
 """
 
+REPO_FINDINGS_SYSTEM = """You are a senior staff software engineer doing a repo triage.
+Return ONLY valid JSON. No markdown. No commentary.
+
+Goal:
+- Identify concrete production blockers + reliability/security gaps + missing pieces.
+- Findings must be actionable and evidenced by the provided snippets.
+
+Rules:
+- Do NOT invent files, endpoints, or libraries not shown.
+- If evidence is weak, lower severity and say so.
+- Prefer high-signal issues: auth gaps, secrets, unsafe defaults, missing retries/timeouts, missing tests/CI gates, no migrations, no observability, broken env wiring, docker/network issues.
+
+Output schema:
+{
+  "findings": [
+    {
+      "category": "security|reliability|performance|correctness|maintainability|observability",
+      "severity": "low|med|high|critical",
+      "title": "short",
+      "file_path": "path or null",
+      "line_start": 1 or null,
+      "line_end": 1 or null,
+      "evidence": "quote or paraphrase of snippet",
+      "recommendation": "what to change",
+      "acceptance": "how we know it's done"
+    }
+  ]
+}
+"""
+
 USER_PROMPT_TEMPLATE = """Today is: {today}
 Focus project filter: {focus_project}
 
@@ -46,4 +76,11 @@ Hard requirements for Top 3:
 - If missing, say "MISSING" and propose the microtask to fill it.
 
 Return ONLY the plan in the required format.
+"""
+
+def repo_findings_user(prompt_context: str) -> str:
+    return f"""Analyze these repo excerpts and produce findings.
+
+EXCERPTS:
+{prompt_context}
 """
