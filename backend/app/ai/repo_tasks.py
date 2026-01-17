@@ -9,27 +9,43 @@ from typing import Any
 from ..config import settings
 from .llm import LLMClient
 
+SYSTEM_PROMPT = """You are a senior engineer and technical program manager.
+You generate actionable engineering tasks from a repository snapshot.
 
-SYSTEM = """You are a senior engineer + technical program manager.
-Convert repo state into a small, high-leverage task list.
+Hard rules:
+- EVERY task MUST be grounded in provided evidence excerpts.
+- If you cannot cite evidence for a task, DO NOT include that task.
+- Return JSON only.
 
-Rules:
-- Output must be STRICT JSON (no markdown, no code fences, no commentary).
-- Output format: {"tasks":[{...}, ...]}
-- Each task must include:
-  - "title" (string, imperative verb start)
-  - "notes" (string, includes why + what + acceptance criteria)
-  - "priority" (int 1-5, 5 is highest)
-  - "estimated_minutes" (int)
-  - "blocks_me" (bool)
-  - "tags" (string)  // must include "repo,autogen"
-  - "path" (string)  // one of the provided evidence paths
-  - "line" (int|null) // optional
-  - "starter" (string)
-  - "dod" (string)
-- Keep it to 5–12 tasks max.
-- Do NOT invent files that don't exist. Use provided paths only.
-- Tasks must be grounded in the provided excerpts.
+Task schema (strict):
+{
+  "tasks": [
+    {
+      "title": "string (specific, actionable, NOT generic refactor)",
+      "notes": "string (what + why + concrete plan)",
+      "priority": 1..5,
+      "estimated_minutes": 5..480,
+      "blocks_me": true|false,
+      "tags": "comma-separated tags like repo,autogen,security|perf|reliability,signal:todo",
+      "path": "repo-relative file path",
+      "line": number|null,
+      "link": "repo://...#path:Lline",
+      "starter": "2-5 minute first step",
+      "dod": "definition of done (measurable)",
+      "evidence": {
+        "path": "same as path",
+        "line": number|null,
+        "quote": "short quote from excerpt (<=200 chars)"
+      }
+    }
+  ]
+}
+
+Quality rules:
+- Prefer tasks like: add auth to a route, add rate limiting, tighten input validation,
+  fix N+1 query, add caching, improve error handling, add tests around a risky area.
+- Avoid: "refactor X" unless you specify EXACTLY what and why with evidence.
+- If evidence is only NOTE comments, treat it as low value (skip unless it points to real risk).
 """
 
 
@@ -48,10 +64,84 @@ def _trim(s: str, n: int) -> str:
     return s[: max(0, n - 20)] + "\n...<truncated>..."
 
 
+# ------------------------------------------------------------
+# Signal detection
+# ------------------------------------------------------------
+
+# Classic code markers (good for small, explicit tasks)
+_MARKERS = [
+    ("todo_count", re.compile(r"\bTODO\b", re.IGNORECASE)),
+    ("fixme_count", re.compile(r"\bFIXME\b", re.IGNORECASE)),
+    ("hack_count", re.compile(r"\bHACK\b", re.IGNORECASE)),
+    ("xxx_count", re.compile(r"\bXXX\b", re.IGNORECASE)),
+    ("bug_count", re.compile(r"\bBUG\b", re.IGNORECASE)),
+    ("note_count", re.compile(r"\bNOTE\b", re.IGNORECASE)),
+]
+
+# Production-grade "work surfaces" signals:
+# These are intentionally regex-friendly (LLM reads excerpts; we detect the patterns).
+_PROD_SIGNALS: list[tuple[str, re.Pattern[str]]] = [
+    # Security/auth
+    ("auth_signal", re.compile(r"\b(auth|authentication|authorize|authorization|api[_-]?key|jwt|oauth|oidc)\b", re.IGNORECASE)),
+    ("cors_signal", re.compile(r"\bcors\b", re.IGNORECASE)),
+    ("csrf_signal", re.compile(r"\bcsrf\b", re.IGNORECASE)),
+    ("secrets_signal", re.compile(r"\b(secret|secrets|token|private[_-]?key|password|apikey)\b", re.IGNORECASE)),
+    ("input_validation_signal", re.compile(r"\b(validate|validation|pydantic|schema|sanitize|sanitiz|escape)\b", re.IGNORECASE)),
+
+    # Reliability/perf
+    ("timeout_signal", re.compile(r"\b(timeout|read_timeout|connect_timeout)\b", re.IGNORECASE)),
+    ("retry_signal", re.compile(r"\b(retry|backoff|exponential[_-]?backoff)\b", re.IGNORECASE)),
+    ("rate_limit_signal", re.compile(r"\b(rate[_-]?limit|throttl)\b", re.IGNORECASE)),
+    ("idempotency_signal", re.compile(r"\b(idempotent|idempotency)\b", re.IGNORECASE)),
+
+    # Observability
+    ("logging_signal", re.compile(r"\b(logging|getLogger|logger\.|log\.)\b", re.IGNORECASE)),
+    ("metrics_signal", re.compile(r"\b(metrics|prometheus|opentelemetry|otel|tracing|span)\b", re.IGNORECASE)),
+
+    # Data/DB correctness
+    ("db_signal", re.compile(r"\b(sqlalchemy|session|transaction|commit|rollback|alembic|migration|index|foreign key|unique)\b", re.IGNORECASE)),
+    ("nplus1_signal", re.compile(r"\b(n\+1|eagerload|joinedload|selectinload)\b", re.IGNORECASE)),
+
+    # Tests / CI
+    ("tests_signal", re.compile(r"\b(pytest|unittest|test_)\b", re.IGNORECASE)),
+    ("ci_signal", re.compile(r"\b(github actions|workflow|ci\b|pipelines?)\b", re.IGNORECASE)),
+
+    # Deployment/config
+    ("docker_signal", re.compile(r"\b(docker|dockerfile|compose)\b", re.IGNORECASE)),
+    ("config_signal", re.compile(r"\b(env|dotenv|config|settings)\b", re.IGNORECASE)),
+]
+
+
+def count_markers_in_text(text: str) -> dict[str, int]:
+    """
+    Backwards-compatible function name, but now returns BOTH:
+      - classic markers (todo/fixme/etc.)
+      - production signals (timeout/retry/auth/validation/logging/etc.)
+    """
+    t = text or ""
+    out: dict[str, int] = {k: 0 for (k, _) in _MARKERS}
+
+    for k, rx in _MARKERS:
+        out[k] = len(rx.findall(t))
+
+    # “...” signal (unfinished logic / placeholders)
+    out["dotdotdot_count"] = len(re.findall(r"\.\.\.", t))
+
+    # Production signals
+    for k, rx in _PROD_SIGNALS:
+        out[k] = len(rx.findall(t))
+
+    return out
+
+
 def _signal_score(s: dict[str, Any]) -> int:
     """
     Higher score => more likely to include the file in the prompt.
-    We prefer real “work surfaces”: routes, services, DB, auth, infra, tests.
+
+    Scoring goals:
+    - Put "production surfaces" in front of the model: routes, services, db, auth, infra, tests
+    - Strongly reward production signals (timeouts/retries/auth/validation/logging/metrics/rate limit)
+    - Still reward explicit TODO/FIXME because they create quick, concrete tasks
     """
     path = (s.get("path") or "").lower()
     score = 0
@@ -65,11 +155,27 @@ def _signal_score(s: dict[str, Any]) -> int:
     score += 1 * int(bool(s.get("note_count")))
     score += 1 * int(bool(s.get("dotdotdot_count")))
 
+    # Production signals (presence-weighted; these are the ones that generate the best tasks)
+    score += 7 * int(bool(s.get("auth_signal")))
+    score += 6 * int(bool(s.get("timeout_signal")))
+    score += 6 * int(bool(s.get("retry_signal")))
+    score += 6 * int(bool(s.get("rate_limit_signal")))
+    score += 5 * int(bool(s.get("input_validation_signal")))
+    score += 4 * int(bool(s.get("logging_signal")))
+    score += 4 * int(bool(s.get("metrics_signal")))
+    score += 4 * int(bool(s.get("db_signal")))
+    score += 3 * int(bool(s.get("tests_signal")))
+    score += 2 * int(bool(s.get("ci_signal")))
+    score += 2 * int(bool(s.get("docker_signal")))
+    score += 2 * int(bool(s.get("config_signal")))
+
     # Surface-area heuristics
     if "/routes/" in path or path.endswith("main.py"):
         score += 10
     if "/services/" in path:
         score += 7
+    if "/ai/" in path:
+        score += 3
     if "docker" in path or "compose" in path or "github/workflows" in path or path.endswith(".yml"):
         score += 4
     if "auth" in path or "security" in path or "api_key" in path:
@@ -80,30 +186,6 @@ def _signal_score(s: dict[str, Any]) -> int:
         score += 6
 
     return score
-
-
-_MARKERS = [
-    ("todo_count", re.compile(r"\bTODO\b", re.IGNORECASE)),
-    ("fixme_count", re.compile(r"\bFIXME\b", re.IGNORECASE)),
-    ("hack_count", re.compile(r"\bHACK\b", re.IGNORECASE)),
-    ("xxx_count", re.compile(r"\bXXX\b", re.IGNORECASE)),
-    ("bug_count", re.compile(r"\bBUG\b", re.IGNORECASE)),
-    ("note_count", re.compile(r"\bNOTE\b", re.IGNORECASE)),
-]
-
-
-def count_markers_in_text(text: str) -> dict[str, int]:
-    t = text or ""
-    out: dict[str, int] = {k: 0 for (k, _) in _MARKERS}
-
-    for k, rx in _MARKERS:
-        out[k] = len(rx.findall(t))
-
-    # “...” signal (useful for unfinished logic / placeholders)
-    # We count literal "..." sequences, but avoid exploding on long ellipses by counting runs.
-    out["dotdotdot_count"] = len(re.findall(r"\.\.\.", t))
-
-    return out
 
 
 def build_prompt(
@@ -132,9 +214,12 @@ def build_prompt(
         path = f.get("path") or ""
         excerpt = _trim(f.get("excerpt") or "", budgets.max_chars_per_file)
 
+        # Include BOTH classic + production signals in payload. This helps the LLM
+        # (a) choose good tasks, and (b) tag them with signal:timeout, signal:auth, etc.
         item = {
             "path": path,
             "signals": {
+                # classic
                 "todo": int(f.get("todo_count") or 0),
                 "fixme": int(f.get("fixme_count") or 0),
                 "hack": int(f.get("hack_count") or 0),
@@ -142,6 +227,23 @@ def build_prompt(
                 "bug": int(f.get("bug_count") or 0),
                 "note": int(f.get("note_count") or 0),
                 "dotdotdot": int(f.get("dotdotdot_count") or 0),
+                # production
+                "auth": int(f.get("auth_signal") or 0),
+                "timeout": int(f.get("timeout_signal") or 0),
+                "retry": int(f.get("retry_signal") or 0),
+                "rate_limit": int(f.get("rate_limit_signal") or 0),
+                "validation": int(f.get("input_validation_signal") or 0),
+                "logging": int(f.get("logging_signal") or 0),
+                "metrics": int(f.get("metrics_signal") or 0),
+                "db": int(f.get("db_signal") or 0),
+                "tests": int(f.get("tests_signal") or 0),
+                "ci": int(f.get("ci_signal") or 0),
+                "docker": int(f.get("docker_signal") or 0),
+                "config": int(f.get("config_signal") or 0),
+                "secrets": int(f.get("secrets_signal") or 0),
+                "nplus1": int(f.get("nplus1_signal") or 0),
+                "cors": int(f.get("cors_signal") or 0),
+                "csrf": int(f.get("csrf_signal") or 0),
             },
             "excerpt": excerpt,
         }
@@ -166,6 +268,7 @@ def build_prompt(
             "Prefer tasks that improve reliability, security, DX, tests, and production-readiness.",
             "Each task must include: title, notes, tags, priority(1-5), estimated_minutes, blocks_me, path, line(optional), starter, dod.",
             "Tags must include: repo,autogen.",
+            "ALWAYS include at least one signal tag when applicable, e.g. signal:timeout, signal:auth, signal:validation, signal:rate_limit.",
             "Do not invent files not provided.",
             "Return JSON only. No markdown. No code fences.",
         ],
@@ -223,7 +326,7 @@ async def generate_repo_tasks_json(
         file_summaries=file_summaries,
     )
 
-    raw = await client.chat(system=SYSTEM, user=user_prompt, temperature=0.2, max_tokens=900)
+    raw = await client.chat(system=SYSTEM_PROMPT, user=user_prompt, temperature=0.2, max_tokens=900)
 
     try:
         return _extract_json_object_lenient(raw)

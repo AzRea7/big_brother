@@ -2,89 +2,78 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-
-from sqlalchemy import select
-from sqlalchemy.orm import Session
-
-from ..models import RepoFile, Task
+from typing import Any
 
 
-@dataclass
-class SuggestedTask:
-    title: str
-    notes: str
-    link: str | None
-    tags: str
+_MARKERS = {
+    "todo": re.compile(r"\bTODO\b", re.IGNORECASE),
+    "fixme": re.compile(r"\bFIXME\b", re.IGNORECASE),
+    "hack": re.compile(r"\bHACK\b", re.IGNORECASE),
+    "xxx": re.compile(r"\bXXX\b", re.IGNORECASE),
+    "bug": re.compile(r"\bBUG\b", re.IGNORECASE),
+    "note": re.compile(r"\bNOTE\b", re.IGNORECASE),
+    "dotdotdot": re.compile(r"\.\.\.", re.IGNORECASE),
+}
 
 
-_TODO_RE = re.compile(r"\b(TODO|FIXME|HACK)\b[:\-\s]*(.*)", re.IGNORECASE)
+def count_markers_in_text(text: str) -> dict[str, int]:
+    """
+    Counts signal markers in a file's content.
+
+    NOTE:
+    - We still count NOTE, but repo_taskgen should treat NOTE as low-priority noise
+      unless you explicitly allow it.
+    """
+    out: dict[str, int] = {}
+    for k, rx in _MARKERS.items():
+        out[f"{k}_count"] = len(rx.findall(text or ""))
+    return out
 
 
-def suggest_tasks_from_snapshot(db: Session, snapshot_id: int, project: str = "haven", limit: int = 30) -> list[SuggestedTask]:
-    files = db.scalars(
-        select(RepoFile)
-        .where(RepoFile.snapshot_id == snapshot_id)
-        .where(RepoFile.content_kind == "text")
-    ).all()
+def pick_best_evidence_snippets(text: str, max_snippets: int = 3, radius: int = 120) -> list[str]:
+    """
+    Extract a few short snippets around the highest-value markers. These snippets go to the LLM.
+    """
+    if not text:
+        return []
 
-    suggestions: list[SuggestedTask] = []
+    hits: list[tuple[int, str]] = []
+    for k, rx in _MARKERS.items():
+        for m in rx.finditer(text):
+            hits.append((m.start(), k))
 
-    for f in files:
-        if not f.content:
+    # Prioritize high-value markers, de-prioritize NOTE
+    weight = {"fixme": 5, "todo": 4, "bug": 4, "hack": 3, "xxx": 3, "dotdotdot": 2, "note": 1}
+    hits.sort(key=lambda t: weight.get(t[1], 0), reverse=True)
+
+    snippets: list[str] = []
+    used_ranges: list[tuple[int, int]] = []
+    for pos, k in hits:
+        start = max(0, pos - radius)
+        end = min(len(text), pos + radius)
+
+        # Avoid overlapping snippets
+        if any(not (end < a or start > b) for a, b in used_ranges):
             continue
 
-        lines = f.content.splitlines()
-        for i, line in enumerate(lines[:2000]):
-            m = _TODO_RE.search(line)
-            if not m:
-                continue
+        chunk = text[start:end].replace("\r\n", "\n").replace("\r", "\n")
+        chunk = chunk.strip()
 
-            kind = m.group(1).upper()
-            msg = (m.group(2) or "").strip()
-            msg = msg[:160] if msg else "Unspecified"
+        # Hard cap snippet length
+        if len(chunk) > 500:
+            chunk = chunk[:500] + "…"
 
-            title = f"{kind}: {msg}"
-            notes = (
-                f"Found {kind} in `{f.path}` line ~{i+1}:\n\n"
-                f"{line.strip()}\n\n"
-                "Starter (2 min): Open the file and locate this line.\n"
-                "DoD: The TODO/FIXME is resolved or replaced with a tracked task + tests where needed."
-            )
-            tags = "code-signal,todo" if kind == "TODO" else "code-signal,fixme"
+        snippets.append(f"[{k.upper()}] {chunk}")
+        used_ranges.append((start, end))
 
-            suggestions.append(SuggestedTask(title=title, notes=notes, link=None, tags=tags))
-            if len(suggestions) >= limit:
-                return suggestions
+        if len(snippets) >= max_snippets:
+            break
 
-    return suggestions
+    return snippets
 
 
-def materialize_suggestions_as_tasks(
-    db: Session,
-    snapshot_id: int,
-    project: str = "haven",
-    limit: int = 30,
-    priority: int = 3,
-    estimated_minutes: int = 45,
-) -> dict[str, int]:
-    suggestions = suggest_tasks_from_snapshot(db, snapshot_id=snapshot_id, project=project, limit=limit)
-
-    created = 0
-    for s in suggestions:
-        db.add(
-            Task(
-                title=s.title,
-                notes=s.notes,
-                project=project,
-                tags=s.tags,
-                priority=priority,
-                estimated_minutes=estimated_minutes,
-                blocks_me=False,
-                completed=False,
-            )
-        )
-        created += 1
-
-    db.commit()
-    return {"created": created}
+def looks_like_impl_stub(text: str) -> bool:
+    if not text:
+        return False
+    needles = ("raise NotImplementedError", "IMPLEMENT", "stub", "pass  #", "pass #")
+    return any(n in text for n in needles)

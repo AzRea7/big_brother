@@ -53,6 +53,9 @@ def latest_snapshot_debug(db: Session = Depends(get_db)):
 
 @router.get("/signal_counts", response_model=RepoSignalCountsOut)
 def signal_counts(snapshot_id: int, db: Session = Depends(get_db)):
+    """
+    Backwards-compatible signal endpoint: only returns fields your schema expects.
+    """
     s = compute_signal_counts(db, snapshot_id)
     return {
         "snapshot_id": snapshot_id,
@@ -61,6 +64,18 @@ def signal_counts(snapshot_id: int, db: Session = Depends(get_db)):
         "files_with_fixme": s["files_with_fixme"],
         "files_with_impl_signals": s["files_with_impl_signals"],
     }
+
+
+@router.get("/signal_counts_full", response_class=JSONResponse)
+def signal_counts_full(snapshot_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """
+    Full production-grade signal breakdown.
+
+    This endpoint avoids breaking RepoSignalCountsOut while letting the UI (and you)
+    see what the snapshot actually contains: auth/timeout/retry/rate-limit/validation/etc.
+    """
+    s = compute_signal_counts(db, snapshot_id)
+    return {"snapshot_id": snapshot_id, "signals": s}
 
 
 @router.post("/generate_tasks", response_model=RepoTaskGenOut)
@@ -144,6 +159,7 @@ def repo_page() -> HTMLResponse:
     button { cursor:pointer; }
     pre { white-space: pre-wrap; word-break: break-word; background:#fafafa; padding:12px; border-radius:12px; border:1px solid #eee; }
     a { color: inherit; }
+    .pill { display:inline-block; padding:4px 10px; border:1px solid #eee; border-radius:999px; margin:4px 6px 0 0; font-size:12px; background:#fafafa; }
   </style>
 </head>
 <body>
@@ -167,6 +183,11 @@ def repo_page() -> HTMLResponse:
   <div id="status" class="card"></div>
 
   <div class="card" style="margin-top:12px;">
+    <div class="muted">Signals (production-oriented)</div>
+    <div id="signals"></div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
     <div class="muted">Output</div>
     <pre id="out">{}</pre>
   </div>
@@ -187,6 +208,19 @@ async function apiPost(url) {
   return j;
 }
 
+function renderSignals(signals) {
+  const keys = [
+    "files_with_auth","files_with_timeout","files_with_retry","files_with_rate_limit",
+    "files_with_validation","files_with_logging","files_with_metrics","files_with_db",
+    "files_with_tests","files_with_ci","files_with_docker","files_with_config",
+    "files_with_secrets","files_with_nplus1","files_with_cors","files_with_csrf",
+    "files_with_todo","files_with_fixme","files_with_impl_signals"
+  ];
+  const el = $("signals");
+  if (!signals) { el.innerHTML = `<span class="muted">No signals loaded.</span>`; return; }
+  el.innerHTML = keys.map(k => `<span class="pill">${k}: <b>${signals[k] ?? 0}</b></span>`).join("");
+}
+
 async function refreshStatus() {
   const repo = $("repo").value.trim();
   const branch = $("branch").value.trim();
@@ -197,6 +231,7 @@ async function refreshStatus() {
 
   if (!data.has_snapshot) {
     $("status").innerHTML = `<b>No snapshot yet.</b><div class="muted">Click Sync.</div>`;
+    renderSignals(null);
     return;
   }
 
@@ -207,6 +242,14 @@ async function refreshStatus() {
     <div class="muted">files=${s.file_count} stored_text=${s.stored_content_files}</div>
     <div class="muted">top_folders=${(stats.top_folders || []).map(x => x.folder+":"+x.count).join(", ")}</div>
   `;
+
+  // Load full signals
+  try {
+    const sig = await apiGet(`/debug/repo/signal_counts_full?snapshot_id=${encodeURIComponent(s.id)}`);
+    renderSignals(sig.signals || {});
+  } catch(e) {
+    renderSignals(null);
+  }
 }
 
 $("syncBtn").onclick = async () => {

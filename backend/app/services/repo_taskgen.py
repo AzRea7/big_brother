@@ -51,6 +51,7 @@ def _repo_link(snapshot: RepoSnapshot, path: str, line: int | None = None) -> st
     base = f"repo://{snapshot.repo}?branch={snapshot.branch}&commit_sha={snapshot.commit_sha or ''}"
     return f"{base}#{path}:L{line}" if line is not None else f"{base}#{path}"
 
+
 def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, int]:
     """
     Backwards-compatible DB-based signal counter.
@@ -58,10 +59,7 @@ def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, int]:
     This exists because routes/repo.py imports compute_signal_counts(db, snapshot_id).
     Internally we delegate to compute_signal_counts_for_files to avoid duplicated logic.
     """
-    files = db.scalars(
-        select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)
-    ).all()
-
+    files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
     return compute_signal_counts_for_files(files)
 
 
@@ -114,9 +112,19 @@ def _blocks_for_kind(kind: str) -> bool:
 # -------------------------
 
 def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
+    """
+    Produces file-level counts for both:
+      - classic TODO/FIXME/HACK/etc.
+      - production signals (auth/timeout/retry/rate_limit/validation/logging/metrics/db/tests/etc.)
+
+    Design choice:
+      - These are "files_with_X" counts (not total matches) because it's stable and
+        helps ranking/snapshot selection without being skewed by long files.
+    """
     total = len(files)
 
-    files_with = {
+    files_with: dict[str, int] = {
+        # classic marker files-with
         "todo": 0,
         "fixme": 0,
         "hack": 0,
@@ -124,7 +132,25 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         "bug": 0,
         "note": 0,
         "dotdotdot": 0,
+        # production signal files-with
+        "auth": 0,
+        "timeout": 0,
+        "retry": 0,
+        "rate_limit": 0,
+        "validation": 0,
+        "logging": 0,
+        "metrics": 0,
+        "db": 0,
+        "tests": 0,
+        "ci": 0,
+        "docker": 0,
+        "config": 0,
+        "secrets": 0,
+        "nplus1": 0,
+        "cors": 0,
+        "csrf": 0,
     }
+
     impl = 0
 
     for f in files:
@@ -133,21 +159,57 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
 
         sig = count_markers_in_text(f.content)
 
-        if sig["todo_count"] > 0:
+        # classic
+        if sig.get("todo_count", 0) > 0:
             files_with["todo"] += 1
-        if sig["fixme_count"] > 0:
+        if sig.get("fixme_count", 0) > 0:
             files_with["fixme"] += 1
-        if sig["hack_count"] > 0:
+        if sig.get("hack_count", 0) > 0:
             files_with["hack"] += 1
-        if sig["xxx_count"] > 0:
+        if sig.get("xxx_count", 0) > 0:
             files_with["xxx"] += 1
-        if sig["bug_count"] > 0:
+        if sig.get("bug_count", 0) > 0:
             files_with["bug"] += 1
-        if sig["note_count"] > 0:
+        if sig.get("note_count", 0) > 0:
             files_with["note"] += 1
-        if sig["dotdotdot_count"] > 0:
+        if sig.get("dotdotdot_count", 0) > 0:
             files_with["dotdotdot"] += 1
 
+        # production signals
+        if sig.get("auth_signal", 0) > 0:
+            files_with["auth"] += 1
+        if sig.get("timeout_signal", 0) > 0:
+            files_with["timeout"] += 1
+        if sig.get("retry_signal", 0) > 0:
+            files_with["retry"] += 1
+        if sig.get("rate_limit_signal", 0) > 0:
+            files_with["rate_limit"] += 1
+        if sig.get("input_validation_signal", 0) > 0:
+            files_with["validation"] += 1
+        if sig.get("logging_signal", 0) > 0:
+            files_with["logging"] += 1
+        if sig.get("metrics_signal", 0) > 0:
+            files_with["metrics"] += 1
+        if sig.get("db_signal", 0) > 0:
+            files_with["db"] += 1
+        if sig.get("tests_signal", 0) > 0:
+            files_with["tests"] += 1
+        if sig.get("ci_signal", 0) > 0:
+            files_with["ci"] += 1
+        if sig.get("docker_signal", 0) > 0:
+            files_with["docker"] += 1
+        if sig.get("config_signal", 0) > 0:
+            files_with["config"] += 1
+        if sig.get("secrets_signal", 0) > 0:
+            files_with["secrets"] += 1
+        if sig.get("nplus1_signal", 0) > 0:
+            files_with["nplus1"] += 1
+        if sig.get("cors_signal", 0) > 0:
+            files_with["cors"] += 1
+        if sig.get("csrf_signal", 0) > 0:
+            files_with["csrf"] += 1
+
+        # Implementation stubs / "unfinished" signals (useful in prod hardening)
         if any(x in f.content for x in ("raise NotImplementedError", "IMPLEMENT", "stub", "pass  #")):
             impl += 1
 
@@ -161,6 +223,23 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         "files_with_note": files_with["note"],
         "files_with_dotdotdot": files_with["dotdotdot"],
         "files_with_impl_signals": impl,
+        # production-grade rollups
+        "files_with_auth": files_with["auth"],
+        "files_with_timeout": files_with["timeout"],
+        "files_with_retry": files_with["retry"],
+        "files_with_rate_limit": files_with["rate_limit"],
+        "files_with_validation": files_with["validation"],
+        "files_with_logging": files_with["logging"],
+        "files_with_metrics": files_with["metrics"],
+        "files_with_db": files_with["db"],
+        "files_with_tests": files_with["tests"],
+        "files_with_ci": files_with["ci"],
+        "files_with_docker": files_with["docker"],
+        "files_with_config": files_with["config"],
+        "files_with_secrets": files_with["secrets"],
+        "files_with_nplus1": files_with["nplus1"],
+        "files_with_cors": files_with["cors"],
+        "files_with_csrf": files_with["csrf"],
     }
 
 
@@ -250,15 +329,15 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
                 title="Repo scan: identify top 3 high-impact improvements",
                 notes=(
                     "No actionable TODO/FIXME/HACK/XXX/BUG markers were found in the stored snapshot content.\n\n"
-                    "Starter (5–10 min): Skim API entrypoints (/main.py, /routes), auth, error handling, and tests.\n"
-                    "DoD: Create 3 concrete tasks with repo links and acceptance criteria."
+                    "Starter (5–10 min): Skim API entrypoints (/main.py, /routes), auth, timeouts, retries, error handling, and tests.\n"
+                    "DoD: Create 3 concrete tasks with repo links and measurable acceptance criteria."
                 ),
                 link=_repo_link(snap, "onehaven/"),
                 tags="repo,autogen,scan",
                 priority=3,
                 estimated_minutes=60,
                 blocks_me=False,
-                starter="Skim /main.py, /routes, and tests; write down 3 concrete improvements.",
+                starter="Skim /main.py, /routes, services, and tests; write down 3 concrete improvements.",
                 dod="3 concrete tasks exist with repo links and clear DoD.",
             )
         ]
@@ -327,8 +406,6 @@ async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], pro
 
     signal_counts = compute_signal_counts_for_files(files)
 
-    # generate_repo_tasks_json SHOULD return dict, but if your current implementation
-    # returns raw text or throws, this handler keeps the pipeline alive.
     raw = await generate_repo_tasks_json(
         repo_name=snapshot.repo,
         branch=snapshot.branch,
@@ -338,8 +415,6 @@ async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], pro
         file_summaries=file_summaries,
     )
 
-    # If your generate_repo_tasks_json already returns dict, great.
-    # If it returns a string (older version), parse it here.
     if isinstance(raw, str):
         raw = _extract_json_object_lenient(raw)
 
