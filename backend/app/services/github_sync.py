@@ -73,9 +73,11 @@ def _looks_like_text(path: str, raw: bytes) -> bool:
 def _make_timeout() -> httpx.Timeout:
     """
     Fixes: ValueError: Timeout must either include a default, or set all four parameters explicitly.
-    We provide a DEFAULT, and optionally override connect.
     """
-    return httpx.Timeout(settings.GITHUB_READ_TIMEOUT_S, connect=settings.GITHUB_CONNECT_TIMEOUT_S)
+    return httpx.Timeout(
+        settings.GITHUB_READ_TIMEOUT_S,
+        connect=settings.GITHUB_CONNECT_TIMEOUT_S,
+    )
 
 
 async def _github_get_json(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> Any:
@@ -118,25 +120,22 @@ def latest_snapshot(db: Session, repo: str | None = None, branch: str | None = N
 
 
 def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
-    files = db.execute(
+    rows = db.execute(
         select(RepoFile.path, RepoFile.skipped, RepoFile.is_text).where(RepoFile.snapshot_id == snapshot_id)
     ).all()
 
-    total = len(files)
-    skipped = sum(1 for _, s, _ in files if s)
-    text_files = sum(1 for _, s, t in files if (not s) and t)
-    binary_files = sum(1 for _, s, t in files if (not s) and (not t))
+    total = len(rows)
+    skipped = sum(1 for _, s, _ in rows if s)
+    text_files = sum(1 for _, s, t in rows if (not s) and t)
+    binary_files = sum(1 for _, s, t in rows if (not s) and (not t))
 
     folder_counts: dict[str, int] = {}
-    for (p, _, _) in files:
+    for (p, _, _) in rows:
         p = _norm_path(p)
         top = p.split("/", 1)[0] if "/" in p else p
         folder_counts[top] = folder_counts.get(top, 0) + 1
 
-    top_folders = [
-        {"folder": k, "count": v}
-        for k, v in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    ]
+    top_folders = [{"folder": k, "count": v} for k, v in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]]
     return {
         "total_files": total,
         "text_files": text_files,
@@ -148,14 +147,13 @@ def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
 
 async def _scan_local_repo(base_path: str) -> list[dict[str, Any]]:
     """
-    Returns a list of file metadata dicts: {path, abs_path, size}
+    Returns: [{path, abs_path, size}]
     Applies include/exclude filters.
     """
     base_path = os.path.abspath(base_path)
     out: list[dict[str, Any]] = []
 
     for root, dirs, files in os.walk(base_path):
-        # prune excluded dir names early
         dirs[:] = [d for d in dirs if d not in settings.GITHUB_EXCLUDE_DIR_NAMES]
 
         for fn in files:
@@ -183,7 +181,7 @@ async def _scan_local_repo(base_path: str) -> list[dict[str, Any]]:
 async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]]:
     """
     Uses GitHub Contents API (recursive BFS) to gather file paths.
-    Applies include/exclude filters to avoid ballooning.
+    Applies include/exclude filters.
     """
     token = settings.GITHUB_TOKEN
     headers = {
@@ -193,7 +191,6 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # BFS over contents API
     queue: list[str] = [""]
     files_out: list[dict[str, Any]] = []
 
@@ -206,7 +203,6 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
                 else f"https://api.github.com/repos/{repo}/contents?ref={branch}"
             )
             data = await _github_get_json(client, url, headers)
-
             if isinstance(data, dict):
                 data = [data]
 
@@ -216,8 +212,6 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
 
                 if not ipath:
                     continue
-
-                # allowlist (currently no-op) + excludes
                 if not _is_included_path(ipath):
                     continue
                 if _is_excluded_path(ipath):
@@ -243,10 +237,8 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
 
 async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
     """
-    The canonical async entrypoint.
-
-    Prefers local scan if REPO_LOCAL_PATH is set (fast, no GitHub rate limits),
-    otherwise uses GitHub API.
+    REAL implementation (kept). The router should call sync_repo_snapshot() below,
+    which forwards here.
     """
     repo = repo or settings.GITHUB_REPO
     branch = branch or settings.GITHUB_BRANCH
@@ -260,7 +252,7 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
         commit_sha=commit_sha,
         file_count=0,
         stored_content_files=0,
-        warnings_json=None,
+        warnings_json=(json.dumps(warnings) if warnings else None),
         created_at=datetime.utcnow(),
     )
     db.add(snap)
@@ -270,7 +262,7 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
     stored = 0
     total = 0
 
-    # Prefer local scan if configured (best for Docker + no tokens)
+    # Prefer local scan if configured
     if settings.REPO_LOCAL_PATH:
         items = await _scan_local_repo(settings.REPO_LOCAL_PATH)
         total = len(items)
@@ -334,7 +326,7 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
             warnings=warnings,
         )
 
-    # GitHub API path (slower + rate limits)
+    # GitHub API path
     items = await _list_github_repo_paths(repo, branch)
     total = len(items)
 
@@ -421,16 +413,26 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
 
 
 # -------------------------------------------------------------------
-# Compatibility exports (do NOT change behavior; just prevents route breakage)
-# These match older route imports: sync_repo_snapshot, sync_snapshot, sync_repo
+# Supported exported sync functions (THIS fixes your "does not export"
+# error without changing your internal implementation).
 # -------------------------------------------------------------------
-async def sync_repo_snapshot(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
-    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
+
+async def sync_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
+    r = await create_repo_snapshot(db, repo=repo, branch=branch)
+    return {
+        "snapshot_id": r.snapshot_id,
+        "repo": r.repo,
+        "branch": r.branch,
+        "commit_sha": r.commit_sha,
+        "file_count": r.file_count,
+        "stored_content_files": r.stored_content_files,
+        "warnings": r.warnings,
+    }
 
 
-async def sync_snapshot(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
-    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
+async def sync_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
+    return await sync_repo_snapshot(db, repo=repo, branch=branch)
 
 
-async def sync_repo(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
-    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
+async def sync_repo(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
+    return await sync_repo_snapshot(db, repo=repo, branch=branch)

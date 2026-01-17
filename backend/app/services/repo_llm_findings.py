@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -14,10 +13,16 @@ from ..config import settings
 from ..models import RepoFile, RepoFinding, Task
 
 
+_SEVERITY_MAP = {
+    "low": 2,
+    "med": 3,
+    "medium": 3,
+    "high": 4,
+    "critical": 5,
+}
+
+
 def _fingerprint(f: dict[str, Any]) -> str:
-    """
-    Stable fingerprint so the same finding doesn't get re-inserted every scan.
-    """
     key = "|".join(
         [
             str(f.get("category") or ""),
@@ -33,23 +38,15 @@ def _fingerprint(f: dict[str, Any]) -> str:
 
 def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
     """
-    Simple heuristic:
-      - only files with stored content_text
-      - prefer larger files (more surface area), but we will excerpt anyway
-      - cap to REPO_TASK_MAX_FILES
+    Simple heuristic: prefer files that have content and are larger (often more "core" code).
+    We cap hard so prompts stay bounded.
     """
     q = (
         db.query(RepoFile)
         .filter(RepoFile.snapshot_id == snapshot_id)
         .filter(RepoFile.content_text.isnot(None))
+        .order_by(RepoFile.size.desc())
     )
-
-    # Some DBs/models use `size` not `size_bytes`. Handle both.
-    if hasattr(RepoFile, "size_bytes"):
-        q = q.order_by(getattr(RepoFile, "size_bytes").desc())  # type: ignore[attr-defined]
-    else:
-        q = q.order_by(RepoFile.size.desc())
-
     files = q.limit(settings.REPO_TASK_MAX_FILES * 3).all()
     return files[: settings.REPO_TASK_MAX_FILES]
 
@@ -59,7 +56,7 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
     total = 0
 
     for rf in files:
-        text = rf.content_text or rf.content or ""
+        text = rf.content_text or ""
         excerpt = text[: settings.REPO_TASK_EXCERPT_CHARS]
 
         block = f"\n--- FILE: {rf.path}\n{excerpt}\n"
@@ -72,40 +69,10 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
     return "".join(chunks)
 
 
-def _severity_rank(sev: str | None) -> int:
-    """
-    Higher is worse.
-    """
-    s = (sev or "").lower().strip()
-    return {
-        "critical": 50,
-        "high": 40,
-        "medium": 30,
-        "low": 20,
-        "info": 10,
-    }.get(s, 20)
-
-
-def _task_key(title: str, link: str | None) -> str:
-    return (title or "").strip().lower() + "|" + (link or "")
-
-
-def _repo_link(snapshot_id: int, file_path: str | None, line_start: int | None) -> str | None:
-    """
-    Your UI uses repo:// links in other places; keep it consistent.
-    """
-    if not file_path:
-        return None
-    # We don't have repo/branch/sha here without joining RepoSnapshot; keep it minimal + stable.
-    # If you want richer links later, pass snapshot in and build: repo://{repo}?branch=...&commit_sha=...#{path}:L{line}
-    if line_start:
-        return f"repo://snapshot/{snapshot_id}#{file_path}:L{line_start}"
-    return f"repo://snapshot/{snapshot_id}#{file_path}"
-
-
 async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, int]:
     """
-    Core scan: runs LLM over a bounded excerpt set and inserts new RepoFinding rows.
+    Core worker: calls LLM and inserts RepoFinding rows.
+    Returns {inserted, total_findings}.
     """
     files = _pick_top_files(db, snapshot_id)
     context = _build_prompt_context(files)
@@ -133,164 +100,148 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
         if exists:
             continue
 
+        severity_str = str(f.get("severity") or "med").lower().strip()
+        sev = _SEVERITY_MAP.get(severity_str, 3)
+
+        path = str(f.get("file_path") or "").strip() or "unknown"
+        line = None
+        if f.get("line_start"):
+            try:
+                line = int(f["line_start"])
+            except Exception:
+                line = None
+
         row = RepoFinding(
             snapshot_id=snapshot_id,
-            category=str(f.get("category") or "maintainability")[:32],
-            severity=str(f.get("severity") or "low")[:16],
-            title=str(f.get("title") or "Finding")[:256],
-            file_path=(str(f.get("file_path"))[:1024] if f.get("file_path") else None),
-            line_start=(int(f["line_start"]) if f.get("line_start") else None),
-            line_end=(int(f["line_end"]) if f.get("line_end") else None),
+            path=path,
+            line=line,
+            category=str(f.get("category") or "maintainability")[:48],
+            severity=int(sev),
+            title=str(f.get("title") or "Finding")[:240],
             evidence=(str(f.get("evidence")) if f.get("evidence") else None),
             recommendation=(str(f.get("recommendation")) if f.get("recommendation") else None),
-            acceptance=(str(f.get("acceptance")) if f.get("acceptance") else None),
             fingerprint=fp,
             created_at=datetime.utcnow(),
-            is_resolved=False,
         )
         db.add(row)
         inserted += 1
 
     db.commit()
 
-    total_findings = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
+    total_findings = (
+        db.query(RepoFinding)
+        .filter(RepoFinding.snapshot_id == snapshot_id)
+        .count()
+    )
     return {"inserted": inserted, "total_findings": total_findings}
 
 
-# -------------------------------------------------------------------
-# Exports expected by routes/repo.py
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
+# Public API expected by routes/repo.py
+# --------------------------------------------------------------------
 
 async def run_llm_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
-    """
-    Backwards-compatible name used by routes.
-    """
-    return await scan_snapshot_to_findings(db=db, snapshot_id=snapshot_id)
+    return await scan_snapshot_to_findings(db, snapshot_id)
 
 
-def list_findings(
-    db: Session,
-    snapshot_id: int,
-    limit: int = 50,
-    offset: int = 0,
-    include_resolved: bool = False,
-) -> dict[str, Any]:
-    q = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id)
-
-    if not include_resolved:
-        q = q.filter(RepoFinding.is_resolved.is_(False))
-
-    # Order by severity first, then newest
-    q = q.order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
-
+def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    q = (
+        db.query(RepoFinding)
+        .filter(RepoFinding.snapshot_id == snapshot_id)
+        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+    )
     rows = q.offset(offset).limit(limit).all()
-
-    def row_to_dict(r: RepoFinding) -> dict[str, Any]:
-        return {
-            "id": r.id,
-            "snapshot_id": r.snapshot_id,
-            "category": r.category,
-            "severity": r.severity,
-            "title": r.title,
-            "file_path": getattr(r, "file_path", None),
-            "line_start": getattr(r, "line_start", None),
-            "line_end": getattr(r, "line_end", None),
-            "evidence": r.evidence,
-            "recommendation": r.recommendation,
-            "acceptance": getattr(r, "acceptance", None),
-            "fingerprint": r.fingerprint,
-            "created_at": (r.created_at.isoformat() if r.created_at else None),
-            "is_resolved": bool(getattr(r, "is_resolved", False)),
-        }
+    total = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
 
     return {
         "snapshot_id": snapshot_id,
-        "count": len(rows),
-        "findings": [row_to_dict(r) for r in rows],
+        "count": total,
+        "findings": [
+            {
+                "id": r.id,
+                "snapshot_id": r.snapshot_id,
+                "path": r.path,
+                "line": r.line,
+                "category": r.category,
+                "severity": r.severity,
+                "title": r.title,
+                "evidence": r.evidence,
+                "recommendation": r.recommendation,
+                "fingerprint": r.fingerprint,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ],
     }
 
 
-async def tasks_from_findings(
-    db: Session,
-    snapshot_id: int,
-    project: str,
-    limit: int = 25,
-) -> tuple[int, int]:
+def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
     """
-    Convert findings -> Tasks with dedupe.
+    Convert RepoFinding rows into real Task rows.
+    This is intentionally deterministic and doesn't need an LLM.
     """
     findings = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
-        .filter(RepoFinding.is_resolved.is_(False))
+        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
         .all()
     )
-
-    if not findings:
-        return 0, 0
-
-    # Sort: critical/high first, then newest
-    findings.sort(key=lambda f: (_severity_rank(f.severity), f.id), reverse=True)
-
-    existing = db.query(Task).filter(Task.project == project).all()
-    existing_keys = {_task_key(t.title or "", t.link) for t in existing}
 
     created = 0
     skipped = 0
 
-    for f in findings[:limit]:
-        file_path = getattr(f, "file_path", None)
-        line_start = getattr(f, "line_start", None)
-
-        link = _repo_link(snapshot_id, file_path, line_start)
-
-        # Build a strong ticket
-        title = f"[{(f.severity or 'low').upper()}] {f.title}".strip()[:240]
-        notes_parts = []
-        if f.category:
-            notes_parts.append(f"Category: {f.category}")
-        if file_path:
-            notes_parts.append(f"File: {file_path}")
-        if line_start:
-            notes_parts.append(f"Lines: {line_start}" + (f"-{f.line_end}" if getattr(f, "line_end", None) else ""))
-
-        if f.evidence:
-            notes_parts.append("\nEvidence:\n" + str(f.evidence).strip())
-        if f.recommendation:
-            notes_parts.append("\nRecommendation:\n" + str(f.recommendation).strip())
-        if getattr(f, "acceptance", None):
-            notes_parts.append("\nAcceptance:\n" + str(getattr(f, "acceptance")).strip())
-
-        notes = "\n".join(notes_parts).strip()
-
-        # Reasonable defaults
-        sev = (f.severity or "").lower().strip()
-        priority = 5 if sev in ("critical", "high") else 4 if sev == "medium" else 3
-        est = 120 if sev in ("critical", "high") else 90 if sev == "medium" else 60
-        blocks = sev in ("critical", "high")
-
-        key = _task_key(title, link)
-        if key in existing_keys:
+    for f in findings:
+        # Dedupe: if we already created a task with this fingerprint tag, skip.
+        fp_tag = f"finding:{f.fingerprint}"
+        existing = (
+            db.query(Task)
+            .filter(Task.project == project)
+            .filter(Task.tags.like(f"%{fp_tag}%"))
+            .first()
+        )
+        if existing:
             skipped += 1
             continue
 
-        db.add(
-            Task(
-                title=title,
-                notes=notes,
-                project=project,
-                tags=f"repo,autogen,findings,{(f.category or 'misc')}",
-                link=link,
-                priority=priority,
-                estimated_minutes=est,
-                blocks_me=blocks,
-                starter="Open the linked file/lines, reproduce or confirm the issue, then implement the recommendation.",
-                dod="Acceptance criteria met; tests updated/added where applicable; no regression in CI.",
-                completed=False,
-            )
+        # Priority mapping 1..5 (your Task model uses 1..5)
+        # RepoFinding.severity is 1..5 already; clamp just in case.
+        pri = int(max(1, min(5, f.severity)))
+
+        link = f"repo://snapshot/{snapshot_id}#{f.path}" + (f":L{f.line}" if f.line else "")
+        tags = ",".join(
+            [
+                "repo",
+                "autogen",
+                f"category:{f.category}",
+                f"severity:{f.severity}",
+                fp_tag,
+            ]
         )
-        existing_keys.add(key)
+
+        notes_parts = []
+        if f.evidence:
+            notes_parts.append(f"Evidence:\n{f.evidence}")
+        if f.recommendation:
+            notes_parts.append(f"Recommendation:\n{f.recommendation}")
+        notes = "\n\n".join(notes_parts) if notes_parts else "Generated from repo findings."
+
+        t = Task(
+            title=f"[RepoFinding] {f.title}",
+            notes=notes,
+            priority=pri,
+            estimated_minutes=90 if pri >= 4 else 45,
+            blocks_me=(pri >= 5),
+            project=project,
+            tags=tags,
+            link=link,
+            starter="Open the file and reproduce/confirm the issue in 2–5 minutes.",
+            dod="Change is implemented + minimal test/verification step is documented in the task notes.",
+            created_at=datetime.utcnow(),
+            completed=False,
+        )
+        db.add(t)
         created += 1
 
     db.commit()
-    return created, skipped
+
+    return {"snapshot_id": snapshot_id, "project": project, "created": created, "skipped": skipped}

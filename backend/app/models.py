@@ -1,19 +1,10 @@
 # backend/app/models.py
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import date, datetime
 from typing import Optional
 
-from sqlalchemy import (
-    Boolean,
-    Date,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-)
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -29,7 +20,7 @@ class Goal(Base):
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    project: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # haven | onestream | personal
+    project: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="goal")
 
@@ -38,7 +29,6 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-
     goal_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("goals.id"), nullable=True)
 
     title: Mapped[str] = mapped_column(String(250), nullable=False)
@@ -88,16 +78,12 @@ class PlanRun(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
 
-# ---------------------------
-# Level 1: GitHub repo snapshots
-# ---------------------------
-
 class RepoSnapshot(Base):
     __tablename__ = "repo_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    repo: Mapped[str] = mapped_column(String(255))
-    branch: Mapped[str] = mapped_column(String(255))
+    repo: Mapped[str] = mapped_column(String(255), nullable=False)
+    branch: Mapped[str] = mapped_column(String(255), nullable=False)
     commit_sha: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     file_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -125,13 +111,10 @@ class RepoFile(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     snapshot_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("repo_snapshots.id"),
-        index=True,
-        nullable=False,
+        Integer, ForeignKey("repo_snapshots.id"), index=True, nullable=False
     )
 
-    path: Mapped[str] = mapped_column(String(1024))
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
     sha: Mapped[str | None] = mapped_column(String(120), nullable=True)
     size: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -145,43 +128,30 @@ class RepoFile(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    snapshot: Mapped[RepoSnapshot] = relationship("RepoSnapshot", back_populates="files")
+    snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="files")
 
-
-# ---------------------------
-# Level 2: LLM Findings (virtual TODO/FIXME)
-# ---------------------------
 
 class RepoFinding(Base):
     __tablename__ = "repo_findings"
-
-    __table_args__ = (
-        UniqueConstraint("snapshot_id", "fingerprint", name="uq_finding_fingerprint"),
-    )
+    __table_args__ = (UniqueConstraint("snapshot_id", "fingerprint", name="uq_finding_fingerprint"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(Integer, ForeignKey("repo_snapshots.id"), index=True, nullable=False)
 
-    snapshot_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("repo_snapshots.id"),
-        index=True,
-        nullable=False,
-    )
-
-    # where
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     line: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    # what
-    category: Mapped[str] = mapped_column(String(48), nullable=False)  # security|reliability|db|api|tests|ops|perf|style
+    category: Mapped[str] = mapped_column(String(48), nullable=False)
     severity: Mapped[int] = mapped_column(Integer, default=3, nullable=False)  # 1..5
 
     title: Mapped[str] = mapped_column(String(240), nullable=False)
-    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)        # excerpt / why
-    recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # what to do
+    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    acceptance: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)        # stable dedupe key
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
 
+    is_resolved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
-    snapshot: Mapped[RepoSnapshot] = relationship("RepoSnapshot", back_populates="findings")
+    snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="findings")

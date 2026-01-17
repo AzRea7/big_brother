@@ -29,7 +29,7 @@ def _snapshot_or_404(db: Session, snapshot_id: int) -> RepoSnapshot:
 # ----------------------------
 def _get_sync_callable():
     """
-    Prefer sync_repo_snapshot if present (compat wrappers),
+    Prefer sync_repo_snapshot if present,
     otherwise fall back to create_repo_snapshot.
     Both are async in your code.
     """
@@ -44,6 +44,32 @@ def _get_sync_callable():
         status_code=500,
         detail="github_sync does not export sync_repo_snapshot or create_repo_snapshot.",
     )
+
+
+# ----------------------------
+# LLM Findings function resolver
+# ----------------------------
+def _get_findings_service():
+    """
+    We intentionally import inside the function so that if the module
+    has an import error, you get a clean API error instead of the whole app
+    failing at startup.
+    """
+    try:
+        from ..services import repo_llm_findings as svc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to import repo_llm_findings: {type(e).__name__}: {e}")
+
+    # Expected exports
+    required = ["run_llm_scan", "list_findings", "tasks_from_findings"]
+    missing = [name for name in required if not hasattr(svc, name)]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"repo_llm_findings missing exports: {missing}. Expected: {required}",
+        )
+
+    return svc
 
 
 @router.post("/sync", response_class=JSONResponse)
@@ -62,8 +88,7 @@ async def repo_sync(
     branch = branch or settings.GITHUB_BRANCH
 
     sync_fn = _get_sync_callable()
-
-    out = await sync_fn(db=db, repo=repo, branch=branch)  # <-- THE FIX
+    out = await sync_fn(db=db, repo=repo, branch=branch)
 
     # RepoSyncResult is a dataclass; convert to dict for JSON.
     if isinstance(out, dict):
@@ -132,6 +157,42 @@ async def tasks_from_snapshot(
     _snapshot_or_404(db, snapshot_id)
     created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=snapshot_id, project=project)
     return {"snapshot_id": snapshot_id, "project": project, "created": created, "skipped": skipped}
+
+
+# ----------------------------
+# Level 2: LLM scan -> findings -> tasks
+# ----------------------------
+@router.post("/scan_llm", response_class=JSONResponse)
+async def scan_llm(
+    snapshot_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    svc = _get_findings_service()
+    return await svc.run_llm_scan(db=db, snapshot_id=snapshot_id)
+
+
+@router.get("/findings", response_class=JSONResponse)
+def findings(
+    snapshot_id: int = Query(..., ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    svc = _get_findings_service()
+    return svc.list_findings(db=db, snapshot_id=snapshot_id, limit=limit, offset=offset)
+
+
+@router.post("/tasks_from_findings", response_class=JSONResponse)
+def tasks_from_findings_route(
+    snapshot_id: int = Query(..., ge=1),
+    project: str = Query(default="haven"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _snapshot_or_404(db, snapshot_id)
+    svc = _get_findings_service()
+    return svc.tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project)
 
 
 @status_router.get("/api/repo/status", response_class=JSONResponse)

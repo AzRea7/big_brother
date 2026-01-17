@@ -1,3 +1,4 @@
+# backend/app/schemas.py
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -10,7 +11,7 @@ class GoalCreate(BaseModel):
     title: str = Field(min_length=2, max_length=200)
     why: str | None = None
     target_date: date | None = None
-    project: str | None = None  # haven | onestream | personal
+    project: str | None = None
 
 
 class GoalOut(BaseModel):
@@ -21,8 +22,7 @@ class GoalOut(BaseModel):
     project: str | None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class TaskCreate(BaseModel):
@@ -89,19 +89,19 @@ class TaskOut(BaseModel):
     energy: Optional[str]
     parent_task_id: Optional[int]
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class PlanOut(BaseModel):
     generated_at: datetime
     content: str
 
+
 class RepoSyncOut(BaseModel):
     snapshot_id: int
     repo: str
     branch: str
-    commit_sha: str
+    commit_sha: str | None
     file_count: int
     stored_content_files: int
     warnings: list[str] = Field(default_factory=list)
@@ -115,12 +115,11 @@ class RepoSignalCountsOut(BaseModel):
 class RepoFindingOut(BaseModel):
     id: int
     snapshot_id: int
+    path: str
+    line: Optional[int] = None
     category: str
-    severity: str
+    severity: int
     title: str
-    file_path: Optional[str] = None
-    line_start: Optional[int] = None
-    line_end: Optional[int] = None
     evidence: Optional[str] = None
     recommendation: Optional[str] = None
     acceptance: Optional[str] = None
@@ -128,8 +127,7 @@ class RepoFindingOut(BaseModel):
     created_at: datetime
     is_resolved: bool
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class RepoScanOut(BaseModel):

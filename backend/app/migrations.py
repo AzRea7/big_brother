@@ -15,7 +15,7 @@ def _add_column_sqlite(engine: Engine, table: str, col: str, col_ddl: str) -> No
         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_ddl}"))
 
 
-def _ensure_table(engine: Engine, ddl: str) -> None:
+def _ensure(engine: Engine, ddl: str) -> None:
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
@@ -23,9 +23,7 @@ def _ensure_table(engine: Engine, ddl: str) -> None:
 def ensure_schema(engine: Engine) -> None:
     """
     SQLite-friendly schema upgrades.
-    This runs on every startup (init_db calls ensure_schema()).
-
-    Goal: keep the app working without forcing Alembic for dev.
+    Runs every startup (init_db calls ensure_schema()).
     """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
@@ -52,7 +50,7 @@ def ensure_schema(engine: Engine) -> None:
 
     # ---- Dependencies ----
     if "task_dependencies" not in tables:
-        _ensure_table(
+        _ensure(
             engine,
             """
             CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -67,7 +65,7 @@ def ensure_schema(engine: Engine) -> None:
 
     # ---- Plan runs ----
     if "plan_runs" not in tables:
-        _ensure_table(
+        _ensure(
             engine,
             """
             CREATE TABLE IF NOT EXISTS plan_runs (
@@ -82,7 +80,7 @@ def ensure_schema(engine: Engine) -> None:
 
     # ---- Repo snapshots ----
     if "repo_snapshots" not in tables:
-        _ensure_table(
+        _ensure(
             engine,
             """
             CREATE TABLE IF NOT EXISTS repo_snapshots (
@@ -100,18 +98,18 @@ def ensure_schema(engine: Engine) -> None:
 
     # ---- Repo files ----
     if "repo_files" not in tables:
-        _ensure_table(
+        _ensure(
             engine,
             """
             CREATE TABLE IF NOT EXISTS repo_files (
               id INTEGER PRIMARY KEY,
               snapshot_id INTEGER NOT NULL,
-              path VARCHAR(600) NOT NULL,
+              path VARCHAR(1024) NOT NULL,
               sha VARCHAR(120),
               size INTEGER,
               content TEXT,
               content_text TEXT,
-              content_kind VARCHAR(16) DEFAULT 'skipped',
+              content_kind VARCHAR(30) DEFAULT 'skipped',
               skipped BOOLEAN DEFAULT 0,
               is_text BOOLEAN DEFAULT 1,
               skip_reason TEXT,
@@ -119,60 +117,70 @@ def ensure_schema(engine: Engine) -> None:
             )
             """,
         )
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_snapshot ON repo_files(snapshot_id)")
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(path)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_snapshot ON repo_files(snapshot_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(path)")
     else:
         for col, ddl in [
             ("sha", "VARCHAR(120)"),
             ("size", "INTEGER"),
-            ("content_kind", "VARCHAR(16) DEFAULT 'skipped'"),
+            ("content_kind", "VARCHAR(30) DEFAULT 'skipped'"),
             ("skipped", "BOOLEAN DEFAULT 0"),
             ("is_text", "BOOLEAN DEFAULT 1"),
             ("content_text", "TEXT"),
             ("skip_reason", "TEXT"),
+            ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
         ]:
             if not _has_column(engine, "repo_files", col):
                 _add_column_sqlite(engine, "repo_files", col, ddl)
 
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_snapshot ON repo_files(snapshot_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_files_path ON repo_files(path)")
+
     # ---- Repo findings (LLM scan output) ----
     if "repo_findings" not in tables:
-        _ensure_table(
+        _ensure(
             engine,
             """
             CREATE TABLE IF NOT EXISTS repo_findings (
               id INTEGER PRIMARY KEY,
               snapshot_id INTEGER NOT NULL,
-              path VARCHAR(600),
+              path VARCHAR(1024) NOT NULL,
               line INTEGER,
-              category VARCHAR(64),
+              category VARCHAR(48) NOT NULL,
               severity INTEGER DEFAULT 3,
-              title VARCHAR(240),
+              title VARCHAR(240) NOT NULL,
               evidence TEXT,
               recommendation TEXT,
-              fingerprint VARCHAR(80),
+              acceptance TEXT,
+              fingerprint VARCHAR(64) NOT NULL,
+              is_resolved BOOLEAN DEFAULT 0,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               UNIQUE(snapshot_id, fingerprint)
             )
             """,
         )
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_snapshot ON repo_findings(snapshot_id)")
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_sev ON repo_findings(severity)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_snapshot ON repo_findings(snapshot_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_sev ON repo_findings(severity)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_resolved ON repo_findings(is_resolved)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_path ON repo_findings(path)")
     else:
-        # upgrade older repo_findings tables (your error: missing path column)
         for col, ddl in [
-            ("path", "VARCHAR(600)"),
+            ("path", "VARCHAR(1024)"),
             ("line", "INTEGER"),
-            ("category", "VARCHAR(64)"),
+            ("category", "VARCHAR(48)"),
             ("severity", "INTEGER DEFAULT 3"),
             ("title", "VARCHAR(240)"),
             ("evidence", "TEXT"),
             ("recommendation", "TEXT"),
-            ("fingerprint", "VARCHAR(80)"),
+            ("acceptance", "TEXT"),
+            ("fingerprint", "VARCHAR(64)"),
+            ("is_resolved", "BOOLEAN DEFAULT 0"),
             ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
         ]:
             if not _has_column(engine, "repo_findings", col):
                 _add_column_sqlite(engine, "repo_findings", col, ddl)
 
-        # best-effort indexes (safe if already exist)
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_snapshot ON repo_findings(snapshot_id)")
-        _ensure_table(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_sev ON repo_findings(severity)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_snapshot ON repo_findings(snapshot_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_sev ON repo_findings(severity)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_resolved ON repo_findings(is_resolved)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_path ON repo_findings(path)")

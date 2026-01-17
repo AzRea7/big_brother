@@ -1,11 +1,11 @@
+# backend/app/db.py
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
 from typing import Generator
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase, Session
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import settings
 
@@ -33,9 +33,6 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 
 
 def get_db() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency that yields a DB session and guarantees closure.
-    """
     db = SessionLocal()
     try:
         yield db
@@ -46,10 +43,9 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     """
     Creates tables + runs lightweight schema upgrades (SQLite-friendly).
-    No Alembic required.
     """
     from . import models  # noqa: F401
-    from .migrations import ensure_schema  # noqa: F401
+    from .migrations import ensure_schema
 
     Base.metadata.create_all(bind=engine)
     ensure_schema(engine)
