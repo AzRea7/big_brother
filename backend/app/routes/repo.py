@@ -12,24 +12,6 @@ from ..config import settings
 from ..db import get_db
 from ..models import RepoFile, RepoSnapshot
 from ..services.repo_taskgen import compute_signal_counts, generate_tasks_from_snapshot
-from ..services.repo_findings import run_llm_scan, list_findings, tasks_from_findings
-
-# ---- github_sync import: support multiple names defensively ----
-try:
-    from ..services.github_sync import sync_repo_snapshot  # preferred
-except Exception:
-    sync_repo_snapshot = None  # type: ignore
-
-try:
-    from ..services.github_sync import sync_snapshot  # fallback
-except Exception:
-    sync_snapshot = None  # type: ignore
-
-try:
-    from ..services.github_sync import sync_repo  # fallback
-except Exception:
-    sync_repo = None  # type: ignore
-
 
 router = APIRouter(prefix="/debug/repo", tags=["repo"])
 status_router = APIRouter(tags=["repo-ui"])
@@ -42,35 +24,51 @@ def _snapshot_or_404(db: Session, snapshot_id: int) -> RepoSnapshot:
     return snap
 
 
-def _sync(db: Session, repo: str, branch: str) -> dict[str, Any]:
+# ----------------------------
+# Sync function resolver
+# ----------------------------
+def _get_sync_callable():
     """
-    Some earlier versions exported different function names.
-    Try a few in order.
+    Prefer sync_repo_snapshot if present (compat wrappers),
+    otherwise fall back to create_repo_snapshot.
+    Both are async in your code.
     """
-    if sync_repo_snapshot:
-        return sync_repo_snapshot(db=db, repo=repo, branch=branch)  # type: ignore[misc]
-    if sync_snapshot:
-        return sync_snapshot(db=db, repo=repo, branch=branch)  # type: ignore[misc]
-    if sync_repo:
-        return sync_repo(db=db, repo=repo, branch=branch)  # type: ignore[misc]
+    from ..services import github_sync as gs
+
+    if hasattr(gs, "sync_repo_snapshot"):
+        return getattr(gs, "sync_repo_snapshot")
+    if hasattr(gs, "create_repo_snapshot"):
+        return getattr(gs, "create_repo_snapshot")
+
     raise HTTPException(
         status_code=500,
-        detail=(
-            "github_sync does not export a supported sync function. Tried: "
-            "sync_repo_snapshot, sync_snapshot, sync_repo."
-        ),
+        detail="github_sync does not export sync_repo_snapshot or create_repo_snapshot.",
     )
 
 
 @router.post("/sync", response_class=JSONResponse)
-def repo_sync(
+async def repo_sync(
     repo: str | None = Query(default=None),
     branch: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    """
+    Create a new repo snapshot.
+
+    IMPORTANT:
+      - This must be async and must await the sync function.
+    """
     repo = repo or settings.GITHUB_REPO
     branch = branch or settings.GITHUB_BRANCH
-    return _sync(db=db, repo=repo, branch=branch)
+
+    sync_fn = _get_sync_callable()
+
+    out = await sync_fn(db=db, repo=repo, branch=branch)  # <-- THE FIX
+
+    # RepoSyncResult is a dataclass; convert to dict for JSON.
+    if isinstance(out, dict):
+        return out
+    return getattr(out, "__dict__", {"result": str(out)})
 
 
 @router.get("/signal_counts_full", response_class=JSONResponse)
@@ -90,14 +88,15 @@ def search_snapshot(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     _snapshot_or_404(db, snapshot_id)
-    needle = q.lower()
 
+    needle = q.lower()
     files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
 
     hits: list[dict[str, Any]] = []
     for rf in files:
         if rf.content_kind != "text":
             continue
+
         text = (getattr(rf, "content_text", None) or rf.content or "")
         if not text:
             continue
@@ -134,69 +133,6 @@ async def tasks_from_snapshot(
     created, skipped = await generate_tasks_from_snapshot(db=db, snapshot_id=snapshot_id, project=project)
     return {"snapshot_id": snapshot_id, "project": project, "created": created, "skipped": skipped}
 
-
-# --------------------------
-# NEW: LLM scan -> findings
-# --------------------------
-
-@router.post("/scan_llm", response_class=JSONResponse)
-async def scan_llm(
-    snapshot_id: int = Query(..., ge=1),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """
-    Run a bounded LLM scan and store RepoFinding rows.
-    """
-    _snapshot_or_404(db, snapshot_id)
-    out = await run_llm_scan(db=db, snapshot_id=snapshot_id)
-    return out
-
-
-@router.get("/findings", response_class=JSONResponse)
-def findings(
-    snapshot_id: int = Query(..., ge=1),
-    limit: int = Query(default=50, ge=1, le=200),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
-    rows = list_findings(db=db, snapshot_id=snapshot_id, limit=limit)
-
-    return {
-        "snapshot_id": snapshot_id,
-        "count": len(rows),
-        "findings": [
-            {
-                "id": r.id,
-                "path": r.path,
-                "line": r.line,
-                "category": r.category,
-                "severity": r.severity,
-                "title": r.title,
-                "evidence": r.evidence,
-                "recommendation": r.recommendation,
-                "fingerprint": r.fingerprint,
-                "created_at": str(r.created_at) if getattr(r, "created_at", None) else None,
-            }
-            for r in rows
-        ],
-    }
-
-
-@router.post("/tasks_from_findings", response_class=JSONResponse)
-def tasks_from_findings_route(
-    snapshot_id: int = Query(..., ge=1),
-    project: str = Query(default="haven"),
-    limit: int = Query(default=12, ge=1, le=50),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
-    out = tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project, limit=limit)
-    return out
-
-
-# --------------------------
-# UI helpers
-# --------------------------
 
 @status_router.get("/api/repo/status", response_class=JSONResponse)
 def repo_status(db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -259,14 +195,6 @@ def repo_ui() -> HTMLResponse:
       <button onclick="runSearch()">Search</button>
     </div>
     <pre id="search"></pre>
-
-    <h3>LLM scan</h3>
-    <div class="row">
-      <button onclick="runScan()">Run /scan_llm</button>
-      <button onclick="loadFindings()">Load /findings</button>
-      <button onclick="makeTasks()">Make tasks from findings</button>
-    </div>
-    <pre id="findings"></pre>
   </div>
 
 <script>
@@ -284,24 +212,6 @@ async function runSearch() {
   const r = await fetch(`/debug/repo/search?snapshot_id=${encodeURIComponent(sid)}&q=${encodeURIComponent(q)}&limit=25`);
   const j = await r.json();
   document.getElementById('search').textContent = JSON.stringify(j, null, 2);
-}
-async function runScan() {
-  const sid = document.getElementById('snapshotId').value;
-  const r = await fetch(`/debug/repo/scan_llm?snapshot_id=${encodeURIComponent(sid)}`, { method: "POST" });
-  const j = await r.json();
-  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
-}
-async function loadFindings() {
-  const sid = document.getElementById('snapshotId').value;
-  const r = await fetch(`/debug/repo/findings?snapshot_id=${encodeURIComponent(sid)}&limit=50`);
-  const j = await r.json();
-  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
-}
-async function makeTasks() {
-  const sid = document.getElementById('snapshotId').value;
-  const r = await fetch(`/debug/repo/tasks_from_findings?snapshot_id=${encodeURIComponent(sid)}&project=haven&limit=12`, { method: "POST" });
-  const j = await r.json();
-  document.getElementById('findings').textContent = JSON.stringify(j, null, 2);
 }
 loadStatus();
 </script>

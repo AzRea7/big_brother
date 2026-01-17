@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import fnmatch
 import json
 import os
 from dataclasses import dataclass
@@ -54,15 +53,12 @@ def _is_excluded_path(path: str) -> bool:
     if ext and ext in set(settings.GITHUB_EXCLUDE_EXTENSIONS):
         return True
 
-    # glob-ish patterns (optional)
-    # (kept minimal: your config uses prefixes + dir names primarily)
     return False
 
 
 def _is_included_path(path: str) -> bool:
     # No allowlist. Everything is included unless excluded.
     return True
-
 
 
 def _looks_like_text(path: str, raw: bytes) -> bool:
@@ -122,11 +118,14 @@ def latest_snapshot(db: Session, repo: str | None = None, branch: str | None = N
 
 
 def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
-    files = db.execute(select(RepoFile.path, RepoFile.skipped, RepoFile.is_text).where(RepoFile.snapshot_id == snapshot_id)).all()
+    files = db.execute(
+        select(RepoFile.path, RepoFile.skipped, RepoFile.is_text).where(RepoFile.snapshot_id == snapshot_id)
+    ).all()
+
     total = len(files)
-    skipped = sum(1 for p, s, t in files if s)
-    text_files = sum(1 for p, s, t in files if (not s) and t)
-    binary_files = sum(1 for p, s, t in files if (not s) and (not t))
+    skipped = sum(1 for _, s, _ in files if s)
+    text_files = sum(1 for _, s, t in files if (not s) and t)
+    binary_files = sum(1 for _, s, t in files if (not s) and (not t))
 
     folder_counts: dict[str, int] = {}
     for (p, _, _) in files:
@@ -134,7 +133,10 @@ def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
         top = p.split("/", 1)[0] if "/" in p else p
         folder_counts[top] = folder_counts.get(top, 0) + 1
 
-    top_folders = [{"folder": k, "count": v} for k, v in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]]
+    top_folders = [
+        {"folder": k, "count": v}
+        for k, v in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    ]
     return {
         "total_files": total,
         "text_files": text_files,
@@ -198,7 +200,11 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
     async with httpx.AsyncClient() as client:
         while queue:
             path = queue.pop(0)
-            url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}" if path else f"https://api.github.com/repos/{repo}/contents?ref={branch}"
+            url = (
+                f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+                if path
+                else f"https://api.github.com/repos/{repo}/contents?ref={branch}"
+            )
             data = await _github_get_json(client, url, headers)
 
             if isinstance(data, dict):
@@ -211,11 +217,9 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
                 if not ipath:
                     continue
 
-                # FILTERS: apply allowlist before exploring too deep
-                # If HAVEN_REPO_ONLY, we only descend into included prefixes.
+                # allowlist (currently no-op) + excludes
                 if not _is_included_path(ipath):
                     continue
-
                 if _is_excluded_path(ipath):
                     continue
 
@@ -238,6 +242,12 @@ async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]
 
 
 async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
+    """
+    The canonical async entrypoint.
+
+    Prefers local scan if REPO_LOCAL_PATH is set (fast, no GitHub rate limits),
+    otherwise uses GitHub API.
+    """
     repo = repo or settings.GITHUB_REPO
     branch = branch or settings.GITHUB_BRANCH
 
@@ -283,7 +293,6 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
                 skip_reason=None,
             )
 
-            # store content if small enough
             if size <= settings.GITHUB_MAX_FILE_BYTES:
                 try:
                     with open(it["abs_path"], "rb") as f:
@@ -370,7 +379,6 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
                 if download_url:
                     raw = await _github_get_bytes(client, download_url, headers)
                 else:
-                    # fallback to contents API (base64)
                     j = await _github_get_json(client, api_url, headers)
                     if j.get("encoding") == "base64" and j.get("content"):
                         raw = base64.b64decode(j["content"])
@@ -410,3 +418,19 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
         stored_content_files=stored,
         warnings=warnings,
     )
+
+
+# -------------------------------------------------------------------
+# Compatibility exports (do NOT change behavior; just prevents route breakage)
+# These match older route imports: sync_repo_snapshot, sync_snapshot, sync_repo
+# -------------------------------------------------------------------
+async def sync_repo_snapshot(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
+    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
+
+
+async def sync_snapshot(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
+    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
+
+
+async def sync_repo(*, db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
+    return await create_repo_snapshot(db=db, repo=repo, branch=branch)
