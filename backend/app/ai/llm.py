@@ -43,7 +43,7 @@ class LLMClient:
         system: str,
         user: str,
         temperature: float = 0.2,
-        max_tokens: int = 600,
+        max_tokens: int = 2000,
     ) -> str:
         """
         Generic chat call used by repo task generation (and anything else).
@@ -69,7 +69,7 @@ class LLMClient:
             "max_tokens": int(max_tokens),
         }
 
-        timeout = httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=10.0)
+        timeout = httpx.Timeout(connect=10.0, read=float(getattr(settings, "LLM_READ_TIMEOUT_S", 600.0)), write=60.0, pool=10.0)
 
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -130,7 +130,7 @@ class LLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 350,
+            "max_tokens": 1200,
         }
 
         timeout = httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=10.0)

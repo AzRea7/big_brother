@@ -74,11 +74,16 @@ class Settings(BaseSettings):
     REPO_TASK_EXCERPT_CHARS: int = 800
 
     # Output
-    REPO_TASK_COUNT: int = 8
+    REPO_TASK_COUNT: int = 3
     # -----------------------
     # GitHub sync exclusions (restored from your old config)
     # Cleaned duplicates but preserved intent.
     # -----------------------
+
+    REPO_TASK_MAX_TOTAL_CHARS: int = 12_000
+    LLM_READ_TIMEOUT_S: float = 660.0
+
+
     GITHUB_EXCLUDE_PREFIXES: list[str] = [
             # OneHaven-specific
             "onehaven/node_modules/",
