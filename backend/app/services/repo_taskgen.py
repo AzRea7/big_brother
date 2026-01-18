@@ -184,7 +184,7 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         if sig.get("csrf_signal", 0) > 0:
             files_with["csrf"] += 1
 
-        # Implementation stubs / "unfinished" signals (useful in prod hardening)
+        # Implementation stubs / "unfinished" signals
         if any(x in text for x in ("raise NotImplementedError", "IMPLEMENT", "stub", "pass  #")):
             impl += 1
 
@@ -271,20 +271,7 @@ def _blocks_for_kind(kind: str) -> bool:
 # -------------------------
 
 def _extract_json_object_lenient(raw: str) -> dict[str, Any]:
-    """
-    Local/hosted models sometimes violate “JSON only”:
-      - leading text
-      - wrap in ```json fences
-      - trailing commentary
-
-    Strategy:
-      - strip fences
-      - take substring from first '{' to last '}'
-      - parse it
-    """
     s = (raw or "").strip()
-
-    # strip code fences
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s*```$", "", s)
 
@@ -320,7 +307,6 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
             continue
 
         lines = text.splitlines()
-        # Hard cap: scanning giant files is slow and usually not worth it for fallback.
         for i, line in enumerate(lines[:2500], start=1):
             m = _FALLBACK_RE.search(line)
             if not m:
@@ -329,7 +315,6 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
             kind = m.group(1).upper()
             raw_msg = (m.group(2) or "").strip()
 
-            # Prevent NOTE spam: only convert NOTE to task if actionable.
             if kind == "NOTE" and not _is_actionable_note(raw_msg):
                 continue
 
@@ -368,7 +353,6 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
             )
         ]
 
-    # Rank by severity first, then stable order by path/line
     found.sort(key=lambda x: (-x["score"], x["path"], x["line"]))
 
     out: list[SuggestedTask] = []
@@ -407,11 +391,6 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
 # -------------------------
 
 def _signal_strength(sig: dict[str, Any]) -> int:
-    """
-    Heuristic ranking to avoid sending the entire repo to the LLM.
-    Higher = more likely to be important / actionable.
-    """
-    # Classic markers (high weight)
     strength = 0
     strength += 12 * int(sig.get("fixme_count", 0))
     strength += 12 * int(sig.get("bug_count", 0))
@@ -421,7 +400,6 @@ def _signal_strength(sig: dict[str, Any]) -> int:
     strength += 2 * int(sig.get("note_count", 0))
     strength += 4 * int(sig.get("dotdotdot_count", 0))
 
-    # Production signals (medium weight)
     strength += 8 * int(sig.get("auth_signal", 0))
     strength += 6 * int(sig.get("timeout_signal", 0))
     strength += 6 * int(sig.get("retry_signal", 0))
@@ -442,10 +420,6 @@ def _signal_strength(sig: dict[str, Any]) -> int:
 
 
 async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], project: str) -> list[SuggestedTask]:
-    """
-    Uses bounded prompt builder (top N by signal strength, capped excerpts, capped total chars).
-    Adds tolerant JSON handling in case the model emits fences or leading text.
-    """
     if not getattr(settings, "LLM_ENABLED", False):
         return []
     if not getattr(settings, "OPENAI_MODEL", None):
@@ -466,14 +440,12 @@ async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], pro
         file_summaries.append(
             {
                 "path": f.path,
-                # keep excerpt short here to reduce upstream memory + token pressure
                 "excerpt": text[:excerpt_chars],
                 **sig,
                 "_strength": _signal_strength(sig),
             }
         )
 
-    # Keep only the most "signal-heavy" files; this is the biggest practical win for prompt size.
     file_summaries.sort(key=lambda d: int(d.get("_strength", 0)), reverse=True)
     file_summaries = file_summaries[:max_files]
     for d in file_summaries:
@@ -537,7 +509,6 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
         .where(RepoFile.content_kind == "text")
     ).all()
 
-    # 1) LLM path (bounded + tolerant parsing)
     suggestions: list[SuggestedTask] = []
     if getattr(settings, "LLM_ENABLED", False):
         try:
@@ -545,11 +516,9 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
         except Exception:
             suggestions = []
 
-    # 2) deterministic fallback (filtered NOTE)
     if not suggestions:
         suggestions = _suggest_tasks_from_signals(db, snapshot_id=snapshot_id, project=project, limit=25)
 
-    # 3) dedupe vs existing tasks in this project (title+link)
     existing = db.scalars(select(Task).where(Task.project == project)).all()
     existing_keys = {_task_key(t.title or "", t.link) for t in existing}
 

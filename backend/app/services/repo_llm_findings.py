@@ -28,18 +28,47 @@ def _fingerprint(f: dict[str, Any]) -> str:
             str(f.get("category") or ""),
             str(f.get("severity") or ""),
             str(f.get("title") or ""),
-            str(f.get("file_path") or ""),
-            str(f.get("line_start") or ""),
+            str(f.get("file_path") or f.get("path") or ""),
+            str(f.get("line_start") or f.get("line") or ""),
             str(f.get("line_end") or ""),
         ]
     )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:64]
 
 
+def _coerce_severity(x: Any) -> int:
+    """
+    Normalize severity into int 1..5.
+    Accepts:
+      - int/float
+      - numeric strings: "4"
+      - words: low/med/high/critical
+    """
+    if x is None:
+        return 3
+
+    if isinstance(x, (int, float)):
+        v = int(x)
+        return max(1, min(5, v))
+
+    s = str(x).strip().lower()
+    if not s:
+        return 3
+
+    if s in _SEVERITY_MAP:
+        return _SEVERITY_MAP[s]
+
+    try:
+        v = int(float(s))
+        return max(1, min(5, v))
+    except Exception:
+        return 3
+
+
 def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
     """
-    Simple heuristic: prefer files that have content and are larger (often more "core" code).
-    We cap hard so prompts stay bounded.
+    Prefer files that have content and are larger (often more "core" code).
+    Hard cap to keep prompt bounded.
     """
     q = (
         db.query(RepoFile)
@@ -69,6 +98,49 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
     return "".join(chunks)
 
 
+def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Drop un-actionable garbage:
+      - missing title
+      - missing file_path/path (your model sometimes emits null file_path)
+    Normalize:
+      - severity -> int 1..5
+      - line_start/line -> int|None
+    """
+    if not isinstance(f, dict):
+        return None
+
+    title = str(f.get("title") or "").strip()
+    if not title:
+        return None
+
+    path = f.get("file_path") or f.get("path")
+    path = str(path or "").strip()
+    if not path or path == "null":
+        return None
+
+    sev = _coerce_severity(f.get("severity"))
+
+    line = None
+    line_start = f.get("line_start") or f.get("line")
+    if line_start is not None:
+        try:
+            line = int(line_start)
+        except Exception:
+            line = None
+
+    return {
+        "category": str(f.get("category") or "maintainability")[:48],
+        "severity": int(sev),
+        "title": title[:240],
+        "path": path,
+        "line": line,
+        "evidence": (str(f.get("evidence")) if f.get("evidence") else None),
+        "recommendation": (str(f.get("recommendation")) if f.get("recommendation") else None),
+        "acceptance": (str(f.get("acceptance")) if f.get("acceptance") else None),
+    }
+
+
 async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, int]:
     """
     Core worker: calls LLM and inserts RepoFinding rows.
@@ -85,11 +157,24 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
     findings = resp.get("findings") or []
     inserted = 0
 
-    for f in findings:
-        if not isinstance(f, dict):
+    for f_raw in findings:
+        if not isinstance(f_raw, dict):
             continue
 
-        fp = _fingerprint(f)
+        f = _normalize_finding(f_raw)
+        if not f:
+            continue
+
+        fp = _fingerprint(
+            {
+                "category": f["category"],
+                "severity": f["severity"],
+                "title": f["title"],
+                "file_path": f["path"],
+                "line_start": f["line"] or "",
+                "line_end": "",
+            }
+        )
 
         exists = (
             db.query(RepoFinding)
@@ -100,26 +185,15 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
         if exists:
             continue
 
-        severity_str = str(f.get("severity") or "med").lower().strip()
-        sev = _SEVERITY_MAP.get(severity_str, 3)
-
-        path = str(f.get("file_path") or "").strip() or "unknown"
-        line = None
-        if f.get("line_start"):
-            try:
-                line = int(f["line_start"])
-            except Exception:
-                line = None
-
         row = RepoFinding(
             snapshot_id=snapshot_id,
-            path=path,
-            line=line,
-            category=str(f.get("category") or "maintainability")[:48],
-            severity=int(sev),
-            title=str(f.get("title") or "Finding")[:240],
-            evidence=(str(f.get("evidence")) if f.get("evidence") else None),
-            recommendation=(str(f.get("recommendation")) if f.get("recommendation") else None),
+            path=f["path"],
+            line=f["line"],
+            category=f["category"],
+            severity=int(f["severity"]),
+            title=f["title"],
+            evidence=f["evidence"],
+            recommendation=f["recommendation"],
             fingerprint=fp,
             created_at=datetime.utcnow(),
         )
@@ -128,11 +202,7 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
 
     db.commit()
 
-    total_findings = (
-        db.query(RepoFinding)
-        .filter(RepoFinding.snapshot_id == snapshot_id)
-        .count()
-    )
+    total_findings = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
     return {"inserted": inserted, "total_findings": total_findings}
 
 
@@ -148,14 +218,14 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
     q = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
-        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+        .order_by(RepoFinding.id.desc())
     )
     rows = q.offset(offset).limit(limit).all()
     total = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
 
     return {
         "snapshot_id": snapshot_id,
-        "count": total,
+        "count": int(total),
         "findings": [
             {
                 "id": r.id,
@@ -163,12 +233,12 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
                 "path": r.path,
                 "line": r.line,
                 "category": r.category,
-                "severity": r.severity,
+                "severity": _coerce_severity(r.severity),
                 "title": r.title,
                 "evidence": r.evidence,
                 "recommendation": r.recommendation,
                 "fingerprint": r.fingerprint,
-                "created_at": r.created_at.isoformat(),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in rows
         ],
@@ -178,21 +248,24 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
 def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
     """
     Convert RepoFinding rows into real Task rows.
-    This is intentionally deterministic and doesn't need an LLM.
+    Deterministic; doesn't need an LLM.
     """
     findings = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
-        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+        .order_by(RepoFinding.id.desc())
         .all()
     )
+
+    # Sort safely even if legacy rows have severity="4"
+    findings.sort(key=lambda r: _coerce_severity(getattr(r, "severity", None)), reverse=True)
 
     created = 0
     skipped = 0
 
     for f in findings:
-        # Dedupe: if we already created a task with this fingerprint tag, skip.
         fp_tag = f"finding:{f.fingerprint}"
+
         existing = (
             db.query(Task)
             .filter(Task.project == project)
@@ -203,20 +276,11 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
             skipped += 1
             continue
 
-        # Priority mapping 1..5 (your Task model uses 1..5)
-        # RepoFinding.severity is 1..5 already; clamp just in case.
-        pri = int(max(1, min(5, f.severity)))
+        sev = _coerce_severity(f.severity)
+        pri = int(max(1, min(5, sev)))
 
         link = f"repo://snapshot/{snapshot_id}#{f.path}" + (f":L{f.line}" if f.line else "")
-        tags = ",".join(
-            [
-                "repo",
-                "autogen",
-                f"category:{f.category}",
-                f"severity:{f.severity}",
-                fp_tag,
-            ]
-        )
+        tags = ",".join(["repo", "autogen", f"category:{f.category}", f"severity:{sev}", fp_tag])
 
         notes_parts = []
         if f.evidence:
@@ -225,23 +289,23 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
             notes_parts.append(f"Recommendation:\n{f.recommendation}")
         notes = "\n\n".join(notes_parts) if notes_parts else "Generated from repo findings."
 
-        t = Task(
-            title=f"[RepoFinding] {f.title}",
-            notes=notes,
-            priority=pri,
-            estimated_minutes=90 if pri >= 4 else 45,
-            blocks_me=(pri >= 5),
-            project=project,
-            tags=tags,
-            link=link,
-            starter="Open the file and reproduce/confirm the issue in 2–5 minutes.",
-            dod="Change is implemented + minimal test/verification step is documented in the task notes.",
-            created_at=datetime.utcnow(),
-            completed=False,
+        db.add(
+            Task(
+                title=f"[RepoFinding] {f.title}",
+                notes=notes,
+                priority=pri,
+                estimated_minutes=90 if pri >= 4 else 45,
+                blocks_me=(pri >= 5),
+                project=project,
+                tags=tags,
+                link=link,
+                starter="Open the file and reproduce/confirm the issue in 2–5 minutes.",
+                dod="Change is implemented + minimal test/verification step is documented in the task notes.",
+                created_at=datetime.utcnow(),
+                completed=False,
+            )
         )
-        db.add(t)
         created += 1
 
     db.commit()
-
     return {"snapshot_id": snapshot_id, "project": project, "created": created, "skipped": skipped}
