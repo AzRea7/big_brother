@@ -15,6 +15,7 @@ class LLMError(RuntimeError):
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")  # ", }" or ", ]" -> "}" / "]"
 
 
 def _strip_code_fences(s: str) -> str:
@@ -22,7 +23,6 @@ def _strip_code_fences(s: str) -> str:
     m = _JSON_FENCE_RE.search(s)
     if m:
         return (m.group(1) or "").strip()
-    # also handle raw triple-fence without regex capture (rare)
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s*```$", "", s)
     return s.strip()
@@ -80,21 +80,7 @@ def _extract_balanced_json_prefix(s: str) -> str | None:
     return None
 
 
-def _repair_truncated_json(s: str) -> str:
-    """
-    Best-effort close missing ']' / '}' at end. Also trims obvious extra closers.
-    Conservative: only adjusts the tail.
-    """
-    s = (s or "").strip()
-
-    # Trim trailing junk after last JSON-ish closer if any
-    last_curly = s.rfind("}")
-    last_brack = s.rfind("]")
-    last = max(last_curly, last_brack)
-    if last != -1:
-        s = s[: last + 1]
-
-    # Count braces/brackets outside strings
+def _count_brackets_outside_strings(s: str) -> tuple[int, int, int, int]:
     in_str = False
     esc = False
     opens_curly = closes_curly = 0
@@ -123,24 +109,78 @@ def _repair_truncated_json(s: str) -> str:
         elif ch == "]":
             closes_brack += 1
 
-    # If we have too many closing braces, trim extras from the end only
+    return opens_curly, closes_curly, opens_brack, closes_brack
+
+
+def _repair_truncated_json(s: str) -> str:
+    """
+    Best-effort repair for truncated LLM JSON.
+
+    Handles the common failure mode you hit:
+      - JSON ends with a '}' but is missing the closing ']' for an array inside it.
+      - naive repair appends ']' AFTER '}', creating invalid nesting and the
+        "Expecting ',' delimiter" JSONDecodeError.
+
+    Strategy:
+      1) Trim to last '}' or ']'
+      2) Remove trailing commas before '}' or ']'
+      3) Count braces/brackets outside strings
+      4) If missing ']' and string ends with '}', INSERT ']' before final '}' (correct nesting)
+      5) Append any missing '}' at the end
+    """
+    s = (s or "").strip()
+
+    # 1) Trim trailing junk after last JSON-ish closer if any
+    last_curly = s.rfind("}")
+    last_brack = s.rfind("]")
+    last = max(last_curly, last_brack)
+    if last != -1:
+        s = s[: last + 1]
+
+    # 2) Remove trailing commas before closing tokens
+    s = _TRAILING_COMMA_RE.sub(r"\1", s)
+
+    # 3) Count open/close tokens outside strings
+    opens_curly, closes_curly, opens_brack, closes_brack = _count_brackets_outside_strings(s)
+
+    # If we have too many closing braces/brackets, trim extras from the end only
     extra_curly = max(0, closes_curly - opens_curly)
     extra_brack = max(0, closes_brack - opens_brack)
-    while extra_curly > 0 and s.endswith("}"):
+    while extra_curly > 0 and s.rstrip().endswith("}"):
+        s = s.rstrip()
         s = s[:-1].rstrip()
         extra_curly -= 1
-    while extra_brack > 0 and s.endswith("]"):
+    while extra_brack > 0 and s.rstrip().endswith("]"):
+        s = s.rstrip()
         s = s[:-1].rstrip()
         extra_brack -= 1
 
-    # Append missing closers (arrays then objects)
+    # Re-count after trimming
+    s = _TRAILING_COMMA_RE.sub(r"\1", s)
+    opens_curly, closes_curly, opens_brack, closes_brack = _count_brackets_outside_strings(s)
+
     missing_brack = max(0, opens_brack - closes_brack)
     missing_curly = max(0, opens_curly - closes_curly)
-    if missing_brack:
-        s += "]" * missing_brack
-    if missing_curly:
-        s += "}" * missing_curly
 
+    # 4) Insert missing ']' BEFORE the final '}' when we end with an object close.
+    # This is the key fix for your error.
+    if missing_brack > 0:
+        stripped = s.rstrip()
+        if stripped.endswith("}"):
+            insert_at = stripped.rfind("}")
+            # Insert all missing brackets before the last '}' (keeps nesting valid)
+            s = stripped[:insert_at] + ("]" * missing_brack) + stripped[insert_at:]
+            missing_brack = 0
+        else:
+            s = stripped + ("]" * missing_brack)
+            missing_brack = 0
+
+    # 5) Append missing '}' at the end
+    if missing_curly > 0:
+        s = s.rstrip() + ("}" * missing_curly)
+
+    # Final trailing-comma cleanup
+    s = _TRAILING_COMMA_RE.sub(r"\1", s)
     return s
 
 
@@ -185,23 +225,6 @@ def _extract_json_object_lenient(raw: str) -> Any:
 
 
 class LLMClient:
-    """
-    OpenAI-compatible chat-completions client.
-
-    Works with:
-    - OpenAI
-    - LM Studio / local OpenAI-compatible servers
-    - Any server exposing POST {base_url}/chat/completions
-      (base_url should usually end with /v1)
-
-    Settings expected:
-      LLM_ENABLED (bool-ish)
-      OPENAI_BASE_URL (e.g. http://host.docker.internal:1234/v1)
-      OPENAI_MODEL (e.g. local-model-name)
-      OPENAI_API_KEY (optional for local servers)
-      LLM_READ_TIMEOUT_S (optional)
-    """
-
     def __init__(self) -> None:
         self.base_url = (getattr(settings, "OPENAI_BASE_URL", "") or "").rstrip("/")
         self.api_key = getattr(settings, "OPENAI_API_KEY", None)
@@ -221,9 +244,6 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> str:
-        """
-        Returns assistant message content as plain text.
-        """
         if not self.enabled():
             raise LLMError("LLM not enabled. Set LLM_ENABLED=true and OPENAI_BASE_URL + OPENAI_MODEL.")
 
@@ -242,9 +262,6 @@ class LLMClient:
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
-
-        # If your server supports it, this can help. Safe if ignored.
-        # payload["response_format"] = {"type": "json_object"}
 
         timeout = httpx.Timeout(
             connect=10.0,
@@ -283,12 +300,9 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> dict[str, Any]:
-        """
-        Calls chat() and parses JSON from the response with lenient fallback.
-        """
         raw = await self.chat(system=system, user=user, temperature=temperature, max_tokens=max_tokens)
 
-        # strict attempt first (fast)
+        # strict attempt first
         try:
             obj = json.loads(_strip_code_fences(raw))
             if isinstance(obj, dict):
@@ -302,9 +316,6 @@ class LLMClient:
 
 
 async def chat_completion_json(system: str, user: str) -> dict[str, Any]:
-    """
-    Backwards-compatible helper used by repo_llm_findings.py.
-    """
     llm = LLMClient()
     if not llm.enabled():
         raise LLMError("LLM is disabled (LLM_ENABLED=false or missing OPENAI_BASE_URL/OPENAI_MODEL).")
