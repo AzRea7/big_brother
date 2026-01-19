@@ -21,6 +21,13 @@ class Settings(BaseSettings):
 
     DB_URL: str = "sqlite:///./data/app.db"
 
+    API_KEY: str = "change-me"
+    # If true, /debug endpoints are disabled unless ENV=dev
+    DISABLE_DEBUG_IN_PROD: bool = True
+    ENV: str = "dev"  # dev | prod | ci
+
+    ENABLE_METRICS: bool = True
+
     # -----------------------
     # Scheduler controls
     # -----------------------
@@ -82,6 +89,8 @@ class Settings(BaseSettings):
 
     REPO_TASK_MAX_TOTAL_CHARS: int = 12_000
     LLM_READ_TIMEOUT_S: float = 660.0
+
+    STATIC_SCAN_MAX_SECONDS: int = 120
 
 
     GITHUB_EXCLUDE_PREFIXES: list[str] = [

@@ -1,252 +1,258 @@
 # backend/app/routes/repo.py
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
-from ..models import RepoFile, RepoFinding, RepoSnapshot
-from ..services.repo_llm_findings import run_llm_scan, tasks_from_findings
-from ..services.repo_taskgen import compute_signal_counts
+from ..models import RepoFile, RepoFinding
+from ..services.code_signals import compute_signal_counts_full
+from ..services.github_sync import sync_repo_to_snapshot
+from ..services.repo_llm_findings import run_llm_repo_scan
+from ..services.repo_taskgen import tasks_from_findings
+from ..services.security import debug_is_allowed, require_api_key
+from ..services.static_analysis import run_static_analysis_all
+from ..services.ops_gaps import run_ops_gap_scan
+from ..services.metrics import JOBS_TOTAL
 
-router = APIRouter(prefix="/debug/repo", tags=["repo"])
-status_router = APIRouter(tags=["repo-ui"])
-
-
-def _snapshot_or_404(db: Session, snapshot_id: int) -> RepoSnapshot:
-    snap = db.get(RepoSnapshot, snapshot_id)
-    if not snap:
-        raise HTTPException(status_code=404, detail=f"snapshot_id={snapshot_id} not found")
-    return snap
+router = APIRouter(prefix="/debug/repo", tags=["repo-debug"])
 
 
-def _get_sync_callable():
+def _guard_debug(request: Request) -> None:
+    if not debug_is_allowed():
+        raise HTTPException(status_code=404, detail="Not found")
+    require_api_key(request)
+
+
+@router.post("/sync")
+def debug_repo_sync(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
     """
-    Prefer sync_repo_snapshot if present (compat wrappers),
-    otherwise fall back to create_repo_snapshot.
-    Both are async in your code.
+    Sync repo content into RepoSnapshot/RepoFile rows.
     """
-    from ..services import github_sync as gs
+    _guard_debug(request)
 
-    if hasattr(gs, "sync_repo_snapshot"):
-        return getattr(gs, "sync_repo_snapshot")
-    if hasattr(gs, "create_repo_snapshot"):
-        return getattr(gs, "create_repo_snapshot")
+    JOBS_TOTAL.labels(job="repo_sync", status="start").inc()
+    try:
+        snapshot = sync_repo_to_snapshot(db=db)
+        JOBS_TOTAL.labels(job="repo_sync", status="ok").inc()
+        return {
+            "snapshot_id": snapshot.id,
+            "repo": snapshot.repo,
+            "branch": snapshot.branch,
+            "commit_sha": snapshot.commit_sha,
+            "file_count": snapshot.file_count,
+            "stored_content_files": snapshot.stored_content_files,
+            "warnings": snapshot.warnings or [],
+        }
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_sync", status="error").inc()
+        raise
 
-    raise HTTPException(
-        status_code=500,
-        detail="github_sync does not export sync_repo_snapshot or create_repo_snapshot.",
-    )
 
-
-@router.post("/sync", response_class=JSONResponse)
-async def repo_sync(
-    repo: str | None = Query(default=None),
-    branch: str | None = Query(default=None),
+@router.post("/scan_llm")
+def debug_repo_scan_llm(
+    request: Request,
+    snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    repo = repo or settings.GITHUB_REPO
-    branch = branch or settings.GITHUB_BRANCH
+    """
+    LLM-driven repo scan -> RepoFinding rows (category based on prompt output).
+    """
+    _guard_debug(request)
 
-    sync_fn = _get_sync_callable()
-    out = await sync_fn(db=db, repo=repo, branch=branch)
+    if not settings.LLM_ENABLED:
+        raise HTTPException(status_code=400, detail="LLM is disabled (LLM_ENABLED=false).")
 
-    if isinstance(out, dict):
+    JOBS_TOTAL.labels(job="repo_scan_llm", status="start").inc()
+    try:
+        inserted, total = run_llm_repo_scan(db=db, snapshot_id=snapshot_id)
+        JOBS_TOTAL.labels(job="repo_scan_llm", status="ok").inc()
+        return {"inserted": inserted, "total_findings": total}
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_scan_llm", status="error").inc()
+        raise
+
+
+@router.post("/scan_static")
+def debug_repo_scan_static(
+    request: Request,
+    snapshot_id: int = Query(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Deterministic static analysis (ruff+mypy+bandit) -> RepoFinding rows.
+    """
+    _guard_debug(request)
+    JOBS_TOTAL.labels(job="repo_scan_static", status="start").inc()
+    try:
+        out = run_static_analysis_all(db=db, snapshot_id=snapshot_id)
+        JOBS_TOTAL.labels(job="repo_scan_static", status="ok").inc()
         return out
-    return getattr(out, "__dict__", {"result": str(out)})
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_scan_static", status="error").inc()
+        raise
 
 
-@router.post("/scan_llm", response_class=JSONResponse)
-async def scan_llm(
-    snapshot_id: int = Query(..., ge=1),
+@router.post("/scan_ops")
+def debug_repo_scan_ops(
+    request: Request,
+    snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
-    return await run_llm_scan(db, snapshot_id=snapshot_id)
+    """
+    Deterministic ops/foot-gun checks -> RepoFinding rows.
+    """
+    _guard_debug(request)
+    JOBS_TOTAL.labels(job="repo_scan_ops", status="start").inc()
+    try:
+        out = run_ops_gap_scan(db=db, snapshot_id=snapshot_id)
+        JOBS_TOTAL.labels(job="repo_scan_ops", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_scan_ops", status="error").inc()
+        raise
 
 
-@router.get("/findings", response_class=JSONResponse)
-def findings(
-    snapshot_id: int = Query(..., ge=1),
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
+@router.get("/findings")
+def debug_repo_findings(
+    request: Request,
+    snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
+) -> list[dict[str, Any]]:
+    """
+    List findings for a snapshot.
+    """
+    _guard_debug(request)
 
     rows = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
-        .order_by(RepoFinding.id.desc())
-        .offset(offset)
-        .limit(limit)
+        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+        .limit(500)
         .all()
     )
-
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r.id,
-                "snapshot_id": r.snapshot_id,
-                "path": r.path,
-                "line": r.line,
-                "category": r.category,
-                "severity": r.severity,
-                "title": r.title,
-                "evidence": r.evidence,
-                "recommendation": r.recommendation,
-                "fingerprint": r.fingerprint,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-        )
-
-    total = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
-    return {"snapshot_id": snapshot_id, "count": int(total), "findings": out}
+    return [
+        {
+            "id": r.id,
+            "snapshot_id": r.snapshot_id,
+            "path": r.path,
+            "line": r.line,
+            "category": r.category,
+            "severity": r.severity,
+            "title": r.title,
+            "evidence": r.evidence,
+            "recommendation": r.recommendation,
+            "fingerprint": r.fingerprint,
+        }
+        for r in rows
+    ]
 
 
-@router.post("/tasks_from_findings", response_class=JSONResponse)
-def make_tasks_from_findings(
-    snapshot_id: int = Query(..., ge=1),
-    project: str = Query(default="haven"),
+@router.post("/tasks_from_findings")
+def debug_repo_tasks_from_findings(
+    request: Request,
+    snapshot_id: int = Query(...),
+    project: str = Query("haven"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
-    return tasks_from_findings(db, snapshot_id=snapshot_id, project=project)
+    """
+    Convert findings -> tasks (your existing LLM-assisted taskgen).
+    """
+    _guard_debug(request)
+    JOBS_TOTAL.labels(job="repo_tasks_from_findings", status="start").inc()
+    try:
+        out = tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project)
+        JOBS_TOTAL.labels(job="repo_tasks_from_findings", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_tasks_from_findings", status="error").inc()
+        raise
 
 
-@router.get("/signal_counts_full", response_class=JSONResponse)
-def signal_counts_full(
-    snapshot_id: int = Query(..., ge=1),
+@router.get("/signal_counts_full")
+def debug_repo_signal_counts_full(
+    request: Request,
+    snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
-    return {"snapshot_id": snapshot_id, "signals": compute_signal_counts(db, snapshot_id)}
+    """
+    Your existing marker signals (TODO/FIXME/etc) + per-file summary.
+    """
+    _guard_debug(request)
+
+    files = db.query(RepoFile).filter(RepoFile.snapshot_id == snapshot_id).all()
+    return compute_signal_counts_full(files)
 
 
-@router.get("/search", response_class=JSONResponse)
-def search_snapshot(
-    snapshot_id: int = Query(..., ge=1),
-    q: str = Query(..., min_length=1, max_length=120),
-    limit: int = Query(default=25, ge=1, le=200),
+@router.get("/signals_summary")
+def debug_repo_signals_summary(
+    request: Request,
+    snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    _snapshot_or_404(db, snapshot_id)
+    """
+    SINGLE merged "Signals Summary" endpoint that combines:
+      - marker counts (TODO/FIXME etc)
+      - findings counts (LLM + static analysis + ops gaps)
+      - risk buckets (security/reliability/quality/observability)
+    """
+    _guard_debug(request)
 
-    needle = q.lower()
-    files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
+    files = db.query(RepoFile).filter(RepoFile.snapshot_id == snapshot_id).all()
+    marker = compute_signal_counts_full(files)
 
-    hits: list[dict[str, Any]] = []
-    for rf in files:
-        if rf.content_kind != "text":
-            continue
+    findings = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).all()
 
-        text = (getattr(rf, "content_text", None) or rf.content or "")
-        if not text:
-            continue
+    by_category: dict[str, int] = defaultdict(int)
+    by_severity: dict[str, int] = defaultdict(int)
 
-        idx = text.lower().find(needle)
-        if idx == -1:
-            continue
+    # “risk buckets” are intentionally higher-level groupings
+    risk_buckets: dict[str, int] = defaultdict(int)
 
-        start = max(0, idx - 140)
-        end = min(len(text), idx + 240)
-        snippet = text[start:end].replace("\r\n", "\n")
+    for f in findings:
+        cat = f.category or "unknown"
+        by_category[cat] += 1
+        by_severity[str(f.severity)] += 1
 
-        hits.append({"path": rf.path, "content_kind": rf.content_kind, "size": rf.size, "snippet": snippet})
-        if len(hits) >= limit:
-            break
+        c = cat.lower()
+        if c.startswith("security/") or "security" in c:
+            risk_buckets["security"] += 1
+        elif "reliability" in c:
+            risk_buckets["reliability"] += 1
+        elif "observability" in c:
+            risk_buckets["observability"] += 1
+        else:
+            risk_buckets["quality"] += 1
 
-    return {"snapshot_id": snapshot_id, "q": q, "hit_count": len(hits), "hits": hits}
-
-
-@status_router.get("/api/repo/status", response_class=JSONResponse)
-def repo_status(db: Session = Depends(get_db)) -> dict[str, Any]:
-    latest = db.scalars(select(RepoSnapshot).order_by(RepoSnapshot.id.desc()).limit(1)).first()
-    if not latest:
-        return {"latest_snapshot": None}
-
-    total_files = db.scalar(select(func.count(RepoFile.id)).where(RepoFile.snapshot_id == latest.id)) or 0
-    stored_text = db.scalar(
-        select(func.count(RepoFile.id))
-        .where(RepoFile.snapshot_id == latest.id)
-        .where(RepoFile.content_kind == "text")
-    ) or 0
+    # Source rollups without schema change (we infer source from category prefix)
+    sources = {
+        "llm": 0,
+        "static": 0,
+        "ops": 0,
+        "other": 0,
+    }
+    for cat, n in by_category.items():
+        c = cat.lower()
+        if c.startswith("quality/ruff") or c.startswith("typing/mypy") or c.startswith("security/bandit"):
+            sources["static"] += n
+        elif c.startswith("ops/"):
+            sources["ops"] += n
+        elif c in ("observability", "security", "typing", "quality") or c.startswith("llm/"):
+            sources["llm"] += n
+        else:
+            sources["other"] += n
 
     return {
-        "latest_snapshot": {
-            "id": latest.id,
-            "repo": latest.repo,
-            "branch": latest.branch,
-            "commit_sha": latest.commit_sha,
-            "file_count": latest.file_count,
-            "stored_content_files": latest.stored_content_files,
-        },
-        "counts": {"total_files": int(total_files), "stored_text_files": int(stored_text)},
+        "snapshot_id": snapshot_id,
+        "marker_signals": marker.get("signals", {}),
+        "marker_total_files": marker.get("total_files", 0),
+        "findings_total": len(findings),
+        "findings_by_category": dict(sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)),
+        "findings_by_severity": dict(sorted(by_severity.items(), key=lambda kv: kv[0], reverse=True)),
+        "sources": sources,
+        "risk_buckets": dict(sorted(risk_buckets.items(), key=lambda kv: kv[1], reverse=True)),
     }
-
-
-@status_router.get("/ui/repo", response_class=HTMLResponse)
-def repo_ui() -> HTMLResponse:
-    html = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Repo Status</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    .card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 14px; max-width: 980px; }
-    pre { background: #fafafa; padding: 12px; border-radius: 12px; overflow:auto; }
-    input, button { padding: 8px 10px; border-radius: 10px; border: 1px solid #ddd; background: white; }
-    button { cursor:pointer; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    .muted { color:#666; font-size:13px; }
-  </style>
-</head>
-<body>
-  <h2>Repo status</h2>
-  <div class="card">
-    <div class="row">
-      <button onclick="loadStatus()">Refresh status</button>
-      <span class="muted">Try: /debug/repo/search?snapshot_id=...&q=TODO</span>
-    </div>
-    <pre id="status">Loading...</pre>
-
-    <h3>Search snapshot content</h3>
-    <div class="row">
-      <input id="snapshotId" placeholder="snapshot_id" />
-      <input id="query" placeholder="TODO / FIXME / rate_limit / etc" />
-      <button onclick="runSearch()">Search</button>
-    </div>
-    <pre id="search"></pre>
-  </div>
-
-<script>
-async function loadStatus() {
-  const r = await fetch('/api/repo/status');
-  const j = await r.json();
-  document.getElementById('status').textContent = JSON.stringify(j, null, 2);
-  if (j.latest_snapshot && j.latest_snapshot.id) {
-    document.getElementById('snapshotId').value = j.latest_snapshot.id;
-  }
-}
-async function runSearch() {
-  const sid = document.getElementById('snapshotId').value;
-  const q = document.getElementById('query').value;
-  const r = await fetch(`/debug/repo/search?snapshot_id=${encodeURIComponent(sid)}&q=${encodeURIComponent(q)}&limit=25`);
-  const j = await r.json();
-  document.getElementById('search').textContent = JSON.stringify(j, null, 2);
-}
-loadStatus();
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html)
