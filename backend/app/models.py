@@ -155,3 +155,30 @@ class RepoFinding(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="findings")
+
+class RepoChunk(Base):
+    """
+    Level 2 RAG:
+    chunks of repo code stored per snapshot, for retrieval.
+    """
+    __tablename__ = "repo_chunks"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "path", "start_line", "end_line", name="uq_chunk_span"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    snapshot_id: Mapped[int] = mapped_column(Integer, ForeignKey("repo_snapshots.id"), index=True, nullable=False)
+
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    start_line: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_line: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    symbols: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="chunks")

@@ -11,6 +11,9 @@ from ..models import Task
 from ..services.planner import generate_daily_plan
 from ..services.notifier import send_webhook, send_email
 from ..services.security import require_api_key, debug_is_allowed
+
+from ..services.repo_rag import chunk_snapshot, search_chunks, load_chunk_text
+
 router = APIRouter(prefix="/debug", tags=["debug"])
 
 
@@ -21,14 +24,12 @@ def _guard_debug(request: Request) -> None:
     - Require X-API-Key for access (at least in prod; configurable in require_api_key)
     """
     if not debug_is_allowed():
-        # 404 is nicer than 403 for hiding sensitive surface area
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Not found")
 
     require_api_key(request)
 
 
-# Apply guard to *all* debug routes
 router.dependencies.append(Depends(_guard_debug))
 
 
@@ -71,7 +72,6 @@ async def send_daily(
     subject = f"Daily Plan — Goal Autopilot ({mode}:{project or 'auto'})"
     await send_webhook(out.content)
 
-    # use project for the UI link in the email; if split, default to onestream
     ui_project = (project or "onestream") if mode != "split" else "onestream"
     send_email(subject, out.content, project=ui_project)
 
@@ -126,11 +126,6 @@ def seed_notes(payload: SeedNotesPayload, db: Session = Depends(get_db)):
 
 @router.post("/tasks/cleanup_microtasks")
 def cleanup_microtasks(db: Session = Depends(get_db)):
-    """
-    Deletes bad historical junk:
-    microtasks whose parent is ALSO a microtask.
-    This prevents infinite “MICRO of MICRO” clutter when old data exists.
-    """
     tasks = list(db.scalars(select(Task)).all())
     by_id = {t.id: t for t in tasks}
 
@@ -151,3 +146,41 @@ def cleanup_microtasks(db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True, "deleted": deleted}
 
+
+# -----------------------------
+# Level 2 RAG (Chunking + Retrieval)
+# -----------------------------
+
+@router.post("/repo/chunks/build")
+def build_repo_chunks(
+    snapshot_id: int = Query(..., ge=1),
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Build repo chunks for a snapshot.
+    If force=true, it rebuilds from scratch.
+    """
+    return chunk_snapshot(db, snapshot_id, force=force)
+
+
+@router.get("/repo/chunks/search")
+def rag_search(
+    snapshot_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=2),
+    top_k: int = Query(16, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    return {"snapshot_id": snapshot_id, "query": q, "hits": search_chunks(db, snapshot_id, q, top_k=top_k)}
+
+
+@router.get("/repo/chunks/get")
+def rag_get_chunk(
+    snapshot_id: int = Query(..., ge=1),
+    path: str = Query(..., min_length=1),
+    start_line: int = Query(..., ge=1),
+    end_line: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+):
+    txt = load_chunk_text(db, snapshot_id, path, start_line, end_line)
+    return {"snapshot_id": snapshot_id, "path": path, "start_line": start_line, "end_line": end_line, "chunk_text": txt}

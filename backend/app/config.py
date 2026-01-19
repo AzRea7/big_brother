@@ -92,6 +92,19 @@ class Settings(BaseSettings):
 
     STATIC_SCAN_MAX_SECONDS: int = 120
 
+    # -----------------------
+    # Level 2 RAG (chunking + retrieval)
+    # -----------------------
+    REPO_CHUNK_LINES: int = 120
+    REPO_CHUNK_OVERLAP: int = 25
+    REPO_CHUNK_MAX_CHARS: int = 9_000
+
+    REPO_RAG_TOP_K: int = 16
+
+    # Optional comma-separated “query seed” phrases to bias retrieval.
+    # Example: "auth,db session,fastapi router,github sync,repo pipeline"
+    REPO_RAG_QUERY_SEEDS: str = ""
+
 
     GITHUB_EXCLUDE_PREFIXES: list[str] = [
             # OneHaven-specific

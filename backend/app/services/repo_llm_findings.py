@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session
 from ..ai.llm import chat_completion_json
 from ..ai.prompts import REPO_FINDINGS_SYSTEM, repo_findings_user
 from ..config import settings
-from ..models import RepoFile, RepoFinding, Task
+from ..models import RepoChunk, RepoFile, RepoFinding, Task
+from .repo_rag import search_chunks, load_chunk_text
 
 
 _SEVERITY_MAP = {
@@ -37,16 +38,8 @@ def _fingerprint(f: dict[str, Any]) -> str:
 
 
 def _coerce_severity(x: Any) -> int:
-    """
-    Normalize severity into int 1..5.
-    Accepts:
-      - int/float
-      - numeric strings: "4"
-      - words: low/med/high/critical
-    """
     if x is None:
         return 3
-
     if isinstance(x, (int, float)):
         v = int(x)
         return max(1, min(5, v))
@@ -54,10 +47,8 @@ def _coerce_severity(x: Any) -> int:
     s = str(x).strip().lower()
     if not s:
         return 3
-
     if s in _SEVERITY_MAP:
         return _SEVERITY_MAP[s]
-
     try:
         v = int(float(s))
         return max(1, min(5, v))
@@ -65,48 +56,7 @@ def _coerce_severity(x: Any) -> int:
         return 3
 
 
-def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
-    """
-    Prefer files that have content and are larger (often more "core" code).
-    Hard cap to keep prompt bounded.
-    """
-    q = (
-        db.query(RepoFile)
-        .filter(RepoFile.snapshot_id == snapshot_id)
-        .filter(RepoFile.content_text.isnot(None))
-        .order_by(RepoFile.size.desc())
-    )
-    files = q.limit(settings.REPO_TASK_MAX_FILES * 3).all()
-    return files[: settings.REPO_TASK_MAX_FILES]
-
-
-def _build_prompt_context(files: list[RepoFile]) -> str:
-    chunks: list[str] = []
-    total = 0
-
-    for rf in files:
-        text = rf.content_text or ""
-        excerpt = text[: settings.REPO_TASK_EXCERPT_CHARS]
-
-        block = f"\n--- FILE: {rf.path}\n{excerpt}\n"
-        if total + len(block) > settings.REPO_TASK_MAX_TOTAL_CHARS:
-            break
-
-        chunks.append(block)
-        total += len(block)
-
-    return "".join(chunks)
-
-
 def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
-    """
-    Drop un-actionable garbage:
-      - missing title
-      - missing file_path/path (your model sometimes emits null file_path)
-    Normalize:
-      - severity -> int 1..5
-      - line_start/line -> int|None
-    """
     if not isinstance(f, dict):
         return None
 
@@ -141,13 +91,85 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _build_prompt_context_from_rag(db: Session, snapshot_id: int) -> str | None:
+    """
+    Best-effort RAG context:
+    - If chunks exist, retrieve top-k chunks using a standards-biased query.
+    """
+    chunk_count = db.query(RepoChunk).filter(RepoChunk.snapshot_id == snapshot_id).count()
+    if chunk_count <= 0:
+        return None
+
+    # This query is intentionally “broad standards” so we surface real issues:
+    base_query = (
+        "fastapi router auth api key debug endpoint sql session db engine "
+        "httpx timeout retry logging error handling metrics scheduler github sync repo pipeline"
+    )
+
+    hits = search_chunks(db, snapshot_id, base_query, top_k=settings.REPO_RAG_TOP_K)
+    if not hits:
+        return None
+
+    blocks: list[str] = []
+    total_chars = 0
+
+    for h in hits:
+        full = load_chunk_text(db, snapshot_id, h["path"], h["start_line"], h["end_line"])
+        if not full:
+            continue
+
+        header = f"\n--- CHUNK: {h['path']} L{h['start_line']}-L{h['end_line']}\n"
+        body = full
+        block = header + body + "\n"
+
+        if total_chars + len(block) > settings.REPO_TASK_MAX_TOTAL_CHARS:
+            break
+
+        blocks.append(block)
+        total_chars += len(block)
+
+    return "".join(blocks) if blocks else None
+
+
+def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
+    q = (
+        db.query(RepoFile)
+        .filter(RepoFile.snapshot_id == snapshot_id)
+        .filter(RepoFile.content_text.isnot(None))
+        .order_by(RepoFile.size.desc())
+    )
+    files = q.limit(settings.REPO_TASK_MAX_FILES * 3).all()
+    return files[: settings.REPO_TASK_MAX_FILES]
+
+
+def _build_prompt_context_from_files(files: list[RepoFile]) -> str:
+    chunks: list[str] = []
+    total = 0
+
+    for rf in files:
+        text = rf.content_text or ""
+        excerpt = text[: settings.REPO_TASK_EXCERPT_CHARS]
+
+        block = f"\n--- FILE: {rf.path}\n{excerpt}\n"
+        if total + len(block) > settings.REPO_TASK_MAX_TOTAL_CHARS:
+            break
+
+        chunks.append(block)
+        total += len(block)
+
+    return "".join(chunks)
+
+
 async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, int]:
     """
     Core worker: calls LLM and inserts RepoFinding rows.
     Returns {inserted, total_findings}.
     """
-    files = _pick_top_files(db, snapshot_id)
-    context = _build_prompt_context(files)
+    # Prefer RAG context if chunks exist
+    context = _build_prompt_context_from_rag(db, snapshot_id)
+    if not context:
+        files = _pick_top_files(db, snapshot_id)
+        context = _build_prompt_context_from_files(files)
 
     resp = await chat_completion_json(
         system=REPO_FINDINGS_SYSTEM,
@@ -194,6 +216,7 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
             title=f["title"],
             evidence=f["evidence"],
             recommendation=f["recommendation"],
+            acceptance=f["acceptance"],
             fingerprint=fp,
             created_at=datetime.utcnow(),
         )
@@ -246,10 +269,6 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
 
 
 def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
-    """
-    Convert RepoFinding rows into real Task rows.
-    Deterministic; doesn't need an LLM.
-    """
     findings = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
@@ -257,7 +276,6 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
         .all()
     )
 
-    # Sort safely even if legacy rows have severity="4"
     findings.sort(key=lambda r: _coerce_severity(getattr(r, "severity", None)), reverse=True)
 
     created = 0
