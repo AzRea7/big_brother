@@ -12,7 +12,20 @@ from ..db import get_db
 from ..models import RepoFile, RepoFinding
 from ..services.code_signals import compute_signal_counts_full
 from ..services.github_sync import sync_repo_to_snapshot
-from ..services.repo_llm_findings import run_llm_repo_scan
+
+# NOTE:
+# Your repo_llm_findings file currently exposes async run_llm_scan(db, snapshot_id)
+# but your routes import run_llm_repo_scan. We'll support both:
+try:
+    from ..services.repo_llm_findings import run_llm_repo_scan  # type: ignore
+except Exception:  # pragma: no cover
+    run_llm_repo_scan = None  # type: ignore
+
+try:
+    from ..services.repo_llm_findings import run_llm_scan  # type: ignore
+except Exception:  # pragma: no cover
+    run_llm_scan = None  # type: ignore
+
 from ..services.repo_taskgen import tasks_from_findings
 from ..services.security import debug_is_allowed, require_api_key
 from ..services.static_analysis import run_static_analysis_all
@@ -29,32 +42,33 @@ def _guard_debug(request: Request) -> None:
 
 
 @router.post("/sync")
-def debug_repo_sync(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+def debug_repo_sync(
+    request: Request,
+    repo: str = Query("AzRea7/OneHaven"),
+    branch: str = Query("main"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """
     Sync repo content into RepoSnapshot/RepoFile rows.
+
+    IMPORTANT: github_sync.sync_repo_to_snapshot returns a dict DTO:
+      {snapshot_id, repo, branch, commit_sha, file_count, stored_content_files, warnings}
+    So we return that directly (no .id access).
     """
     _guard_debug(request)
 
     JOBS_TOTAL.labels(job="repo_sync", status="start").inc()
     try:
-        snapshot = sync_repo_to_snapshot(db=db)
+        result = sync_repo_to_snapshot(db=db, repo=repo, branch=branch)
         JOBS_TOTAL.labels(job="repo_sync", status="ok").inc()
-        return {
-            "snapshot_id": snapshot.id,
-            "repo": snapshot.repo,
-            "branch": snapshot.branch,
-            "commit_sha": snapshot.commit_sha,
-            "file_count": snapshot.file_count,
-            "stored_content_files": snapshot.stored_content_files,
-            "warnings": snapshot.warnings or [],
-        }
+        return result
     except Exception:
         JOBS_TOTAL.labels(job="repo_sync", status="error").inc()
         raise
 
 
 @router.post("/scan_llm")
-def debug_repo_scan_llm(
+async def debug_repo_scan_llm(
     request: Request,
     snapshot_id: int = Query(...),
     db: Session = Depends(get_db),
@@ -69,7 +83,17 @@ def debug_repo_scan_llm(
 
     JOBS_TOTAL.labels(job="repo_scan_llm", status="start").inc()
     try:
-        inserted, total = run_llm_repo_scan(db=db, snapshot_id=snapshot_id)
+        # Prefer the newer async API if present
+        if run_llm_scan is not None:
+            out = await run_llm_scan(db=db, snapshot_id=snapshot_id)
+            inserted = int(out.get("inserted", 0))
+            total = int(out.get("total_findings", 0))
+        elif run_llm_repo_scan is not None:
+            # Older sync API style
+            inserted, total = run_llm_repo_scan(db=db, snapshot_id=snapshot_id)  # type: ignore[misc]
+        else:
+            raise HTTPException(status_code=500, detail="LLM scan function not available.")
+
         JOBS_TOTAL.labels(job="repo_scan_llm", status="ok").inc()
         return {"inserted": inserted, "total_findings": total}
     except Exception:
@@ -160,7 +184,7 @@ def debug_repo_tasks_from_findings(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    Convert findings -> tasks (your existing LLM-assisted taskgen).
+    Convert findings -> tasks.
     """
     _guard_debug(request)
     JOBS_TOTAL.labels(job="repo_tasks_from_findings", status="start").inc()
@@ -195,10 +219,7 @@ def debug_repo_signals_summary(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    SINGLE merged "Signals Summary" endpoint that combines:
-      - marker counts (TODO/FIXME etc)
-      - findings counts (LLM + static analysis + ops gaps)
-      - risk buckets (security/reliability/quality/observability)
+    SINGLE merged "Signals Summary" endpoint.
     """
     _guard_debug(request)
 
@@ -210,7 +231,6 @@ def debug_repo_signals_summary(
     by_category: dict[str, int] = defaultdict(int)
     by_severity: dict[str, int] = defaultdict(int)
 
-    # “risk buckets” are intentionally higher-level groupings
     risk_buckets: dict[str, int] = defaultdict(int)
 
     for f in findings:
@@ -228,13 +248,7 @@ def debug_repo_signals_summary(
         else:
             risk_buckets["quality"] += 1
 
-    # Source rollups without schema change (we infer source from category prefix)
-    sources = {
-        "llm": 0,
-        "static": 0,
-        "ops": 0,
-        "other": 0,
-    }
+    sources = {"llm": 0, "static": 0, "ops": 0, "other": 0}
     for cat, n in by_category.items():
         c = cat.lower()
         if c.startswith("quality/ruff") or c.startswith("typing/mypy") or c.startswith("security/bandit"):

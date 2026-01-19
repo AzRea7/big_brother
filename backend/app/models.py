@@ -65,7 +65,7 @@ class Task(Base):
 
     parent_task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    goal: Mapped[Goal | None] = relationship("Goal", back_populates="tasks")
+    goal: Mapped["Goal | None"] = relationship("Goal", back_populates="tasks")
 
 
 class TaskDependency(Base):
@@ -193,7 +193,9 @@ class RepoChunk(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    snapshot_id: Mapped[int] = mapped_column(Integer, ForeignKey("repo_snapshots.id"), index=True, nullable=False)
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("repo_snapshots.id"), index=True, nullable=False
+    )
 
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     start_line: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -204,4 +206,5 @@ class RepoChunk(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
+    # IMPORTANT: no trailing comma; must be a relationship, not a tuple
     snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="chunks")
