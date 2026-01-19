@@ -8,8 +8,10 @@ services:
     - GITHUB_TOKEN=${GITHUB_TOKEN}
     - GITHUB_REPO=AzRea7/OneHaven
     - GITHUB_BRANCH=main
+    - REPO_LOCAL_PATH=/repos/OneHaven
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ../OneHaven:/repos/OneHaven:ro
     restart: unless-stopped

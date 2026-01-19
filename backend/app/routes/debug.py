@@ -1,7 +1,7 @@
 # backend/app/routes/debug.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -10,18 +10,55 @@ from ..db import get_db
 from ..models import Task
 from ..services.planner import generate_daily_plan
 from ..services.notifier import send_webhook, send_email
-
+from ..services.security import require_api_key, debug_is_allowed
 router = APIRouter(prefix="/debug", tags=["debug"])
 
 
+def _guard_debug(request: Request) -> None:
+    """
+    Enforce production safety:
+    - Optionally disable debug endpoints entirely in prod
+    - Require X-API-Key for access (at least in prod; configurable in require_api_key)
+    """
+    if not debug_is_allowed():
+        # 404 is nicer than 403 for hiding sensitive surface area
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Not found")
+
+    require_api_key(request)
+
+
+# Apply guard to *all* debug routes
+router.dependencies.append(Depends(_guard_debug))
+
+
+class DailyPlanRequest(BaseModel):
+    project: str | None = None
+    mode: str | None = None
+
+
 @router.post("/run/daily")
-async def run_daily(
-    project: str | None = Query(default=None),
-    mode: str = Query(default="single"),
-    db: Session = Depends(get_db),
-):
-    out = await generate_daily_plan(db=db, focus_project=project, mode=mode)
-    return {"generated_at": out.generated_at.isoformat(), "content": out.content}
+async def run_daily_plan(payload: DailyPlanRequest, db: Session = Depends(get_db)) -> dict:
+    mode = (payload.mode or "single").strip().lower()
+    project = (payload.project or "onestream").strip().lower()
+
+    plan = await generate_daily_plan(
+        db=db,
+        focus_project=(project if mode != "split" else None),
+        mode=mode,
+    )
+
+    msg = plan.content
+    await send_webhook(msg)
+    send_email(f"Daily Plan — Goal Autopilot ({project})", msg, project=project)
+    return {"ok": True, "project": project, "mode": mode}
+
+
+@router.get("/tasks/recent")
+def recent_tasks(limit: int = Query(20, ge=1, le=200), db: Session = Depends(get_db)) -> dict:
+    q = select(Task).order_by(Task.id.desc()).limit(limit)
+    rows = db.execute(q).scalars().all()
+    return {"count": len(rows), "tasks": [t.to_dict() for t in rows]}
 
 
 @router.post("/send/daily")
@@ -113,3 +150,4 @@ def cleanup_microtasks(db: Session = Depends(get_db)):
 
     db.commit()
     return {"ok": True, "deleted": deleted}
+
