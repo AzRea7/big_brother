@@ -552,3 +552,23 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
 
     db.commit()
     return created, skipped
+
+
+# -------------------------
+# NEW: Compatibility entrypoint expected by routes/repo.py
+# -------------------------
+
+def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
+    """
+    routes/repo.py imports:
+        from ..services.repo_taskgen import tasks_from_findings
+
+    But the actual canonical implementation (deterministic conversion of RepoFinding -> Task)
+    lives in services/repo_llm_findings.py.
+
+    We keep this wrapper so refactors don't break imports again.
+    """
+    # Import inside function to avoid circular imports during app startup.
+    from .repo_llm_findings import tasks_from_findings as _impl  # type: ignore
+
+    return _impl(db=db, snapshot_id=snapshot_id, project=project)

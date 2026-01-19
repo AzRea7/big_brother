@@ -2,249 +2,289 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
+import re
+import time
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RepoFile, RepoSnapshot
 
 
-@dataclass
-class RepoSyncResult:
-    snapshot_id: int
-    repo: str
-    branch: str
-    commit_sha: str | None
-    file_count: int
-    stored_content_files: int
-    warnings: list[str]
+_TEXT_EXT_ALLOW = {
+    ".py",
+    ".md",
+    ".txt",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".env",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".dockerfile",
+    ".sql",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".html",
+    ".css",
+    ".scss",
+    ".csv",
+    ".xml",
+}
 
 
-def _norm_path(p: str) -> str:
-    return p.replace("\\", "/")
+def _now() -> float:
+    return time.time()
 
 
-def _has_excluded_dir(path: str) -> bool:
-    parts = [x for x in _norm_path(path).split("/") if x]
-    return any(part in settings.GITHUB_EXCLUDE_DIR_NAMES for part in parts)
+def _norm_ext(path: str) -> str:
+    base = path.lower()
+    _, ext = os.path.splitext(base)
+    return ext
 
 
-def _is_excluded_path(path: str) -> bool:
-    p = _norm_path(path)
-
-    # prefix exclusions
-    for pref in settings.GITHUB_EXCLUDE_PREFIXES:
-        if p.startswith(_norm_path(pref)):
-            return True
-
-    # dir-name exclusions
-    if _has_excluded_dir(p):
-        return True
-
-    # extension exclusions
-    ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
-    if ext and ext in set(settings.GITHUB_EXCLUDE_EXTENSIONS):
-        return True
-
-    return False
-
-
-def _is_included_path(path: str) -> bool:
-    # No allowlist. Everything is included unless excluded.
-    return True
-
-
-def _looks_like_text(path: str, raw: bytes) -> bool:
+def _looks_like_text(path: str, b: bytes) -> bool:
     """
-    Cheap heuristic: reject null bytes + reject known binary extensions (already filtered)
+    Conservative text detector:
+    - allowlist extensions (fast)
+    - else: reject if NUL bytes present
+    - else: treat as text if decodes as utf-8 reasonably
     """
-    if b"\x00" in raw:
+    ext = _norm_ext(path)
+    if ext in _TEXT_EXT_ALLOW:
+        return True
+    if b"\x00" in b:
         return False
-    return True
+    try:
+        b.decode("utf-8")
+        return True
+    except Exception:
+        return False
 
 
-def _make_timeout() -> httpx.Timeout:
+def _should_exclude_path(path: str) -> tuple[bool, str | None]:
+    p = path.replace("\\", "/")
+
+    # prefixes
+    for pref in getattr(settings, "GITHUB_EXCLUDE_PREFIXES", []) or []:
+        if p.startswith(pref):
+            return True, f"excluded_prefix:{pref}"
+
+    # dir names
+    parts = p.split("/")
+    for dn in getattr(settings, "GITHUB_EXCLUDE_DIR_NAMES", []) or []:
+        if dn in parts:
+            return True, f"excluded_dir:{dn}"
+
+    # extensions
+    ext = _norm_ext(p)
+    exts = getattr(settings, "GITHUB_EXCLUDE_EXTENSIONS", []) or []
+    if ext:
+        ext_no_dot = ext[1:] if ext.startswith(".") else ext
+        if ext_no_dot in exts:
+            return True, f"excluded_ext:{ext_no_dot}"
+
+    return False, None
+
+
+def _safe_read_file_bytes(path: str, max_bytes: int) -> tuple[bytes | None, str | None]:
+    try:
+        st = os.stat(path)
+        if st.st_size > max_bytes:
+            return None, f"over_max_bytes:{st.st_size}"
+    except Exception as e:
+        return None, f"stat_failed:{e!r}"
+
+    try:
+        with open(path, "rb") as f:
+            b = f.read(max_bytes + 1)
+        if len(b) > max_bytes:
+            return None, f"over_max_bytes:{len(b)}"
+        return b, None
+    except Exception as e:
+        return None, f"read_failed:{e!r}"
+
+
+def _iter_local_files(root: str) -> Iterable[tuple[str, str]]:
     """
-    Fixes: ValueError: Timeout must either include a default, or set all four parameters explicitly.
+    Yield (relative_path, abs_path) for files under root.
     """
-    return httpx.Timeout(
-        settings.GITHUB_READ_TIMEOUT_S,
-        connect=settings.GITHUB_CONNECT_TIMEOUT_S,
-    )
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        # cheap pruning
+        rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
+        if rel_dir == ".":
+            rel_dir = ""
 
-
-async def _github_get_json(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> Any:
-    r = await client.get(url, headers=headers, timeout=_make_timeout())
-    r.raise_for_status()
-    return r.json()
-
-
-async def _github_get_bytes(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> bytes:
-    r = await client.get(url, headers=headers, timeout=_make_timeout())
-    r.raise_for_status()
-    return r.content
-
-
-async def _get_commit_sha(repo: str, branch: str) -> str | None:
-    token = settings.GITHUB_TOKEN
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "goal-autopilot",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    url = f"https://api.github.com/repos/{repo}/commits/{branch}"
-    async with httpx.AsyncClient() as client:
-        try:
-            j = await _github_get_json(client, url, headers)
-            return j.get("sha")
-        except Exception:
-            return None
-
-
-def latest_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> RepoSnapshot | None:
-    q = select(RepoSnapshot).order_by(RepoSnapshot.id.desc())
-    if repo:
-        q = q.where(RepoSnapshot.repo == repo)
-    if branch:
-        q = q.where(RepoSnapshot.branch == branch)
-    return db.execute(q).scalars().first()
-
-
-def snapshot_file_stats(db: Session, snapshot_id: int) -> dict[str, Any]:
-    rows = db.execute(
-        select(RepoFile.path, RepoFile.skipped, RepoFile.is_text).where(RepoFile.snapshot_id == snapshot_id)
-    ).all()
-
-    total = len(rows)
-    skipped = sum(1 for _, s, _ in rows if s)
-    text_files = sum(1 for _, s, t in rows if (not s) and t)
-    binary_files = sum(1 for _, s, t in rows if (not s) and (not t))
-
-    folder_counts: dict[str, int] = {}
-    for (p, _, _) in rows:
-        p = _norm_path(p)
-        top = p.split("/", 1)[0] if "/" in p else p
-        folder_counts[top] = folder_counts.get(top, 0) + 1
-
-    top_folders = [{"folder": k, "count": v} for k, v in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]]
-    return {
-        "total_files": total,
-        "text_files": text_files,
-        "binary_files": binary_files,
-        "skipped_files": skipped,
-        "top_folders": top_folders,
-    }
-
-
-async def _scan_local_repo(base_path: str) -> list[dict[str, Any]]:
-    """
-    Returns: [{path, abs_path, size}]
-    Applies include/exclude filters.
-    """
-    base_path = os.path.abspath(base_path)
-    out: list[dict[str, Any]] = []
-
-    for root, dirs, files in os.walk(base_path):
-        dirs[:] = [d for d in dirs if d not in settings.GITHUB_EXCLUDE_DIR_NAMES]
-
-        for fn in files:
-            abs_path = os.path.join(root, fn)
-            rel_path = _norm_path(os.path.relpath(abs_path, base_path))
-
-            if not _is_included_path(rel_path):
-                continue
-            if _is_excluded_path(rel_path):
-                continue
-
+        # remove excluded dirs early
+        pruned = []
+        for d in list(dirnames):
+            rel_candidate = f"{rel_dir}/{d}" if rel_dir else d
+            excluded, _ = _should_exclude_path(rel_candidate + "/")
+            if excluded:
+                pruned.append(d)
+        for d in pruned:
             try:
-                st = os.stat(abs_path)
-            except FileNotFoundError:
-                continue
+                dirnames.remove(d)
+            except ValueError:
+                pass
 
-            out.append({"path": rel_path, "abs_path": abs_path, "size": int(st.st_size)})
+        for fn in filenames:
+            rel = f"{rel_dir}/{fn}" if rel_dir else fn
+            rel = rel.replace("\\", "/")
+            abs_path = os.path.join(dirpath, fn)
+            yield rel, abs_path
 
-            if len(out) >= settings.GITHUB_MAX_FILES_PER_SYNC:
-                return out
 
-    return out
-
-
-async def _list_github_repo_paths(repo: str, branch: str) -> list[dict[str, Any]]:
-    """
-    Uses GitHub Contents API (recursive BFS) to gather file paths.
-    Applies include/exclude filters.
-    """
-    token = settings.GITHUB_TOKEN
-    headers = {
+def _github_headers() -> dict[str, str]:
+    h = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "goal-autopilot",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    queue: list[str] = [""]
-    files_out: list[dict[str, Any]] = []
-
-    async with httpx.AsyncClient() as client:
-        while queue:
-            path = queue.pop(0)
-            url = (
-                f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
-                if path
-                else f"https://api.github.com/repos/{repo}/contents?ref={branch}"
-            )
-            data = await _github_get_json(client, url, headers)
-            if isinstance(data, dict):
-                data = [data]
-
-            for item in data:
-                itype = item.get("type")
-                ipath = _norm_path(item.get("path", ""))
-
-                if not ipath:
-                    continue
-                if not _is_included_path(ipath):
-                    continue
-                if _is_excluded_path(ipath):
-                    continue
-
-                if itype == "dir":
-                    queue.append(ipath)
-                elif itype == "file":
-                    files_out.append(
-                        {
-                            "path": ipath,
-                            "sha": item.get("sha"),
-                            "size": item.get("size"),
-                            "download_url": item.get("download_url"),
-                            "url": item.get("url"),
-                        }
-                    )
-                    if len(files_out) >= settings.GITHUB_MAX_FILES_PER_SYNC:
-                        return files_out
-
-    return files_out
+    tok = getattr(settings, "GITHUB_TOKEN", None) or None
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
 
 
-async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> RepoSyncResult:
+def _github_api_base(repo: str) -> str:
+    # repo is like "AzRea7/OneHaven"
+    return f"https://api.github.com/repos/{repo}"
+
+
+def _parse_repo(repo: str | None) -> str:
+    r = (repo or getattr(settings, "GITHUB_REPO", "") or "").strip()
+    if not r:
+        raise ValueError("repo is required")
+    return r
+
+
+def _parse_branch(branch: str | None) -> str:
+    b = (branch or getattr(settings, "GITHUB_BRANCH", "") or "main").strip()
+    return b or "main"
+
+
+def _get_commit_sha_via_github(repo: str, branch: str) -> str | None:
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(
+                connect=float(getattr(settings, "GITHUB_CONNECT_TIMEOUT_S", 10.0)),
+                read=float(getattr(settings, "GITHUB_READ_TIMEOUT_S", 60.0)),
+            ),
+            headers=_github_headers(),
+        ) as client:
+            r = client.get(f"{_github_api_base(repo)}/commits/{branch}")
+            if r.status_code >= 400:
+                return None
+            js = r.json()
+            return js.get("sha")
+    except Exception:
+        return None
+
+
+def _github_list_tree(repo: str, branch: str) -> list[dict[str, Any]]:
     """
-    REAL implementation (kept). The router should call sync_repo_snapshot() below,
-    which forwards here.
+    Uses the git tree API to list all files.
     """
-    repo = repo or settings.GITHUB_REPO
-    branch = branch or settings.GITHUB_BRANCH
+    sha = _get_commit_sha_via_github(repo, branch)
+    if not sha:
+        return []
+    with httpx.Client(
+        timeout=httpx.Timeout(
+            connect=float(getattr(settings, "GITHUB_CONNECT_TIMEOUT_S", 10.0)),
+            read=float(getattr(settings, "GITHUB_READ_TIMEOUT_S", 60.0)),
+        ),
+        headers=_github_headers(),
+    ) as client:
+        # recursive tree
+        url = f"{_github_api_base(repo)}/git/trees/{sha}?recursive=1"
+        r = client.get(url)
+        r.raise_for_status()
+        js = r.json()
+        tree = js.get("tree") or []
+        # keep only blobs
+        blobs = [t for t in tree if t.get("type") == "blob" and t.get("path")]
+        return blobs
+
+
+def _github_get_file_contents(repo: str, path: str, ref: str) -> tuple[bytes | None, str | None, int | None]:
+    """
+    Fetch file content via contents API (base64). Returns (bytes, sha, size).
+    """
+    url = f"{_github_api_base(repo)}/contents/{path}"
+    params = {"ref": ref}
+
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(
+                connect=float(getattr(settings, "GITHUB_CONNECT_TIMEOUT_S", 10.0)),
+                read=float(getattr(settings, "GITHUB_READ_TIMEOUT_S", 60.0)),
+            ),
+            headers=_github_headers(),
+        ) as client:
+            r = client.get(url, params=params)
+            if r.status_code >= 400:
+                return None, None, None
+            js = r.json()
+            # If it's a directory, js will be a list
+            if isinstance(js, list):
+                return None, None, None
+            content_b64 = js.get("content")
+            if not content_b64:
+                return None, js.get("sha"), js.get("size")
+            # GitHub inserts newlines in base64 content
+            raw = base64.b64decode(content_b64.encode("utf-8"))
+            return raw, js.get("sha"), js.get("size")
+    except Exception:
+        return None, None, None
+
+
+# --------------------------------------------------------------------
+# PUBLIC ENTRYPOINT expected by routes/repo.py
+# --------------------------------------------------------------------
+
+def sync_repo_to_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
+    """
+    Creates a RepoSnapshot and populates RepoFile rows.
+
+    Prefers local disk scan if settings.REPO_LOCAL_PATH is set (docker mount).
+    Falls back to GitHub API if not.
+
+    Returns:
+      {
+        "snapshot_id": int,
+        "repo": str,
+        "branch": str,
+        "commit_sha": str|None,
+        "file_count": int,
+        "stored_content_files": int,
+        "warnings": list[str]
+      }
+    """
+    repo = _parse_repo(repo)
+    branch = _parse_branch(branch)
 
     warnings: list[str] = []
-    commit_sha = settings.REPO_LOCAL_GIT_SHA or await _get_commit_sha(repo, branch)
+    max_bytes = int(getattr(settings, "GITHUB_MAX_FILE_BYTES", 150_000) or 150_000)
+    max_files = int(getattr(settings, "GITHUB_MAX_FILES_PER_SYNC", 5000) or 5000)
+
+    # create snapshot row first
+    commit_sha: str | None = None
+    if getattr(settings, "REPO_LOCAL_PATH", None):
+        # Optional: user may provide a local git sha manually via env
+        commit_sha = getattr(settings, "REPO_LOCAL_GIT_SHA", None) or None
+    else:
+        commit_sha = _get_commit_sha_via_github(repo, branch)
 
     snap = RepoSnapshot(
         repo=repo,
@@ -252,8 +292,7 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
         commit_sha=commit_sha,
         file_count=0,
         stored_content_files=0,
-        warnings_json=(json.dumps(warnings) if warnings else None),
-        created_at=datetime.utcnow(),
+        warnings_json=None,
     )
     db.add(snap)
     db.commit()
@@ -262,177 +301,202 @@ async def create_repo_snapshot(db: Session, repo: str | None = None, branch: str
     stored = 0
     total = 0
 
-    # Prefer local scan if configured
-    if settings.REPO_LOCAL_PATH:
-        items = await _scan_local_repo(settings.REPO_LOCAL_PATH)
-        total = len(items)
+    # -------------------------
+    # Local scan (preferred)
+    # -------------------------
+    local_root = getattr(settings, "REPO_LOCAL_PATH", None) or None
+    if local_root:
+        root = local_root
+        if not os.path.exists(root):
+            warnings.append(f"REPO_LOCAL_PATH does not exist: {root}")
+        else:
+            for rel, abs_path in _iter_local_files(root):
+                if total >= max_files:
+                    warnings.append(f"hit_max_files:{max_files}")
+                    break
 
-        for it in items:
-            path = it["path"]
-            size = int(it["size"])
+                excluded, reason = _should_exclude_path(rel)
+                if excluded:
+                    db.add(
+                        RepoFile(
+                            snapshot_id=snap.id,
+                            path=rel,
+                            sha=None,
+                            size=None,
+                            is_text=True,
+                            skipped=True,
+                            skip_reason=reason,
+                            content=None,
+                            content_kind="skipped",
+                            content_text=None,
+                        )
+                    )
+                    total += 1
+                    continue
 
-            rf = RepoFile(
-                snapshot_id=snap.id,
-                path=path,
-                sha=None,
-                size=size,
-                is_text=True,
-                skipped=False,
-                content_kind="skipped",
-                content=None,
-                content_text=None,
-                created_at=datetime.utcnow(),
-                skip_reason=None,
-            )
+                b, err = _safe_read_file_bytes(abs_path, max_bytes=max_bytes)
+                if b is None:
+                    db.add(
+                        RepoFile(
+                            snapshot_id=snap.id,
+                            path=rel,
+                            sha=None,
+                            size=None,
+                            is_text=True,
+                            skipped=True,
+                            skip_reason=err or "read_failed",
+                            content=None,
+                            content_kind="skipped",
+                            content_text=None,
+                        )
+                    )
+                    total += 1
+                    continue
 
-            if size <= settings.GITHUB_MAX_FILE_BYTES:
-                try:
-                    with open(it["abs_path"], "rb") as f:
-                        raw = f.read()
-                    if _looks_like_text(path, raw):
-                        text = raw.decode("utf-8", errors="replace")
-                        rf.content_kind = "text"
-                        rf.content_text = text
-                        rf.content = text
-                        stored += 1
-                    else:
-                        rf.is_text = False
-                        rf.skipped = True
-                        rf.content_kind = "binary"
-                        rf.skip_reason = "binary"
-                except Exception as e:
-                    rf.skipped = True
-                    rf.content_kind = "skipped"
-                    rf.skip_reason = f"read_error:{type(e).__name__}"
-            else:
-                rf.skipped = True
-                rf.content_kind = "skipped"
-                rf.skip_reason = "too_large"
+                is_text = _looks_like_text(rel, b)
+                content_text = None
+                kind = "binary"
+                if is_text:
+                    try:
+                        content_text = b.decode("utf-8", errors="replace")
+                        kind = "text"
+                    except Exception:
+                        content_text = None
+                        kind = "binary"
 
-            db.add(rf)
+                db.add(
+                    RepoFile(
+                        snapshot_id=snap.id,
+                        path=rel,
+                        sha=None,
+                        size=len(b),
+                        is_text=bool(is_text),
+                        skipped=False,
+                        skip_reason=None,
+                        content=None,  # legacy field, keep None
+                        content_kind=kind if is_text else "binary",
+                        content_text=content_text if is_text else None,
+                    )
+                )
+                total += 1
+                if is_text and content_text:
+                    stored += 1
 
-        snap.file_count = total
-        snap.stored_content_files = stored
-        snap.warnings_json = json.dumps(warnings) if warnings else None
-        db.commit()
+            db.commit()
 
-        return RepoSyncResult(
-            snapshot_id=snap.id,
-            repo=repo,
-            branch=branch,
-            commit_sha=commit_sha,
-            file_count=total,
-            stored_content_files=stored,
-            warnings=warnings,
-        )
+    # -------------------------
+    # GitHub API fallback
+    # -------------------------
+    else:
+        tree = _github_list_tree(repo, branch)
+        if not tree:
+            warnings.append("github_tree_empty_or_failed")
 
-    # GitHub API path
-    items = await _list_github_repo_paths(repo, branch)
-    total = len(items)
-
-    token = settings.GITHUB_TOKEN
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "goal-autopilot",
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    async with httpx.AsyncClient() as client:
-        for it in items:
-            path = it["path"]
-            sha = it.get("sha")
-            size = int(it.get("size") or 0)
-            download_url = it.get("download_url")
-            api_url = it.get("url")
-
-            rf = RepoFile(
-                snapshot_id=snap.id,
-                path=path,
-                sha=sha,
-                size=size,
-                is_text=True,
-                skipped=False,
-                content_kind="skipped",
-                content=None,
-                content_text=None,
-                created_at=datetime.utcnow(),
-                skip_reason=None,
-            )
-
-            if size > settings.GITHUB_MAX_FILE_BYTES:
-                rf.skipped = True
-                rf.content_kind = "skipped"
-                rf.skip_reason = "too_large"
-                db.add(rf)
+        for item in tree[:max_files]:
+            path = (item.get("path") or "").strip()
+            if not path:
                 continue
 
-            try:
-                if download_url:
-                    raw = await _github_get_bytes(client, download_url, headers)
-                else:
-                    j = await _github_get_json(client, api_url, headers)
-                    if j.get("encoding") == "base64" and j.get("content"):
-                        raw = base64.b64decode(j["content"])
-                    else:
-                        raw = b""
+            excluded, reason = _should_exclude_path(path)
+            if excluded:
+                db.add(
+                    RepoFile(
+                        snapshot_id=snap.id,
+                        path=path,
+                        sha=item.get("sha"),
+                        size=item.get("size"),
+                        is_text=True,
+                        skipped=True,
+                        skip_reason=reason,
+                        content=None,
+                        content_kind="skipped",
+                        content_text=None,
+                    )
+                )
+                total += 1
+                continue
 
-                if _looks_like_text(path, raw):
-                    text = raw.decode("utf-8", errors="replace")
-                    rf.content_kind = "text"
-                    rf.content_text = text
-                    rf.content = text
-                    stored += 1
-                else:
-                    rf.is_text = False
-                    rf.skipped = True
-                    rf.content_kind = "binary"
-                    rf.skip_reason = "binary"
+            size = item.get("size")
+            if isinstance(size, int) and size > max_bytes:
+                db.add(
+                    RepoFile(
+                        snapshot_id=snap.id,
+                        path=path,
+                        sha=item.get("sha"),
+                        size=size,
+                        is_text=True,
+                        skipped=True,
+                        skip_reason=f"over_max_bytes:{size}",
+                        content=None,
+                        content_kind="skipped",
+                        content_text=None,
+                    )
+                )
+                total += 1
+                continue
 
-            except Exception as e:
-                rf.skipped = True
-                rf.content_kind = "skipped"
-                rf.skip_reason = f"fetch_error:{type(e).__name__}"
+            raw, sha, sz = _github_get_file_contents(repo, path, ref=branch)
+            if raw is None:
+                db.add(
+                    RepoFile(
+                        snapshot_id=snap.id,
+                        path=path,
+                        sha=sha or item.get("sha"),
+                        size=sz or item.get("size"),
+                        is_text=True,
+                        skipped=True,
+                        skip_reason="github_fetch_failed",
+                        content=None,
+                        content_kind="skipped",
+                        content_text=None,
+                    )
+                )
+                total += 1
+                continue
 
-            db.add(rf)
+            is_text = _looks_like_text(path, raw)
+            content_text = None
+            kind = "binary"
+            if is_text:
+                content_text = raw.decode("utf-8", errors="replace")
+                kind = "text"
 
-    snap.file_count = total
-    snap.stored_content_files = stored
-    snap.warnings_json = json.dumps(warnings) if warnings else None
+            db.add(
+                RepoFile(
+                    snapshot_id=snap.id,
+                    path=path,
+                    sha=sha or item.get("sha"),
+                    size=len(raw),
+                    is_text=bool(is_text),
+                    skipped=False,
+                    skip_reason=None,
+                    content=None,
+                    content_kind=kind if is_text else "binary",
+                    content_text=content_text if is_text else None,
+                )
+            )
+            total += 1
+            if is_text and content_text:
+                stored += 1
+
+        db.commit()
+
+    # update snapshot stats + warnings
+    snap.file_count = int(total)
+    snap.stored_content_files = int(stored)
+    if warnings:
+        # keep it light; routes can display it
+        import json
+
+        snap.warnings_json = json.dumps(warnings)
     db.commit()
 
-    return RepoSyncResult(
-        snapshot_id=snap.id,
-        repo=repo,
-        branch=branch,
-        commit_sha=commit_sha,
-        file_count=total,
-        stored_content_files=stored,
-        warnings=warnings,
-    )
-
-
-# -------------------------------------------------------------------
-# Supported exported sync functions (THIS fixes your "does not export"
-# error without changing your internal implementation).
-# -------------------------------------------------------------------
-
-async def sync_repo_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
-    r = await create_repo_snapshot(db, repo=repo, branch=branch)
     return {
-        "snapshot_id": r.snapshot_id,
-        "repo": r.repo,
-        "branch": r.branch,
-        "commit_sha": r.commit_sha,
-        "file_count": r.file_count,
-        "stored_content_files": r.stored_content_files,
-        "warnings": r.warnings,
+        "snapshot_id": snap.id,
+        "repo": repo,
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "file_count": int(total),
+        "stored_content_files": int(stored),
+        "warnings": warnings,
     }
-
-
-async def sync_snapshot(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
-    return await sync_repo_snapshot(db, repo=repo, branch=branch)
-
-
-async def sync_repo(db: Session, repo: str | None = None, branch: str | None = None) -> dict[str, Any]:
-    return await sync_repo_snapshot(db, repo=repo, branch=branch)

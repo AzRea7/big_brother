@@ -20,14 +20,25 @@ def _ensure(engine: Engine, ddl: str) -> None:
         conn.execute(text(ddl))
 
 
-def _table_exists(engine: Engine, table: str) -> bool:
-    insp = inspect(engine)
-    return table in set(insp.get_table_names())
-
-
 def _is_sqlite(engine: Engine) -> bool:
     try:
         return engine.dialect.name == "sqlite"
+    except Exception:
+        return False
+
+
+def _sqlite_has_fts5(engine: Engine) -> bool:
+    """
+    Detect if SQLite was compiled with FTS5 support.
+    If not, we skip creating FTS tables/triggers.
+    """
+    if not _is_sqlite(engine):
+        return False
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("PRAGMA compile_options;")).fetchall()
+        opts = {str(r[0]).upper() for r in rows}
+        return any("FTS5" in o for o in opts)
     except Exception:
         return False
 
@@ -197,11 +208,9 @@ def ensure_schema(engine: Engine) -> None:
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_resolved ON repo_findings(is_resolved)")
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_path ON repo_findings(path)")
 
-    # ------------------------------------------------------------------
-    # Level 2 RAG: repo_chunks + SQLite FTS
-    # ------------------------------------------------------------------
-
-    # ---- Repo chunks ----
+    # -----------------------
+    # ✅ Level 2 RAG: repo_chunks
+    # -----------------------
     if "repo_chunks" not in tables:
         _ensure(
             engine,
@@ -213,8 +222,7 @@ def ensure_schema(engine: Engine) -> None:
               start_line INTEGER NOT NULL,
               end_line INTEGER NOT NULL,
               chunk_text TEXT NOT NULL,
-              symbols TEXT,
-              fingerprint VARCHAR(64) NOT NULL,
+              symbols_json TEXT,
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
               UNIQUE(snapshot_id, path, start_line, end_line)
             )
@@ -223,13 +231,12 @@ def ensure_schema(engine: Engine) -> None:
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunks_snapshot ON repo_chunks(snapshot_id)")
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunks_path ON repo_chunks(path)")
     else:
-        # Add columns for older DBs if needed
         for col, ddl in [
+            ("path", "VARCHAR(1024)"),
             ("start_line", "INTEGER"),
             ("end_line", "INTEGER"),
             ("chunk_text", "TEXT"),
-            ("symbols", "TEXT"),
-            ("fingerprint", "VARCHAR(64)"),
+            ("symbols_json", "TEXT"),
             ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
         ]:
             if not _has_column(engine, "repo_chunks", col):
@@ -238,40 +245,42 @@ def ensure_schema(engine: Engine) -> None:
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunks_snapshot ON repo_chunks(snapshot_id)")
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunks_path ON repo_chunks(path)")
 
-    # ---- SQLite FTS for chunks ----
-    # Notes:
-    # - This is optional but strongly recommended.
-    # - If your Python SQLite build lacks FTS5, you will get an error at startup.
-    #   In that case, you can comment this block out and rely on LIKE fallback.
-    if _is_sqlite(engine):
-        # SQLAlchemy inspect() may not list virtual tables on some setups,
-        # but most do. We'll check both via inspector and sqlite_master.
-        def _fts_exists() -> bool:
-            try:
-                if _table_exists(engine, "repo_chunks_fts"):
-                    return True
-            except Exception:
-                pass
-            with engine.begin() as conn:
-                r = conn.execute(
-                    text(
-                        "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = 'repo_chunks_fts'"
-                    )
-                ).fetchone()
-                return bool(r)
+    # Optional: FTS5 for chunk retrieval
+    if _sqlite_has_fts5(engine):
+        # Create the FTS virtual table (contentless is simplest, but we want rowid=id)
+        _ensure(
+            engine,
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS repo_chunks_fts
+            USING fts5(chunk_text, path, content='repo_chunks', content_rowid='id');
+            """,
+        )
 
-        if not _fts_exists():
-            _ensure(
-                engine,
-                """
-                CREATE VIRTUAL TABLE repo_chunks_fts USING fts5(
-                  chunk_text,
-                  path,
-                  snapshot_id UNINDEXED,
-                  start_line UNINDEXED,
-                  end_line UNINDEXED,
-                  tokenize = 'porter'
-                );
-                """,
-            )
-            _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunks_fts_snapshot ON repo_chunks_fts(snapshot_id)")
+        # Triggers to keep FTS in sync
+        _ensure(
+            engine,
+            """
+            CREATE TRIGGER IF NOT EXISTS repo_chunks_ai AFTER INSERT ON repo_chunks BEGIN
+              INSERT INTO repo_chunks_fts(rowid, chunk_text, path) VALUES (new.id, new.chunk_text, new.path);
+            END;
+            """,
+        )
+        _ensure(
+            engine,
+            """
+            CREATE TRIGGER IF NOT EXISTS repo_chunks_ad AFTER DELETE ON repo_chunks BEGIN
+              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path)
+              VALUES('delete', old.id, old.chunk_text, old.path);
+            END;
+            """,
+        )
+        _ensure(
+            engine,
+            """
+            CREATE TRIGGER IF NOT EXISTS repo_chunks_au AFTER UPDATE ON repo_chunks BEGIN
+              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path)
+              VALUES('delete', old.id, old.chunk_text, old.path);
+              INSERT INTO repo_chunks_fts(rowid, chunk_text, path) VALUES (new.id, new.chunk_text, new.path);
+            END;
+            """,
+        )

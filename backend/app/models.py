@@ -4,7 +4,16 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -104,6 +113,13 @@ class RepoSnapshot(Base):
         cascade="all, delete-orphan",
     )
 
+    # ✅ Level 2 RAG: chunks linked to this snapshot
+    chunks: Mapped[list["RepoChunk"]] = relationship(
+        "RepoChunk",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+
 
 class RepoFile(Base):
     __tablename__ = "repo_files"
@@ -156,14 +172,23 @@ class RepoFinding(Base):
 
     snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="findings")
 
+
+# -----------------------
+# ✅ Level 2 RAG: RepoChunk
+# -----------------------
+
 class RepoChunk(Base):
     """
-    Level 2 RAG:
-    chunks of repo code stored per snapshot, for retrieval.
+    Stores chunked code context for a given RepoSnapshot.
+
+    Minimal fields for v1 RAG:
+      - path + line range
+      - chunk_text
+      - symbols_json (optional; e.g., ["ClassA", "func_b"])
     """
     __tablename__ = "repo_chunks"
     __table_args__ = (
-        UniqueConstraint("snapshot_id", "path", "start_line", "end_line", name="uq_chunk_span"),
+        UniqueConstraint("snapshot_id", "path", "start_line", "end_line", name="uq_repo_chunk_range"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -175,9 +200,7 @@ class RepoChunk(Base):
     end_line: Mapped[int] = mapped_column(Integer, nullable=False)
 
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
-    symbols: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbols_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
