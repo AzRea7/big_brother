@@ -4,14 +4,14 @@ services:
     container_name: goal_autopilot
     env_file:
       - .env
-    environment: 
-    - GITHUB_TOKEN=${GITHUB_TOKEN}
-    - GITHUB_REPO=AzRea7/OneHaven
-    - GITHUB_BRANCH=main
-    - REPO_LOCAL_PATH=/repos/OneHaven
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=AzRea7/OneHaven
+      - GITHUB_BRANCH=main
+      - REPO_LOCAL_PATH=/repos/OneHaven/onehaven
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ../OneHaven:/repos/OneHaven:ro
+      - C:/Users/austin/onehaven:/repos/OneHaven:ro
     restart: unless-stopped
