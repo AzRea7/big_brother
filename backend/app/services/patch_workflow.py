@@ -8,28 +8,29 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import httpx
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RepoPatchRun, RepoPullRequest, RepoSnapshot
+from .repo_materialize import materialize_snapshot_to_disk
 
 
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$", re.MULTILINE)
 
 
 def patch_workflow_enabled() -> bool:
-    return bool(getattr(settings, "PATCH_WORKFLOW_ENABLED", False))
+    return bool(getattr(settings, "ENABLE_PATCH_WORKFLOW", False))
 
 
 def pr_workflow_enabled() -> bool:
-    return bool(getattr(settings, "PR_WORKFLOW_ENABLED", False))
+    return bool(getattr(settings, "ENABLE_PR_WORKFLOW", False))
 
 
-def github_token() -> str:
-    tok = str(getattr(settings, "GITHUB_TOKEN", "") or "")
+def _github_token() -> str:
+    tok = str(getattr(settings, "GITHUB_TOKEN", "") or "").strip()
     if not tok:
         raise RuntimeError("GITHUB_TOKEN is required to open PRs.")
     return tok
@@ -38,7 +39,6 @@ def github_token() -> str:
 def _allowlist_prefixes() -> list[str]:
     raw = str(getattr(settings, "PATCH_ALLOWLIST_PREFIXES", "") or "").strip()
     if not raw:
-        # default: allow everything (but still blocks absolute paths + .. traversal)
         return []
     return [p.strip() for p in raw.split(",") if p.strip()]
 
@@ -54,15 +54,10 @@ def _reject_path(path: str) -> Optional[str]:
     return None
 
 
-def validate_patch_text(patch_text: str) -> tuple[bool, Optional[str], int, int]:
+def validate_unified_diff(patch_text: str) -> tuple[bool, Optional[str], int, int]:
     """
-    Validates:
-    - has diff headers
-    - no absolute paths / traversal
-    - optional allowlist prefixes
-    Also returns:
-    - files_changed
-    - lines_changed (rough, from +/- lines not in headers)
+    Validates unified diff content and returns:
+      (valid, error, files_changed, lines_changed)
     """
     s = (patch_text or "").strip()
     if not s:
@@ -70,9 +65,11 @@ def validate_patch_text(patch_text: str) -> tuple[bool, Optional[str], int, int]
 
     matches = list(_DIFF_HEADER_RE.finditer(s))
     if not matches:
-        return False, "Patch does not look like unified diff (missing 'diff --git a/... b/...').", 0, 0
+        return False, "Patch missing 'diff --git a/... b/...'.", 0, 0
 
     allow = _allowlist_prefixes()
+    max_files = int(getattr(settings, "PATCH_MAX_FILES", 25) or 25)
+    max_lines = int(getattr(settings, "PATCH_MAX_LINES", 1200) or 1200)
 
     files_changed = 0
     for m in matches:
@@ -83,14 +80,15 @@ def validate_patch_text(patch_text: str) -> tuple[bool, Optional[str], int, int]
         if err:
             return False, err, 0, 0
 
-        # enforce allowlist if provided
-        if allow:
-            if not any(a_path.startswith(p) or b_path.startswith(p) for p in allow):
-                return False, f"Path not in allowlist: {a_path} / {b_path}", 0, 0
+        if allow and not any(a_path.startswith(p) or b_path.startswith(p) for p in allow):
+            return False, f"Path not in allowlist: {a_path} / {b_path}", 0, 0
 
         files_changed += 1
 
-    # lines changed: count +/- lines excluding diff metadata
+    if files_changed > max_files:
+        return False, f"Too many files changed: {files_changed} > {max_files}", 0, 0
+
+    # rough line delta count
     lines_changed = 0
     for line in s.splitlines():
         if line.startswith("+++ ") or line.startswith("--- ") or line.startswith("@@"):
@@ -98,260 +96,228 @@ def validate_patch_text(patch_text: str) -> tuple[bool, Optional[str], int, int]
         if line.startswith("+") or line.startswith("-"):
             lines_changed += 1
 
-    max_files = int(getattr(settings, "PATCH_MAX_FILES", 25))
-    max_lines = int(getattr(settings, "PATCH_MAX_LINES", 2500))
-    if files_changed > max_files:
-        return False, f"Too many files changed ({files_changed} > {max_files}).", files_changed, lines_changed
     if lines_changed > max_lines:
-        return False, f"Too many changed lines ({lines_changed} > {max_lines}).", files_changed, lines_changed
+        return False, f"Too many changed lines: {lines_changed} > {max_lines}", 0, 0
 
     return True, None, files_changed, lines_changed
 
 
-def _repo_local_path() -> str:
-    p = str(getattr(settings, "REPO_LOCAL_PATH", "") or "").strip()
-    return p
+def _run_cmd(cmd: str, cwd: str, timeout_s: int = 60) -> tuple[bool, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+            text=True,
+        )
+        ok = p.returncode == 0
+        return ok, p.stdout
+    except Exception as e:
+        return False, f"command failed: {e}"
 
 
-def _tests_cmd() -> str:
-    return str(getattr(settings, "PATCH_TEST_CMD", "") or "pytest -q")
-
-
-def _run(cmd: list[str], *, cwd: str, timeout_s: int = 900) -> tuple[int, str]:
-    p = subprocess.run(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout_s,
-    )
-    return int(p.returncode), p.stdout
-
-
-def apply_patch_in_sandbox(
+def apply_unified_diff_in_sandbox(
     db: Session,
-    *,
     snapshot_id: int,
     patch_text: str,
+    *,
     run_tests: bool = True,
-) -> RepoPatchRun:
+) -> dict:
     """
-    Creates RepoPatchRun row, validates patch, copies REPO_LOCAL_PATH into sandbox,
-    applies patch using `git apply`, optionally runs tests.
-
-    Important: This expects REPO_LOCAL_PATH to point to a git checkout of the target repo.
+    1) validate diff
+    2) materialize snapshot into a temp sandbox
+    3) init git + commit baseline
+    4) apply patch via git apply
+    5) optionally run tests
+    Stores RepoPatchRun row with outputs.
     """
-    snap = db.get(RepoSnapshot, snapshot_id)
-    if not snap:
-        raise RuntimeError(f"Snapshot not found: {snapshot_id}")
+    if not patch_workflow_enabled():
+        raise RuntimeError("Patch workflow is disabled (ENABLE_PATCH_WORKFLOW=false).")
 
+    valid, err, files_changed, lines_changed = validate_unified_diff(patch_text)
     run = RepoPatchRun(
         snapshot_id=snapshot_id,
-        patch_text=patch_text,
         created_at=datetime.utcnow(),
-        valid=False,
+        patch_text=patch_text,
+        valid=bool(valid),
+        validation_error=err,
+        files_changed=int(files_changed),
+        lines_changed=int(lines_changed),
         applied=False,
+        apply_error=None,
         tests_ran=False,
         tests_ok=False,
+        test_output=None,
+        sandbox_path=None,
+        diff_output=None,
     )
     db.add(run)
     db.commit()
     db.refresh(run)
 
-    ok, err, _, _ = validate_patch_text(patch_text)
-    run.valid = bool(ok)
-    run.validation_error = err
+    if not valid:
+        return {
+            "run_id": run.id,
+            "valid": False,
+            "validation_error": err,
+            "applied": False,
+            "apply_error": None,
+            "tests_ran": False,
+            "tests_ok": False,
+            "test_output": None,
+        }
+
+    sandbox = tempfile.mkdtemp(prefix="repo_patch_sandbox_")
+    run.sandbox_path = sandbox
     db.commit()
 
-    if not ok:
-        return run
-
-    if not patch_workflow_enabled():
-        run.applied = False
-        run.apply_error = "PATCH_WORKFLOW_ENABLED=false (apply is gated for safety)."
-        db.commit()
-        return run
-
-    base = _repo_local_path()
-    if not base or not os.path.isdir(base):
-        run.applied = False
-        run.apply_error = "REPO_LOCAL_PATH is not set or does not exist. Patch apply requires a real git checkout."
-        db.commit()
-        return run
-
-    sandbox_root = str(getattr(settings, "PATCH_SANDBOX_ROOT", "") or "data/patch_sandboxes")
-    os.makedirs(sandbox_root, exist_ok=True)
-
-    sandbox_dir = os.path.join(sandbox_root, f"run_{run.id}")
-    if os.path.isdir(sandbox_dir):
-        shutil.rmtree(sandbox_dir, ignore_errors=True)
-
-    # Copy repo into sandbox (simple + deterministic)
-    shutil.copytree(
-        base,
-        sandbox_dir,
-        ignore=shutil.ignore_patterns(".venv", "node_modules", ".pytest_cache", "__pycache__", ".mypy_cache"),
-        dirs_exist_ok=False,
-    )
-
-    run.sandbox_path = sandbox_dir
-    db.commit()
-
-    # Ensure it's a git repo
-    if not os.path.isdir(os.path.join(sandbox_dir, ".git")):
-        run.applied = False
-        run.apply_error = "Sandbox copy is not a git repo (missing .git). Ensure REPO_LOCAL_PATH points to a git checkout."
-        db.commit()
-        return run
-
-    # Write patch to temp file
-    patch_file = os.path.join(sandbox_dir, ".autopatch.diff")
-    with open(patch_file, "w", encoding="utf-8") as f:
+    # Write patch to disk
+    patch_path = os.path.join(sandbox, "change.patch")
+    with open(patch_path, "w", encoding="utf-8") as f:
         f.write(patch_text)
 
-    # Check + apply
-    rc, out = _run(["git", "apply", "--check", patch_file], cwd=sandbox_dir, timeout_s=120)
-    if rc != 0:
-        run.applied = False
-        run.apply_error = f"git apply --check failed:\n{out}"
-        db.commit()
-        return run
+    # Materialize snapshot
+    materialize_snapshot_to_disk(db, snapshot_id, sandbox)
 
-    rc, out = _run(["git", "apply", "--whitespace=nowarn", patch_file], cwd=sandbox_dir, timeout_s=120)
-    if rc != 0:
-        run.applied = False
-        run.apply_error = f"git apply failed:\n{out}"
-        db.commit()
-        return run
+    # Initialize git repo so `git apply` and `git diff` work reliably
+    _run_cmd("git init", cwd=sandbox, timeout_s=30)
+    _run_cmd("git add -A", cwd=sandbox, timeout_s=60)
+    _run_cmd('git commit -m "baseline"', cwd=sandbox, timeout_s=60)
 
-    run.applied = True
-    run.apply_error = None
+    applied_ok, apply_out = _run_cmd(f"git apply --whitespace=nowarn {patch_path}", cwd=sandbox, timeout_s=60)
+    run.applied = applied_ok
+    run.apply_error = None if applied_ok else apply_out
+    db.commit()
+
+    if not applied_ok:
+        return {
+            "run_id": run.id,
+            "valid": True,
+            "validation_error": None,
+            "applied": False,
+            "apply_error": apply_out,
+            "tests_ran": False,
+            "tests_ok": False,
+            "test_output": None,
+        }
+
+    # capture diff for UI review
+    _, diff_out = _run_cmd("git diff", cwd=sandbox, timeout_s=30)
+    run.diff_output = diff_out
     db.commit()
 
     if run_tests:
+        test_cmd = str(getattr(settings, "PR_TEST_CMD", "pytest -q") or "pytest -q")
+        timeout_s = int(getattr(settings, "PR_TIMEOUT_SECONDS", 900) or 900)
+        tests_ok, out = _run_cmd(test_cmd, cwd=sandbox, timeout_s=timeout_s)
         run.tests_ran = True
-        cmd = _tests_cmd().strip()
-        # allow either "pytest -q" string or JSON list (power users)
-        if cmd.startswith("["):
-            try:
-                cmd_list = list(__import__("json").loads(cmd))
-                cmd_list = [str(x) for x in cmd_list]
-            except Exception:
-                cmd_list = ["pytest", "-q"]
-        else:
-            cmd_list = cmd.split()
-
-        timeout_s = int(getattr(settings, "PATCH_TEST_TIMEOUT_S", 900))
-        rc, out = _run(cmd_list, cwd=sandbox_dir, timeout_s=timeout_s)
-        run.tests_ok = (rc == 0)
-        run.test_output = out[-25000:]  # cap
+        run.tests_ok = bool(tests_ok)
+        run.test_output = out
         db.commit()
 
-    return run
+        return {
+            "run_id": run.id,
+            "valid": True,
+            "validation_error": None,
+            "applied": True,
+            "apply_error": None,
+            "tests_ran": True,
+            "tests_ok": bool(tests_ok),
+            "test_output": out,
+        }
+
+    return {
+        "run_id": run.id,
+        "valid": True,
+        "validation_error": None,
+        "applied": True,
+        "apply_error": None,
+        "tests_ran": False,
+        "tests_ok": False,
+        "test_output": None,
+    }
 
 
-async def open_pull_request(
+def open_pull_request_from_patch_run(
     db: Session,
-    *,
     run_id: int,
+    *,
     title: str,
     body: Optional[str] = None,
     base_branch: Optional[str] = None,
-) -> tuple[bool, Optional[int], Optional[str], Optional[str]]:
+) -> dict:
     """
-    Requires:
-      - PR_WORKFLOW_ENABLED=true
-      - GITHUB_TOKEN set
-      - RepoPatchRun.applied=true
-      - RepoPatchRun.tests_ok=true (optional gate; can relax via settings)
+    OFF by default. When enabled, this will:
+      - push a branch to GitHub using git CLI (requires git + network + token)
+      - open a PR via GitHub REST API
+
+    This is intentionally strict and can be tightened further (branch naming, commit signing, etc.).
     """
     if not pr_workflow_enabled():
-        return False, None, None, "PR_WORKFLOW_ENABLED=false (PR creation gated)."
+        raise RuntimeError("PR workflow is disabled (ENABLE_PR_WORKFLOW=false).")
 
     run = db.get(RepoPatchRun, run_id)
     if not run:
-        return False, None, None, f"Patch run not found: {run_id}"
+        raise RuntimeError(f"run_id={run_id} not found")
     if not run.applied:
-        return False, None, None, "Patch was not applied. Apply first."
-    if not run.sandbox_path or not os.path.isdir(run.sandbox_path):
-        return False, None, None, "Sandbox path missing. Apply must create sandbox."
-
-    require_tests_ok = bool(getattr(settings, "PATCH_REQUIRE_TESTS_OK", True))
-    if require_tests_ok and not run.tests_ok:
-        return False, None, None, "Tests did not pass (PATCH_REQUIRE_TESTS_OK=true)."
+        raise RuntimeError("Patch was not applied; cannot open PR.")
+    if run.tests_ran and not run.tests_ok:
+        raise RuntimeError("Tests failed; cannot open PR.")
 
     snap = db.get(RepoSnapshot, run.snapshot_id)
     if not snap:
-        return False, None, None, "Snapshot missing for run."
+        raise RuntimeError("Snapshot not found for patch run.")
+
+    repo = snap.repo  # e.g. "AzRea7/OneHaven"
+    base = base_branch or snap.branch or "main"
+    branch = f"autopilot/patch-run-{run.id}"
 
     sandbox = run.sandbox_path
-    branch = (base_branch or snap.branch or "main").strip()
-    new_branch = f"autopatch/run-{run.id}"
+    if not sandbox or not os.path.isdir(sandbox):
+        raise RuntimeError("Sandbox path missing; cannot push.")
 
-    # Create branch, commit, push
-    rc, out = _run(["git", "checkout", "-b", new_branch], cwd=sandbox, timeout_s=60)
-    if rc != 0:
-        return False, None, None, f"git checkout failed:\n{out}"
+    tok = _github_token()
 
-    rc, out = _run(["git", "add", "-A"], cwd=sandbox, timeout_s=60)
-    if rc != 0:
-        return False, None, None, f"git add failed:\n{out}"
+    # Create commit in sandbox
+    _run_cmd("git add -A", cwd=sandbox, timeout_s=60)
+    safe_title = title.replace('"', '\\"')
+    _run_cmd(f'git commit -m "{safe_title}"', cwd=sandbox, timeout_s=60)
 
-    rc, out = _run(["git", "commit", "-m", title], cwd=sandbox, timeout_s=60)
-    if rc != 0:
-        return False, None, None, f"git commit failed:\n{out}"
+    remote_url = f"https://{tok}@github.com/{repo}.git"
+    _run_cmd("git remote remove origin", cwd=sandbox, timeout_s=15)
+    _run_cmd(f"git remote add origin {remote_url}", cwd=sandbox, timeout_s=15)
+    _run_cmd(f"git checkout -b {branch}", cwd=sandbox, timeout_s=30)
 
-    # Ensure origin URL contains token (non-interactive)
-    tok = github_token()
-    # snap.repo like "AzRea7/OneHaven"
-    repo_full = snap.repo.strip()
-    if "/" not in repo_full:
-        return False, None, None, f"Invalid repo format: {repo_full}"
-    owner, repo = repo_full.split("/", 1)
+    ok, out = _run_cmd(f"git push -u origin {branch}", cwd=sandbox, timeout_s=120)
+    if not ok:
+        raise RuntimeError(f"Failed to push branch: {out}")
 
-    remote_url = f"https://{tok}@github.com/{owner}/{repo}.git"
-    _run(["git", "remote", "set-url", "origin", remote_url], cwd=sandbox, timeout_s=30)
+    # Open PR via GitHub API
+    api = "https://api.github.com"
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
+    payload = {"title": title, "head": branch, "base": base, "body": body or ""}
 
-    rc, out = _run(["git", "push", "-u", "origin", new_branch], cwd=sandbox, timeout_s=180)
-    if rc != 0:
-        return False, None, None, f"git push failed:\n{out}"
-
-    # Create PR via GitHub API
-    api = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-    headers = {
-        "Authorization": f"token {tok}",
-        "Accept": "application/vnd.github+json",
-    }
-    payload = {
-        "title": title,
-        "head": new_branch,
-        "base": branch,
-        "body": body or "",
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(api, headers=headers, json=payload)
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(f"{api}/repos/{repo}/pulls", headers=headers, json=payload)
         if r.status_code >= 400:
-            return False, None, None, f"GitHub PR create failed {r.status_code}: {r.text}"
+            raise RuntimeError(f"Failed to open PR {r.status_code}: {r.text}")
+        pr = r.json()
 
-        j = r.json()
-        pr_number = int(j.get("number")) if j.get("number") is not None else None
-        pr_url = str(j.get("html_url")) if j.get("html_url") else None
+    pr_url = pr.get("html_url")
+    pr_number = pr.get("number")
 
-    # Record PR row
-    pr = RepoPullRequest(
-        snapshot_id=snap.id,
-        patch_run_id=run.id,
-        repo=repo_full,
-        branch=branch,
-        pr_number=pr_number,
-        pr_url=pr_url,
-        title=title,
-        body=body,
-        created_at=datetime.utcnow(),
+    db.add(
+        RepoPullRequest(
+            patch_run_id=run.id,
+            repo=repo,
+            pr_number=int(pr_number) if pr_number else None,
+            pr_url=str(pr_url) if pr_url else None,
+            created_at=datetime.utcnow(),
+        )
     )
-    db.add(pr)
     db.commit()
 
-    return True, pr_number, pr_url, None
+    return {"ok": True, "pr_url": pr_url, "pr_number": pr_number}
