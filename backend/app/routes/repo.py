@@ -34,10 +34,18 @@ except Exception:  # pragma: no cover
 
 # --- Level 2 RAG (chunks + retrieval) ---
 try:
-    from ..services.repo_taskgen import build_chunks_for_snapshot, search_chunks  # type: ignore
+    from ..services.repo_chunks import (  # type: ignore
+        chunk_snapshot as build_chunks_for_snapshot,
+        build_embeddings_for_snapshot,
+        search_chunks,
+        load_chunk_text,
+    )
 except Exception:  # pragma: no cover
     build_chunks_for_snapshot = None  # type: ignore
+    build_embeddings_for_snapshot = None  # type: ignore
     search_chunks = None  # type: ignore
+    load_chunk_text = None  # type: ignore
+
 
 # --- Level 3 PR workflow (optional, gated) ---
 # If you haven't added services/patch_workflow.py yet, these endpoints will return 501-ish errors.
@@ -327,45 +335,31 @@ def debug_repo_chunks_build(
         JOBS_TOTAL.labels(job="repo_chunks_build", status="error").inc()
         raise
 
+@router.post("/chunks/embed")
+async def debug_repo_chunks_embed(
+    request: Request,
+    snapshot_id: int = Query(..., ge=1),
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    _guard_debug(request)
+    if build_embeddings_for_snapshot is None:
+        raise HTTPException(status_code=501, detail="Embeddings not available (missing services.repo_chunks)")
+    return await build_embeddings_for_snapshot(db, snapshot_id, force=force)
 
 @router.get("/chunks/search")
-def debug_repo_chunks_search(
+async def debug_repo_chunks_search(
     request: Request,
-    snapshot_id: int = Query(...),
-    query: str = Query(..., min_length=2, max_length=400),
-    top_k: int = Query(10, ge=1, le=30),
-    mode: str = Query("auto", pattern="^(auto|fts|embeddings)$"),
-    path_contains: Optional[str] = Query(None),
+    snapshot_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=2),
+    top_k: int = Query(16, ge=1, le=100),
     db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """
-    Search chunks for code context.
-
-    mode:
-      - auto: prefer embeddings if available, otherwise fts
-      - fts: lightweight term scoring (DB-friendly)
-      - embeddings: cosine similarity (only works if your RepoChunk rows have embeddings stored)
-    """
+):
     _guard_debug(request)
-
     if search_chunks is None:
-        raise HTTPException(status_code=500, detail="Chunk search not available (repo_taskgen missing search_chunks).")
-
-    JOBS_TOTAL.labels(job="repo_chunks_search", status="start").inc()
-    try:
-        out = search_chunks(
-            db=db,
-            snapshot_id=snapshot_id,
-            query=query,
-            top_k=top_k,
-            mode=mode,
-            path_contains=path_contains,
-        )
-        JOBS_TOTAL.labels(job="repo_chunks_search", status="ok").inc()
-        return out
-    except Exception:
-        JOBS_TOTAL.labels(job="repo_chunks_search", status="error").inc()
-        raise
+        raise HTTPException(status_code=501, detail="Chunk search not available")
+    hits = await search_chunks(db, snapshot_id, q, top_k=top_k)
+    return {"snapshot_id": snapshot_id, "query": q, "hits": hits}
 
 
 # -------------------------------------------------------------------

@@ -20,6 +20,13 @@ from ..services.repo_findings import (
     generate_tasks_from_findings_llm,
 )
 
+from ..services.repo_chunks import (
+    chunk_snapshot,
+    build_embeddings_for_snapshot,
+    search_chunks,
+    load_chunk_text,
+)
+
 router = APIRouter(prefix="/debug", tags=["debug"])
 
 
@@ -126,47 +133,58 @@ def notify_email(request: Request, body: EmailBody):
 # Repo: chunks + search
 # -----------------------
 
-@router.post("/repo/chunks/build")
-def repo_chunks_build(
-    request: Request,
-    snapshot_id: int = Query(...),
-    max_chars: int = Query(1200),
-    overlap: int = Query(120),
+@router.post("/repo/chunks/embed")
+async def embed_repo_chunks(
+    snapshot_id: int = Query(..., ge=1),
+    force: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    _guard_debug(request)
-    return chunk_snapshot(db=db, snapshot_id=snapshot_id, max_chars=max_chars, overlap=overlap)
+    """
+    Build embeddings for all chunks in a snapshot.
+    Requires EMBEDDINGS_ENABLED=true and OPENAI_API_KEY set.
+    """
+    return await build_embeddings_for_snapshot(db, snapshot_id, force=force)
+
+@router.post("/repo/chunks/build")
+def build_repo_chunks(
+    snapshot_id: int = Query(..., ge=1),
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Build repo chunks for a snapshot (and FTS index).
+    If force=true, it rebuilds from scratch.
+    """
+    return chunk_snapshot(db, snapshot_id, force=force)
 
 
 @router.get("/repo/chunks/search")
-def repo_chunks_search(
-    request: Request,
-    snapshot_id: int = Query(...),
-    q: str = Query(...),
-    top_k: int = Query(8),
-    mode: str = Query("auto"),
-    path_contains: str | None = Query(default=None),
+async def rag_search(
+    snapshot_id: int = Query(..., ge=1),
+    q: str = Query(..., min_length=2),
+    top_k: int = Query(16, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    _guard_debug(request)
-    return search_chunks(
-        db=db,
-        snapshot_id=snapshot_id,
-        query=q,
-        top_k=top_k,
-        mode=mode,
-        path_contains=path_contains,
-    )
+    hits = await search_chunks(db, snapshot_id, q, top_k=top_k)
+    return {"snapshot_id": snapshot_id, "query": q, "hits": hits}
 
 
-@router.get("/repo/chunks/load")
-def repo_chunks_load(
-    request: Request,
-    chunk_id: int = Query(...),
+@router.get("/repo/chunks/get")
+def rag_get_chunk(
+    snapshot_id: int = Query(..., ge=1),
+    path: str = Query(..., min_length=1),
+    start_line: int = Query(..., ge=1),
+    end_line: int = Query(..., ge=1),
     db: Session = Depends(get_db),
 ):
-    _guard_debug(request)
-    return load_chunk_text(db=db, chunk_id=chunk_id)
+    txt = load_chunk_text(db, snapshot_id, path, start_line, end_line)
+    return {
+        "snapshot_id": snapshot_id,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "chunk_text": txt,
+    }
 
 
 # -----------------------

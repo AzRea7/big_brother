@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = ""
 
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    OPENAI_TIMEOUT_S: float = 60.0
+
     # Optional safety / behavior toggles
     HAVEN_REPO_ONLY: bool = True
     LLM_READ_TIMEOUT_S: float = 660.0
@@ -112,6 +115,7 @@ class Settings(BaseSettings):
     REPO_RAG_QUERY_SEEDS: str = ""
 
     # Embeddings
+    EMBEDDINGS_ENABLED: bool = False
     EMBEDDINGS_PROVIDER: str = "off"  # off | openai
     EMBEDDINGS_MODEL: str = "text-embedding-3-small"
 

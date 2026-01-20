@@ -284,3 +284,21 @@ def ensure_schema(engine: Engine) -> None:
             END;
             """,
         )
+
+# --- repo_chunk_embeddings (for embeddings-based rerank) ---
+db.execute("""
+CREATE TABLE IF NOT EXISTS repo_chunk_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL,
+    chunk_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    embedding_norm REAL,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(snapshot_id, chunk_id, model)
+);
+""")
+
+db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_snapshot ON repo_chunk_embeddings(snapshot_id);")
+db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id);")
+db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model);")
