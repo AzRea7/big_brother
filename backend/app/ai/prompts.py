@@ -29,58 +29,102 @@ Output format MUST be EXACTLY:
 4) Motivation
 - one sentence
 """
-
-REPO_FINDINGS_SYSTEM = """You are a senior staff software engineer doing a repo triage.
-Return ONLY valid JSON. No markdown. No commentary.
-
-Goal:
-- Identify concrete production blockers + reliability/security gaps + missing pieces.
-- Findings must be actionable and evidenced by the provided snippets.
-
-Rules:
-- Do NOT invent files, endpoints, or libraries not shown.
-- If evidence is weak, lower severity and say so.
-- Prefer high-signal issues: auth gaps, secrets, unsafe defaults, missing retries/timeouts, missing tests/CI gates, no migrations, no observability, broken env wiring, docker/network issues.
-
-Output schema:
-{
-  "findings": [
-    {
-      "category": "security|reliability|performance|correctness|maintainability|observability",
-      "severity": "low|med|high|critical",
-      "title": "short",
-      "file_path": "path or null",
-      "line_start": 1 or null,
-      "line_end": 1 or null,
-      "evidence": "quote or paraphrase of snippet",
-      "recommendation": "what to change",
-      "acceptance": "how we know it's done"
-    }
-  ]
-}
+# -----------------------
+# Repo Finding generation (LLM scan)
+# -----------------------
+REPO_FINDINGS_SYSTEM = """You are a strict code reviewer.
+You must produce actionable, specific findings grounded in the provided code excerpts.
+Avoid generic advice. Cite concrete evidence from the excerpts.
 """
 
-USER_PROMPT_TEMPLATE = """Today is: {today}
-Focus project filter: {focus_project}
+REPO_FINDINGS_USER = """Analyze this repository snapshot excerpt set and produce findings.
 
-Goals for this lane:
-{goals}
-
-Candidate tasks (already pre-ranked by code):
-{tasks}
-
-Hard requirements for Top 3:
-- Only choose tasks that are NOT blocked by dependencies.
-- Prefer tasks with starter + dod + link present (precision fuel).
-- Use starter/dod/link verbatim when available (tighten wording is fine, but keep it concrete).
-- If missing, say "MISSING" and propose the microtask to fill it.
-
-Return ONLY the plan in the required format.
-"""
-
-def repo_findings_user(prompt_context: str) -> str:
-    return f"""Analyze these repo excerpts and produce findings.
+Return JSON as a list of objects with fields:
+- path: string
+- line: integer | null
+- category: string (security|reliability|correctness|observability|maintainability|performance|testing|docs)
+- severity: integer 1-5 (5 = highest)
+- title: string (short)
+- evidence: string (quote or close paraphrase from excerpt)
+- recommendation: string (concrete change)
+- acceptance: string (how to verify)
 
 EXCERPTS:
-{prompt_context}
+{excerpts}
 """
+
+
+def build_repo_findings_prompt(excerpts: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": REPO_FINDINGS_SYSTEM},
+        {"role": "user", "content": REPO_FINDINGS_USER.format(excerpts=excerpts)},
+    ]
+
+
+# -----------------------
+# Repo Tasks generation (LLM "top tasks" scan)
+# -----------------------
+REPO_TASKS_SYSTEM = """You are an engineering manager generating a small set of high-impact tasks.
+Each task must be concrete, testable, and tied to a file path + evidence from the provided excerpts.
+Avoid vague "improve X" language.
+"""
+
+REPO_TASKS_USER = """From these excerpts, propose {count} tasks.
+
+Return JSON list, each item:
+- title
+- notes
+- priority (1-5)
+- estimated_minutes
+- tags (comma-separated)
+- link (repo://... style if possible)
+- starter (2-5 min first action)
+- dod (definition of done)
+
+EXCERPTS:
+{excerpts}
+"""
+
+
+def build_repo_tasks_prompt(excerpts: str, count: int) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": REPO_TASKS_SYSTEM},
+        {"role": "user", "content": REPO_TASKS_USER.format(excerpts=excerpts, count=count)},
+    ]
+
+
+# -----------------------
+# NEW: Finding -> Task enrichment with chunk retrieval
+# -----------------------
+FINDING_TASK_SYSTEM = """You are a senior engineer turning a single code finding into a production-quality task.
+
+Rules:
+- Be specific: reference exact files and what to change.
+- Use the provided code chunks. Do not hallucinate code that is not in chunks.
+- Produce a task that a developer can complete in one sitting.
+- Include a minimal verification step (test, curl, or log evidence).
+"""
+
+FINDING_TASK_USER = """Turn this single finding into a high-quality task.
+
+Return JSON object with:
+- title
+- notes (include: What/Why/How + small checklist)
+- starter (2-5 minute first action)
+- dod (definition of done)
+- priority (1-5)
+- estimated_minutes (15-180)
+
+Finding:
+{finding_json}
+
+Top relevant code chunks (each has path + line range):
+{chunks_text}
+"""
+
+
+def build_finding_task_prompt(finding_json: str, chunks_text: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": FINDING_TASK_SYSTEM},
+        {"role": "user", "content": FINDING_TASK_USER.format(finding_json=finding_json, chunks_text=chunks_text)},
+    ]

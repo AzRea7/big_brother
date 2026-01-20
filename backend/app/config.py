@@ -99,8 +99,8 @@ class Settings(BaseSettings):
     REPO_CHUNK_OVERLAP: int = 25
     REPO_CHUNK_MAX_CHARS: int = 9_000
 
-    REPO_RAG_TOP_K: int = 16
-
+    REPO_RAG_TOP_K: int = 8
+    FINDING_RAG_MAX_CHARS: int = 6_000
     # Optional comma-separated “query seed” phrases to bias retrieval.
     # Example: "auth,db session,fastapi router,github sync,repo pipeline"
     REPO_RAG_QUERY_SEEDS: str = ""

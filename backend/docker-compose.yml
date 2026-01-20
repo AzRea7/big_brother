@@ -1,17 +1,46 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: goal_autopilot_postgres
+    environment:
+      POSTGRES_USER: goal
+      POSTGRES_PASSWORD: goal
+      POSTGRES_DB: goal_autopilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U goal -d goal_autopilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   goal_autopilot:
     build: .
     container_name: goal_autopilot
     env_file:
       - .env
     environment:
+      # Repo sync config (kept from your current compose)
       - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - GITHUB_REPO=AzRea7/OneHaven
-      - GITHUB_BRANCH=main
-      - REPO_LOCAL_PATH=/repos/OneHaven/onehaven
+      - GITHUB_REPO=${GITHUB_REPO:-AzRea7/OneHaven}
+      - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
+      - REPO_LOCAL_PATH=${REPO_LOCAL_PATH:-/repos/OneHaven/onehaven}
+
+      # Prod DB default (override in .env if you want)
+      - DB_URL=${DB_URL:-postgresql+psycopg://goal:goal@postgres:5432/goal_autopilot}
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      # Windows example mount (keep yours, update if your path differs)
       - C:/Users/austin/onehaven:/repos/OneHaven:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  pgdata:
