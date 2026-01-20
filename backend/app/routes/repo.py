@@ -1,8 +1,7 @@
-# backend/app/routes/repo.py
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
@@ -12,10 +11,17 @@ from ..db import get_db
 from ..models import RepoFile, RepoFinding
 from ..services.code_signals import compute_signal_counts_full
 from ..services.github_sync import sync_repo_to_snapshot
+from ..services.metrics import JOBS_TOTAL
+from ..services.ops_gaps import run_ops_gap_scan
+from ..services.security import debug_is_allowed, require_api_key
+from ..services.static_analysis import run_static_analysis_all
+
+# Task conversion (findings -> tasks). This wrapper now prefers "finding-driven retrieval" if available.
+from ..services.repo_taskgen import tasks_from_findings
 
 # NOTE:
 # Your repo_llm_findings file currently exposes async run_llm_scan(db, snapshot_id)
-# but your routes import run_llm_repo_scan. We'll support both:
+# but some older routes import run_llm_repo_scan. We'll support both:
 try:
     from ..services.repo_llm_findings import run_llm_repo_scan  # type: ignore
 except Exception:  # pragma: no cover
@@ -26,18 +32,34 @@ try:
 except Exception:  # pragma: no cover
     run_llm_scan = None  # type: ignore
 
-from ..services.repo_taskgen import tasks_from_findings
-from ..services.security import debug_is_allowed, require_api_key
-from ..services.static_analysis import run_static_analysis_all
-from ..services.ops_gaps import run_ops_gap_scan
-from ..services.metrics import JOBS_TOTAL
+# --- Level 2 RAG (chunks + retrieval) ---
+try:
+    from ..services.repo_taskgen import build_chunks_for_snapshot, search_chunks  # type: ignore
+except Exception:  # pragma: no cover
+    build_chunks_for_snapshot = None  # type: ignore
+    search_chunks = None  # type: ignore
+
+# --- Level 3 PR workflow (optional, gated) ---
+# If you haven't added services/patch_workflow.py yet, these endpoints will return 501-ish errors.
+try:
+    from ..services.patch_workflow import (  # type: ignore
+        validate_unified_diff,
+        apply_unified_diff_in_sandbox,
+        open_pull_request_from_patch_run,
+    )
+except Exception:  # pragma: no cover
+    validate_unified_diff = None  # type: ignore
+    apply_unified_diff_in_sandbox = None  # type: ignore
+    open_pull_request_from_patch_run = None  # type: ignore
 
 router = APIRouter(prefix="/debug/repo", tags=["repo-debug"])
 
 
 def _guard_debug(request: Request) -> None:
+    # "debug routes disappear in prod" safety
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
+    # API key safety
     require_api_key(request)
 
 
@@ -51,9 +73,8 @@ def debug_repo_sync(
     """
     Sync repo content into RepoSnapshot/RepoFile rows.
 
-    IMPORTANT: github_sync.sync_repo_to_snapshot returns a dict DTO:
+    github_sync.sync_repo_to_snapshot returns a dict DTO:
       {snapshot_id, repo, branch, commit_sha, file_count, stored_content_files, warnings}
-    So we return that directly (no .id access).
     """
     _guard_debug(request)
 
@@ -89,7 +110,6 @@ async def debug_repo_scan_llm(
             inserted = int(out.get("inserted", 0))
             total = int(out.get("total_findings", 0))
         elif run_llm_repo_scan is not None:
-            # Older sync API style
             inserted, total = run_llm_repo_scan(db=db, snapshot_id=snapshot_id)  # type: ignore[misc]
         else:
             raise HTTPException(status_code=500, detail="LLM scan function not available.")
@@ -170,7 +190,9 @@ def debug_repo_findings(
             "title": r.title,
             "evidence": r.evidence,
             "recommendation": r.recommendation,
+            "acceptance": getattr(r, "acceptance", None),
             "fingerprint": r.fingerprint,
+            "is_resolved": getattr(r, "is_resolved", False),
         }
         for r in rows
     ]
@@ -185,6 +207,10 @@ def debug_repo_tasks_from_findings(
 ) -> dict[str, Any]:
     """
     Convert findings -> tasks.
+
+    Implementation detail:
+      - The wrapper in services/repo_taskgen.py prefers "finding-driven retrieval" when chunks exist,
+        and falls back to deterministic conversion if anything is missing.
     """
     _guard_debug(request)
     JOBS_TOTAL.labels(job="repo_tasks_from_findings", status="start").inc()
@@ -204,10 +230,9 @@ def debug_repo_signal_counts_full(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """
-    Your existing marker signals (TODO/FIXME/etc) + per-file summary.
+    Marker signals (TODO/FIXME/etc) + per-file summary.
     """
     _guard_debug(request)
-
     files = db.query(RepoFile).filter(RepoFile.snapshot_id == snapshot_id).all()
     return compute_signal_counts_full(files)
 
@@ -230,7 +255,6 @@ def debug_repo_signals_summary(
 
     by_category: dict[str, int] = defaultdict(int)
     by_severity: dict[str, int] = defaultdict(int)
-
     risk_buckets: dict[str, int] = defaultdict(int)
 
     for f in findings:
@@ -270,3 +294,176 @@ def debug_repo_signals_summary(
         "sources": sources,
         "risk_buckets": dict(sorted(risk_buckets.items(), key=lambda kv: kv[1], reverse=True)),
     }
+
+
+# -------------------------------------------------------------------
+# ✅ Level 2 RAG endpoints: chunking + retrieval
+# -------------------------------------------------------------------
+
+@router.post("/chunks/build")
+def debug_repo_chunks_build(
+    request: Request,
+    snapshot_id: int = Query(...),
+    max_lines: int = Query(220, ge=40, le=800),
+    overlap: int = Query(40, ge=0, le=200),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Build RepoChunk rows from RepoFile text content for a snapshot.
+
+    Run this once after /sync, then retrieval + finding-focused taskgen becomes powerful.
+    """
+    _guard_debug(request)
+
+    if build_chunks_for_snapshot is None:
+        raise HTTPException(status_code=500, detail="Chunk builder not available (repo_taskgen missing build_chunks_for_snapshot).")
+
+    JOBS_TOTAL.labels(job="repo_chunks_build", status="start").inc()
+    try:
+        out = build_chunks_for_snapshot(db=db, snapshot_id=snapshot_id, max_lines=max_lines, overlap=overlap)
+        JOBS_TOTAL.labels(job="repo_chunks_build", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_chunks_build", status="error").inc()
+        raise
+
+
+@router.get("/chunks/search")
+def debug_repo_chunks_search(
+    request: Request,
+    snapshot_id: int = Query(...),
+    query: str = Query(..., min_length=2, max_length=400),
+    top_k: int = Query(10, ge=1, le=30),
+    mode: str = Query("auto", pattern="^(auto|fts|embeddings)$"),
+    path_contains: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Search chunks for code context.
+
+    mode:
+      - auto: prefer embeddings if available, otherwise fts
+      - fts: lightweight term scoring (DB-friendly)
+      - embeddings: cosine similarity (only works if your RepoChunk rows have embeddings stored)
+    """
+    _guard_debug(request)
+
+    if search_chunks is None:
+        raise HTTPException(status_code=500, detail="Chunk search not available (repo_taskgen missing search_chunks).")
+
+    JOBS_TOTAL.labels(job="repo_chunks_search", status="start").inc()
+    try:
+        out = search_chunks(
+            db=db,
+            snapshot_id=snapshot_id,
+            query=query,
+            top_k=top_k,
+            mode=mode,
+            path_contains=path_contains,
+        )
+        JOBS_TOTAL.labels(job="repo_chunks_search", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_chunks_search", status="error").inc()
+        raise
+
+
+# -------------------------------------------------------------------
+# ✅ Level 3 PR workflow endpoints (optional, gated)
+# -------------------------------------------------------------------
+
+@router.post("/patch/validate")
+def debug_repo_patch_validate(
+    request: Request,
+    snapshot_id: int = Query(...),
+    db: Session = Depends(get_db),
+    patch_text: str = "",
+) -> dict[str, Any]:
+    """
+    Validate unified diff patch against safety rules.
+
+    NOTE: This is intentionally gated behind debug + API key + (optional) service.
+    """
+    _guard_debug(request)
+
+    if validate_unified_diff is None:
+        raise HTTPException(status_code=501, detail="Patch workflow not wired yet (services/patch_workflow.py missing).")
+
+    JOBS_TOTAL.labels(job="repo_patch_validate", status="start").inc()
+    try:
+        out = validate_unified_diff(db=db, snapshot_id=snapshot_id, patch_text=patch_text)  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_patch_validate", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_patch_validate", status="error").inc()
+        raise
+
+
+@router.post("/patch/apply")
+def debug_repo_patch_apply(
+    request: Request,
+    snapshot_id: int = Query(...),
+    run_tests: bool = Query(True),
+    db: Session = Depends(get_db),
+    patch_text: str = "",
+) -> dict[str, Any]:
+    """
+    Apply patch in sandbox + optionally run tests.
+
+    Requires services/patch_workflow.py
+    """
+    _guard_debug(request)
+
+    if apply_unified_diff_in_sandbox is None:
+        raise HTTPException(status_code=501, detail="Patch workflow not wired yet (services/patch_workflow.py missing).")
+
+    JOBS_TOTAL.labels(job="repo_patch_apply", status="start").inc()
+    try:
+        out = apply_unified_diff_in_sandbox(
+            db=db,
+            snapshot_id=snapshot_id,
+            patch_text=patch_text,
+            run_tests=run_tests,
+        )  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_patch_apply", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_patch_apply", status="error").inc()
+        raise
+
+
+@router.post("/pr/create")
+def debug_repo_pr_create(
+    request: Request,
+    snapshot_id: int = Query(...),
+    patch_run_id: int = Query(...),
+    title: str = Query(..., min_length=4, max_length=300),
+    body: str = Query("", max_length=20_000),
+    base_branch: str = Query("main", max_length=120),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Create a PR from a validated/applied patch run.
+
+    Requires services/patch_workflow.py (and GitHub credentials in settings).
+    """
+    _guard_debug(request)
+
+    if open_pull_request_from_patch_run is None:
+        raise HTTPException(status_code=501, detail="PR workflow not wired yet (services/patch_workflow.py missing).")
+
+    JOBS_TOTAL.labels(job="repo_pr_create", status="start").inc()
+    try:
+        out = open_pull_request_from_patch_run(
+            db=db,
+            snapshot_id=snapshot_id,
+            patch_run_id=patch_run_id,
+            title=title,
+            body=body,
+            base_branch=base_branch,
+        )  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_create", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_create", status="error").inc()
+        raise

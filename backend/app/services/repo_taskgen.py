@@ -1,16 +1,16 @@
-# backend/app/services/repo_taskgen.py
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import RepoFile, RepoSnapshot, Task
+from ..models import RepoChunk, RepoFile, RepoFinding, RepoSnapshot, Task
 
 # --- Import compatibility (repo evolves; keep this file resilient) ---
 # We want ONE canonical signal counter used everywhere.
@@ -25,7 +25,6 @@ try:
     # LLM task generator (JSON schema: {"tasks":[...]}), contains bounded prompt builder.
     from ..ai.repo_tasks import generate_repo_tasks_json  # type: ignore
 except Exception:  # pragma: no cover
-    # If you ever moved it elsewhere, patch the import here.
     from ..ai.repo_tasks import generate_repo_tasks_json  # type: ignore
 
 
@@ -33,19 +32,15 @@ except Exception:  # pragma: no cover
 # Deterministic fallback (only used if LLM fails)
 # -------------------------
 
-# Classic markers + broadened set.
 _FALLBACK_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG|NOTE)\b[:\-\s]*(.*)", re.IGNORECASE)
 
-# NOTE is usually documentation. Only convert to tasks if it looks actionable.
 _ACTION_WORDS_RE = re.compile(
     r"\b(should|must|need|needs|fix|implement|add|remove|refactor|rename|handle|support|validate|sanitize|secure|test)\b",
     re.IGNORECASE,
 )
 
-# Skip messages that are basically punctuation/quotes/etc. (prevents NOTE: "," garbage).
 _GARBAGE_RE = re.compile(r"^[\s\"',.:;()\[\]{}<>/\\-]*$")
 
-# Order fallback results by severity/importance.
 _KIND_SCORE = {"BUG": 100, "FIXME": 90, "HACK": 80, "XXX": 70, "TODO": 60, "NOTE": 10}
 
 
@@ -62,40 +57,28 @@ class SuggestedTask:
     dod: str | None = None
 
 
+# -------------------------
+# Repo links
+# -------------------------
+
 def _repo_link(snapshot: RepoSnapshot, path: str, line: int | None = None) -> str:
     base = f"repo://{snapshot.repo}?branch={snapshot.branch}&commit_sha={snapshot.commit_sha or ''}"
     return f"{base}#{path}:L{line}" if line is not None else f"{base}#{path}"
 
 
 # -------------------------
-# Public: signal counts (used by routes + prompt builder)
+# Signal counts (used by routes + prompt builder)
 # -------------------------
 
 def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, int]:
-    """
-    Backwards-compatible DB-based signal counter.
-
-    Routes import compute_signal_counts(db, snapshot_id).
-    Internally we delegate to compute_signal_counts_for_files to avoid duplicated logic.
-    """
     files = db.scalars(select(RepoFile).where(RepoFile.snapshot_id == snapshot_id)).all()
     return compute_signal_counts_for_files(files)
 
 
 def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
-    """
-    Produces file-level counts for both:
-      - classic TODO/FIXME/HACK/etc.
-      - production signals (auth/timeout/retry/rate_limit/validation/logging/metrics/db/tests/etc.)
-
-    Design choice:
-      - These are "files_with_X" counts (not total matches) because it's stable and
-        helps ranking/snapshot selection without being skewed by long files.
-    """
     total = len(files)
 
     files_with: dict[str, int] = {
-        # classic marker files-with
         "todo": 0,
         "fixme": 0,
         "hack": 0,
@@ -103,7 +86,6 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         "bug": 0,
         "note": 0,
         "dotdotdot": 0,
-        # production signal files-with
         "auth": 0,
         "timeout": 0,
         "retry": 0,
@@ -184,7 +166,6 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         if sig.get("csrf_signal", 0) > 0:
             files_with["csrf"] += 1
 
-        # Implementation stubs / "unfinished" signals
         if any(x in text for x in ("raise NotImplementedError", "IMPLEMENT", "stub", "pass  #")):
             impl += 1
 
@@ -198,7 +179,6 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         "files_with_note": files_with["note"],
         "files_with_dotdotdot": files_with["dotdotdot"],
         "files_with_impl_signals": impl,
-        # production-grade rollups
         "files_with_auth": files_with["auth"],
         "files_with_timeout": files_with["timeout"],
         "files_with_retry": files_with["retry"],
@@ -216,6 +196,278 @@ def compute_signal_counts_for_files(files: list[RepoFile]) -> dict[str, int]:
         "files_with_cors": files_with["cors"],
         "files_with_csrf": files_with["csrf"],
     }
+
+
+# -------------------------
+# ✅ Level 2 RAG: chunk builder
+# -------------------------
+
+def _iter_line_chunks(lines: list[str], max_lines: int, overlap: int) -> Iterable[tuple[int, int, str]]:
+    """
+    Yields (start_line, end_line, chunk_text) with overlap, 1-indexed line numbers.
+    """
+    if max_lines <= 0:
+        max_lines = 220
+    if overlap < 0:
+        overlap = 0
+    if overlap >= max_lines:
+        overlap = max_lines // 4
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        start = i
+        end = min(n, i + max_lines)
+        chunk = "\n".join(lines[start:end])
+        yield (start + 1, end, chunk)
+        if end >= n:
+            break
+        i = max(0, end - overlap)
+
+
+def build_chunks_for_snapshot(
+    db: Session,
+    snapshot_id: int,
+    *,
+    max_lines: int = 220,
+    overlap: int = 40,
+) -> dict[str, Any]:
+    """
+    Builds RepoChunk rows from RepoFile content for the snapshot.
+
+    Safe behavior:
+      - deletes existing chunks for snapshot, then rebuilds deterministically
+      - only chunks files where content_kind == "text"
+    """
+    snap = db.get(RepoSnapshot, snapshot_id)
+    if not snap:
+        return {"snapshot_id": snapshot_id, "inserted": 0, "deleted": 0, "files": 0}
+
+    deleted = db.execute(delete(RepoChunk).where(RepoChunk.snapshot_id == snapshot_id)).rowcount or 0
+
+    files = db.scalars(
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot_id)
+        .where(RepoFile.content_kind == "text")
+    ).all()
+
+    inserted = 0
+    for f in files:
+        text = (getattr(f, "content_text", None) or f.content or "")
+        if not text:
+            continue
+        lines = text.splitlines()
+        if not lines:
+            continue
+
+        for start_line, end_line, chunk_text in _iter_line_chunks(lines, max_lines=max_lines, overlap=overlap):
+            if not chunk_text.strip():
+                continue
+            db.add(
+                RepoChunk(
+                    snapshot_id=snapshot_id,
+                    path=f.path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    chunk_text=chunk_text,
+                    symbols_json=None,
+                )
+            )
+            inserted += 1
+
+    db.commit()
+    return {
+        "snapshot_id": snapshot_id,
+        "deleted": deleted,
+        "inserted": inserted,
+        "files": len(files),
+        "max_lines": max_lines,
+        "overlap": overlap,
+    }
+
+
+# -------------------------
+# ✅ Level 2 RAG: retrieval (FTS + optional embeddings)
+# -------------------------
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
+
+
+def _tokenize(q: str) -> list[str]:
+    return [t.lower() for t in _WORD_RE.findall(q or "")][:24]
+
+
+def _fts_score(text: str, tokens: list[str]) -> float:
+    """
+    Lightweight scoring:
+      - counts token occurrences
+      - small bonus if tokens appear early
+    """
+    if not text or not tokens:
+        return 0.0
+    t = text.lower()
+    score = 0.0
+    for tok in tokens:
+        c = t.count(tok)
+        if c:
+            score += 1.0 + min(3.0, float(c))  # cap per token
+            first = t.find(tok)
+            if 0 <= first < 200:
+                score += 0.5
+            if 0 <= first < 80:
+                score += 0.5
+    return score
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _chunk_has_embedding(c: RepoChunk) -> bool:
+    """
+    Embeddings are optional. If you later add RepoChunk.embedding_json or RepoChunk.embedding,
+    this will start working automatically.
+    """
+    return bool(getattr(c, "embedding_json", None) or getattr(c, "embedding", None))
+
+
+def _get_chunk_embedding(c: RepoChunk) -> Optional[list[float]]:
+    raw = getattr(c, "embedding_json", None)
+    if raw:
+        try:
+            v = json.loads(raw)
+            if isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                return [float(x) for x in v]
+        except Exception:
+            return None
+    raw2 = getattr(c, "embedding", None)
+    if isinstance(raw2, list) and raw2 and isinstance(raw2[0], (int, float)):
+        return [float(x) for x in raw2]
+    return None
+
+
+def _embed_query_optional(query: str) -> Optional[list[float]]:
+    """
+    Optional query embedding hook.
+
+    If you already added a real embedding service elsewhere, wire it by setting:
+      - settings.EMBEDDINGS_ENABLED = true
+      - and providing a function in backend/app/ai/embeddings.py: embed_text(query)->list[float]
+
+    This file won’t crash if you haven't added it; it simply falls back to FTS.
+    """
+    if not bool(getattr(settings, "EMBEDDINGS_ENABLED", False)):
+        return None
+
+    try:
+        from ..ai.embeddings import embed_text  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        v = embed_text(query)  # type: ignore[misc]
+        if isinstance(v, list) and v and isinstance(v[0], (int, float)):
+            return [float(x) for x in v]
+    except Exception:
+        return None
+    return None
+
+
+def search_chunks(
+    db: Session,
+    snapshot_id: int,
+    *,
+    query: str,
+    top_k: int = 10,
+    mode: str = "auto",
+    path_contains: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Returns:
+      {
+        snapshot_id, query, mode_used,
+        results: [{id,path,start_line,end_line,chunk_text,symbols_json}, ...]
+      }
+    """
+    snap = db.get(RepoSnapshot, snapshot_id)
+    if not snap:
+        return {"snapshot_id": snapshot_id, "query": query, "mode_used": "none", "results": []}
+
+    q = (query or "").strip()
+    if len(q) < 2:
+        return {"snapshot_id": snapshot_id, "query": query, "mode_used": "none", "results": []}
+
+    top_k = max(1, min(int(top_k), 30))
+
+    stmt = select(RepoChunk).where(RepoChunk.snapshot_id == snapshot_id)
+    if path_contains:
+        stmt = stmt.where(RepoChunk.path.ilike(f"%{path_contains}%"))  # type: ignore[attr-defined]
+
+    chunks = db.scalars(stmt).all()
+    if not chunks:
+        return {"snapshot_id": snapshot_id, "query": query, "mode_used": "none", "results": []}
+
+    tokens = _tokenize(q)
+
+    # Decide mode
+    mode_used = mode
+    query_vec: Optional[list[float]] = None
+    if mode == "auto":
+        # Only use embeddings if both (a) you enabled embeddings and (b) chunks actually have embeddings stored.
+        if bool(getattr(settings, "EMBEDDINGS_ENABLED", False)) and any(_chunk_has_embedding(c) for c in chunks):
+            query_vec = _embed_query_optional(q)
+            if query_vec is not None:
+                mode_used = "embeddings"
+            else:
+                mode_used = "fts"
+        else:
+            mode_used = "fts"
+
+    if mode == "embeddings":
+        query_vec = _embed_query_optional(q)
+        if query_vec is None:
+            mode_used = "fts"
+
+    scored: list[tuple[float, RepoChunk]] = []
+
+    if mode_used == "embeddings" and query_vec is not None:
+        for c in chunks:
+            v = _get_chunk_embedding(c)
+            if v is None or len(v) != len(query_vec):
+                continue
+            scored.append((_cosine(query_vec, v), c))
+    else:
+        for c in chunks:
+            scored.append((_fts_score(c.chunk_text, tokens), c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    picked = [c for s, c in scored[:top_k] if s > 0.0] or [c for _, c in scored[:top_k]]
+
+    results = [
+        {
+            "id": c.id,
+            "snapshot_id": c.snapshot_id,
+            "path": c.path,
+            "start_line": c.start_line,
+            "end_line": c.end_line,
+            "chunk_text": c.chunk_text,
+            "symbols_json": getattr(c, "symbols_json", None),
+        }
+        for c in picked
+    ]
+
+    return {"snapshot_id": snapshot_id, "query": query, "mode_used": mode_used, "results": results}
 
 
 # -------------------------
@@ -266,22 +518,8 @@ def _blocks_for_kind(kind: str) -> bool:
     return kind.upper() in ("BUG", "FIXME", "HACK")
 
 
-# -------------------------
-# Robust JSON extraction (guards against fenced/non-JSON responses)
-# -------------------------
-
-def _extract_json_object_lenient(raw: str) -> dict[str, Any]:
-    s = (raw or "").strip()
-    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*```$", "", s)
-
-    first = s.find("{")
-    last = s.rfind("}")
-    if first == -1 or last == -1 or last <= first:
-        raise ValueError(f"No JSON object found in response. First 400 chars: {raw[:400]}")
-
-    candidate = s[first : last + 1]
-    return json.loads(candidate)
+def _task_key(title: str, link: str | None) -> str:
+    return (title or "").strip().lower() + "|" + (link or "")
 
 
 # -------------------------
@@ -387,70 +625,113 @@ def _suggest_tasks_from_signals(db: Session, snapshot_id: int, project: str, lim
 
 
 # -------------------------
-# LLM task generation (bounded + tolerant parsing)
+# ✅ NEW: Finding-driven retrieval → LLM prompt
 # -------------------------
 
-def _signal_strength(sig: dict[str, Any]) -> int:
-    strength = 0
-    strength += 12 * int(sig.get("fixme_count", 0))
-    strength += 12 * int(sig.get("bug_count", 0))
-    strength += 10 * int(sig.get("hack_count", 0))
-    strength += 8 * int(sig.get("xxx_count", 0))
-    strength += 6 * int(sig.get("todo_count", 0))
-    strength += 2 * int(sig.get("note_count", 0))
-    strength += 4 * int(sig.get("dotdotdot_count", 0))
-
-    strength += 8 * int(sig.get("auth_signal", 0))
-    strength += 6 * int(sig.get("timeout_signal", 0))
-    strength += 6 * int(sig.get("retry_signal", 0))
-    strength += 6 * int(sig.get("rate_limit_signal", 0))
-    strength += 6 * int(sig.get("input_validation_signal", 0))
-    strength += 4 * int(sig.get("logging_signal", 0))
-    strength += 4 * int(sig.get("metrics_signal", 0))
-    strength += 5 * int(sig.get("db_signal", 0))
-    strength += 4 * int(sig.get("tests_signal", 0))
-    strength += 4 * int(sig.get("ci_signal", 0))
-    strength += 3 * int(sig.get("docker_signal", 0))
-    strength += 3 * int(sig.get("config_signal", 0))
-    strength += 6 * int(sig.get("secrets_signal", 0))
-    strength += 4 * int(sig.get("nplus1_signal", 0))
-    strength += 4 * int(sig.get("cors_signal", 0))
-    strength += 4 * int(sig.get("csrf_signal", 0))
-    return strength
+def _finding_query(f: RepoFinding) -> str:
+    """
+    Turn a finding into a retrieval query.
+    """
+    parts = [
+        f.title or "",
+        f.category or "",
+        f.path or "",
+        (f.evidence or "")[:180],
+        (f.recommendation or "")[:180],
+    ]
+    q = " ".join(p for p in parts if p).strip()
+    return q[:600]
 
 
-async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], project: str) -> list[SuggestedTask]:
+def _format_finding_block(f: RepoFinding) -> str:
+    return (
+        f"[FINDING]\n"
+        f"id={f.id} severity={f.severity} category={f.category}\n"
+        f"path={f.path} line={f.line}\n"
+        f"title={f.title}\n"
+        f"evidence={(f.evidence or '')[:400]}\n"
+        f"recommendation={(f.recommendation or '')[:400]}\n"
+        f"acceptance={(getattr(f, 'acceptance', None) or '')[:300]}\n"
+    )
+
+
+async def _llm_generate_tasks_from_findings_with_retrieval(
+    db: Session,
+    snapshot: RepoSnapshot,
+    *,
+    project: str,
+    max_findings: int = 10,
+    chunks_per_finding: int = 3,
+) -> list[SuggestedTask]:
+    """
+    Generates tasks using:
+      findings → query → retrieve chunks → send excerpts to LLM
+
+    Important: this uses your existing generate_repo_tasks_json() contract by creating
+    synthetic "file_summaries" with excerpt text drawn from chunks.
+
+    If chunks do not exist yet, it raises and caller will fall back cleanly.
+    """
     if not getattr(settings, "LLM_ENABLED", False):
         return []
     if not getattr(settings, "OPENAI_MODEL", None):
         return []
 
-    max_files = int(getattr(settings, "REPO_PROMPT_MAX_FILES", 60))
-    excerpt_chars = int(getattr(settings, "REPO_PROMPT_EXCERPT_CHARS", 1200))
+    # We need chunks to exist for RAG.
+    chunk_count = db.scalar(select(RepoChunk.id).where(RepoChunk.snapshot_id == snapshot.id).limit(1))
+    if chunk_count is None:
+        raise RuntimeError("No RepoChunk rows found. Run /debug/repo/chunks/build first.")
 
+    findings = db.scalars(
+        select(RepoFinding)
+        .where(RepoFinding.snapshot_id == snapshot.id)
+        .where(RepoFinding.is_resolved == False)  # noqa: E712
+        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+        .limit(max_findings)
+    ).all()
+
+    if not findings:
+        return []
+
+    # Build synthetic evidence “files”
     file_summaries: list[dict[str, Any]] = []
-    for f in files:
-        if f.content_kind != "text":
-            continue
-        text = (getattr(f, "content_text", None) or f.content or "")
-        if not text:
-            continue
-
-        sig = count_markers_in_text(text)
-        file_summaries.append(
-            {
-                "path": f.path,
-                "excerpt": text[:excerpt_chars],
-                **sig,
-                "_strength": _signal_strength(sig),
-            }
+    for f in findings:
+        q = _finding_query(f)
+        search = search_chunks(
+            db=db,
+            snapshot_id=snapshot.id,
+            query=q,
+            top_k=chunks_per_finding,
+            mode="auto",
+            path_contains=f.path,  # keep it scoped unless path is empty
         )
+        chunks = search.get("results", []) or []
+        if not chunks:
+            # Try a second time without path constraint
+            search = search_chunks(db=db, snapshot_id=snapshot.id, query=q, top_k=chunks_per_finding, mode="auto")
+            chunks = search.get("results", []) or []
 
-    file_summaries.sort(key=lambda d: int(d.get("_strength", 0)), reverse=True)
-    file_summaries = file_summaries[:max_files]
-    for d in file_summaries:
-        d.pop("_strength", None)
+        finding_header = _format_finding_block(f)
 
+        for c in chunks:
+            excerpt = f"{finding_header}\n[CODE_CHUNK]\npath={c.get('path')} lines={c.get('start_line')}-{c.get('end_line')}\n{c.get('chunk_text','')}"
+            excerpt = excerpt[: int(getattr(settings, "REPO_TASK_EXCERPT_CHARS", 1200))]
+
+            sig = count_markers_in_text(excerpt)
+            file_summaries.append(
+                {
+                    "path": str(c.get("path") or f.path or "unknown"),
+                    "excerpt": excerpt,
+                    **sig,
+                }
+            )
+
+    # Also provide global signal counts (stable)
+    files = db.scalars(
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot.id)
+        .where(RepoFile.content_kind == "text")
+    ).all()
     signal_counts = compute_signal_counts_for_files(files)
 
     raw = await generate_repo_tasks_json(
@@ -462,16 +743,16 @@ async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], pro
         file_summaries=file_summaries,
     )
 
+    # generate_repo_tasks_json returns dict; if it ever returns str, handle leniently
     if isinstance(raw, str):
-        raw = _extract_json_object_lenient(raw)
+        raw = json.loads(raw)
 
-    tasks: list[SuggestedTask] = []
+    out: list[SuggestedTask] = []
     for t in (raw or {}).get("tasks", []):
         path = str(t.get("path") or "").strip() or "unknown"
         line = t.get("line")
         link = _repo_link(snapshot, path, int(line) if isinstance(line, int) else None)
-
-        tasks.append(
+        out.append(
             SuggestedTask(
                 title=str(t.get("title", "")).strip()[:240] or "Untitled repo task",
                 notes=str(t.get("notes", "")).strip(),
@@ -486,46 +767,27 @@ async def _llm_generate_tasks(snapshot: RepoSnapshot, files: list[RepoFile], pro
                 dod=str(t.get("dod", "")).strip() or None,
             )
         )
-
-    return tasks
+    return out
 
 
 # -------------------------
-# Materialization (DB writes + dedupe)
+# DB materialization helpers
 # -------------------------
 
-def _task_key(title: str, link: str | None) -> str:
-    return (title or "").strip().lower() + "|" + (link or "")
-
-
-async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: str = "haven") -> tuple[int, int]:
-    snap = db.get(RepoSnapshot, snapshot_id)
-    if not snap:
-        return 0, 0
-
-    files = db.scalars(
-        select(RepoFile)
-        .where(RepoFile.snapshot_id == snapshot_id)
-        .where(RepoFile.content_kind == "text")
-    ).all()
-
-    suggestions: list[SuggestedTask] = []
-    if getattr(settings, "LLM_ENABLED", False):
-        try:
-            suggestions = await _llm_generate_tasks(snap, files, project=project)
-        except Exception:
-            suggestions = []
-
-    if not suggestions:
-        suggestions = _suggest_tasks_from_signals(db, snapshot_id=snapshot_id, project=project, limit=25)
-
+def _write_tasks_deduped(
+    db: Session,
+    *,
+    snapshot: RepoSnapshot,
+    project: str,
+    suggestions: list[SuggestedTask],
+    limit: int,
+) -> tuple[int, int]:
     existing = db.scalars(select(Task).where(Task.project == project)).all()
     existing_keys = {_task_key(t.title or "", t.link) for t in existing}
 
     created = 0
     skipped = 0
 
-    limit = int(getattr(settings, "REPO_TASK_COUNT", 8))
     for s in suggestions[:limit]:
         key = _task_key(s.title, s.link)
         if key in existing_keys:
@@ -555,20 +817,66 @@ async def generate_tasks_from_snapshot(db: Session, snapshot_id: int, project: s
 
 
 # -------------------------
-# NEW: Compatibility entrypoint expected by routes/repo.py
+# Compatibility entrypoint expected by routes/repo.py
 # -------------------------
 
 def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
     """
-    routes/repo.py imports:
-        from ..services.repo_taskgen import tasks_from_findings
-
-    But the actual canonical implementation (deterministic conversion of RepoFinding -> Task)
-    lives in services/repo_llm_findings.py.
-
-    We keep this wrapper so refactors don't break imports again.
+    Preferred behavior:
+      1) If LLM enabled AND chunks exist → generate tasks using finding-driven retrieval (better tasks).
+      2) Otherwise → fall back to canonical deterministic conversion (repo_llm_findings.tasks_from_findings)
     """
-    # Import inside function to avoid circular imports during app startup.
+    snap = db.get(RepoSnapshot, snapshot_id)
+    if not snap:
+        return {"snapshot_id": snapshot_id, "count": 0, "created": 0, "skipped": 0, "mode": "missing_snapshot"}
+
+    # Try new retrieval-driven mode first (best quality)
+    suggestions: list[SuggestedTask] = []
+    mode_used = "fallback"
+
+    if bool(getattr(settings, "LLM_ENABLED", False)) and bool(getattr(settings, "OPENAI_MODEL", None)):
+        try:
+            # NOTE: sync endpoint; we run async LLM in a simple event loop-less way by delegating to repo_llm_findings fallback
+            # if environment doesn't support await here.
+            #
+            # If your FastAPI is async-friendly and you want true async all the way, you can move this call to an async route.
+            import asyncio  # local import avoids global dependency issues
+
+            suggestions = asyncio.run(
+                _llm_generate_tasks_from_findings_with_retrieval(
+                    db=db,
+                    snapshot=snap,
+                    project=project,
+                    max_findings=int(getattr(settings, "REPO_TASK_FINDINGS_MAX", 10)),
+                    chunks_per_finding=int(getattr(settings, "REPO_TASK_CHUNKS_PER_FINDING", 3)),
+                )
+            )
+            if suggestions:
+                mode_used = "findings_rag_llm"
+        except Exception:
+            suggestions = []
+
+    if suggestions:
+        limit = int(getattr(settings, "REPO_TASK_COUNT", 8))
+        created, skipped = _write_tasks_deduped(
+            db=db,
+            snapshot=snap,
+            project=project,
+            suggestions=suggestions,
+            limit=limit,
+        )
+        return {
+            "snapshot_id": snapshot_id,
+            "count": len(suggestions),
+            "created": created,
+            "skipped": skipped,
+            "mode": mode_used,
+        }
+
+    # Fall back to canonical implementation (your existing stable conversion)
     from .repo_llm_findings import tasks_from_findings as _impl  # type: ignore
 
-    return _impl(db=db, snapshot_id=snapshot_id, project=project)
+    out = _impl(db=db, snapshot_id=snapshot_id, project=project)
+    if isinstance(out, dict):
+        out.setdefault("mode", "repo_llm_findings_fallback")
+    return out

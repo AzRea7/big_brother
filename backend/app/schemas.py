@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel, Field
 
@@ -110,6 +110,92 @@ class RepoSyncOut(BaseModel):
 class RepoSignalCountsOut(BaseModel):
     snapshot_id: int
     signals: dict[str, int]
+
+
+class RepoSnapshotOut(BaseModel):
+    id: int
+    repo: str
+    branch: str
+    commit_sha: Optional[str]
+    file_count: int
+    stored_content_files: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RepoChunkOut(BaseModel):
+    id: int
+    snapshot_id: int
+    path: str
+    start_line: int
+    end_line: int
+    chunk_text: str
+    symbols_json: Optional[str] = None
+    score: Optional[float] = None  # bm25 rank or cosine similarity score depending on mode
+
+    class Config:
+        from_attributes = True
+
+
+class ChunkSearchRequest(BaseModel):
+    snapshot_id: int
+    query: str
+    top_k: int = Field(default=10, ge=1, le=30)
+    mode: str = Field(default="auto", description="auto|fts|embeddings")
+    path_contains: Optional[str] = None
+
+
+class ChunkSearchResponse(BaseModel):
+    snapshot_id: int
+    query: str
+    mode_used: str
+    results: List[RepoChunkOut]
+
+
+# ---- PR workflow ----
+class PatchValidateRequest(BaseModel):
+    patch_text: str
+    snapshot_id: int
+
+
+class PatchValidateResponse(BaseModel):
+    valid: bool
+    error: Optional[str] = None
+    files_changed: int = 0
+    lines_changed: int = 0
+
+
+class PatchApplyRequest(BaseModel):
+    snapshot_id: int
+    patch_text: str
+    run_tests: bool = True
+
+
+class PatchApplyResponse(BaseModel):
+    run_id: int
+    valid: bool
+    validation_error: Optional[str]
+    applied: bool
+    apply_error: Optional[str]
+    tests_ran: bool
+    tests_ok: bool
+    test_output: Optional[str]
+
+
+class PatchOpenPRRequest(BaseModel):
+    run_id: int
+    title: str = Field(min_length=4, max_length=300)
+    body: Optional[str] = None
+    base_branch: Optional[str] = None  # default: snapshot.branch
+
+
+class PatchOpenPRResponse(BaseModel):
+    ok: bool
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    error: Optional[str] = None
 
 
 class RepoFindingOut(BaseModel):

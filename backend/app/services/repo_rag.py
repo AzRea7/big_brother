@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RepoChunk, RepoFile
+from .repo_embeddings import embed_texts, loads_embedding, cosine_similarity
 
 
 # -----------------------
@@ -67,6 +68,24 @@ def _line_chunks(lines: list[str], chunk_lines: int, overlap: int) -> Iterable[t
             break
         start += step
 
+def _simple_keyword_score(text: str, q_terms: List[str]) -> float:
+    """
+    Cheap relevance scoring for FTS-like behavior without needing SQLite FTS tables.
+    """
+    t = text.lower()
+    score = 0.0
+    for term in q_terms:
+        if not term:
+            continue
+        # count occurrences (cheap)
+        score += float(t.count(term))
+    return score
+
+
+def _tokenize(q: str) -> List[str]:
+    q = (q or "").strip().lower()
+    parts = [p for p in q.replace("/", " ").replace(":", " ").split() if len(p) >= 2]
+    return parts[:20]
 
 def _truncate(s: str, max_chars: int) -> str:
     if max_chars <= 0:
@@ -138,81 +157,65 @@ def _sqlite_fts_available(db: Session) -> bool:
         return False
 
 
-def search_chunks(
+async def search_chunks(
     db: Session,
     snapshot_id: int,
     query: str,
-    top_k: int = 12,
-    prefer_path: str | None = None,
-) -> List[ChunkHit]:
+    top_k: int = 10,
+    mode: str = "auto",
+    path_contains: Optional[str] = None,
+) -> Tuple[str, List[RepoChunk]]:
     """
-    Retrieve top-k chunks for snapshot_id using SQLite FTS5 when available.
-    If FTS table is absent (or non-sqlite), falls back to LIKE query.
+    Returns (mode_used, chunks)
+    mode: auto|fts|embeddings
     """
-    query = (query or "").strip()
-    if not query:
-        return []
+    top_k = max(1, min(int(top_k), settings.RAG_MAX_TOP_K))
+    mode = (mode or "auto").lower().strip()
 
-    top_k = max(1, min(50, top_k))
+    # base query
+    q = db.query(RepoChunk).filter(RepoChunk.snapshot_id == snapshot_id)
+    if path_contains:
+        q = q.filter(RepoChunk.path.contains(path_contains))
 
-    # ---- FTS path (SQLite only, when available) ----
-    if settings.DB_URL.startswith("sqlite") and _sqlite_fts_available(db):
-        # Join repo_chunks_fts(rowid) -> repo_chunks(id) and filter snapshot_id
-        # bm25() is available in FTS5; lower is "better". We'll keep it as score.
-        sql = text(
-            """
-            SELECT
-              c.id AS id,
-              c.path AS path,
-              c.start_line AS start_line,
-              c.end_line AS end_line,
-              bm25(repo_chunks_fts) AS score,
-              c.chunk_text AS chunk_text
-            FROM repo_chunks_fts
-            JOIN repo_chunks c ON c.id = repo_chunks_fts.rowid
-            WHERE c.snapshot_id = :snapshot_id
-              AND repo_chunks_fts MATCH :q
-            ORDER BY score ASC
-            LIMIT :k
-            """
-        )
-        rows = db.execute(sql, {"snapshot_id": snapshot_id, "q": query, "k": top_k}).fetchall()
-        hits = [
-            ChunkHit(
-                id=int(r[0]),
-                path=str(r[1]),
-                start_line=int(r[2]),
-                end_line=int(r[3]),
-                score=float(r[4]) if r[4] is not None else None,
-                chunk_text=str(r[5]),
-            )
-            for r in rows
-        ]
-    else:
-        # ---- Fallback: naive LIKE ----
-        like = f"%{query}%"
-        rows = (
-            db.query(RepoChunk)
-            .filter(RepoChunk.snapshot_id == snapshot_id)
-            .filter(RepoChunk.chunk_text.ilike(like))
-            .limit(top_k)
-            .all()
-        )
-        hits = [
-            ChunkHit(
-                id=c.id,
-                path=c.path,
-                start_line=c.start_line,
-                end_line=c.end_line,
-                score=None,
-                chunk_text=c.chunk_text,
-            )
-            for c in rows
-        ]
+    # pull candidates (cap for safety)
+    candidates = q.order_by(RepoChunk.id.asc()).limit(2000).all()
 
-    # Optional: prefer chunks from a specific path (finding.path)
-    if prefer_path:
-        prefer_path = prefer_path.strip()
-        hits.sort(key=lambda h: (0 if h.path == prefer_path else 1, h.score if h.score is not None else 999999.0))
+    if mode == "embeddings" or (mode == "auto" and settings.EMBEDDINGS_PROVIDER.lower() != "off"):
+        # require embeddings exist on rows
+        emb_rows = [c for c in candidates if c.embedding_json]
+        if emb_rows:
+            qvec = (await embed_texts([query]))[0]
+            qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
 
-    return hits
+            scored: List[Tuple[float, RepoChunk]] = []
+            for c in emb_rows:
+                vec = loads_embedding(c.embedding_json or "[]")
+                # we stored scaled int norms; recover approximate norm:
+                cnorm = None
+                if c.embedding_norm:
+                    cnorm = float(c.embedding_norm) / 1_000_000.0
+                s = cosine_similarity(qvec, vec, a_norm=qnorm, b_norm=cnorm)
+                scored.append((s, c))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return "embeddings", [c for _, c in scored[:top_k]]
+
+        # fallback if no embeddings present
+        if mode == "embeddings":
+            return "fts", _fts_fallback(candidates, query, top_k)
+
+    # default: fts-like fallback
+    return "fts", _fts_fallback(candidates, query, top_k)
+
+
+def _fts_fallback(candidates: List[RepoChunk], query: str, top_k: int) -> List[RepoChunk]:
+    terms = _tokenize(query)
+    scored = []
+    for c in candidates:
+        scored.append((_simple_keyword_score(c.chunk_text, terms), c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # filter out pure zeros unless we’d return nothing
+    nonzero = [c for s, c in scored if s > 0.0]
+    if nonzero:
+        return nonzero[:top_k]
+    return [c for _, c in scored[:top_k]]

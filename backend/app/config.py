@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, List, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -21,10 +21,10 @@ class Settings(BaseSettings):
 
     DB_URL: str = "sqlite:///./data/app.db"
 
+    # Auth
     API_KEY: str = "change-me"
-    # If true, /debug endpoints are disabled unless ENV=dev
-    DISABLE_DEBUG_IN_PROD: bool = True
     ENV: str = "dev"  # dev | prod | ci
+    DISABLE_DEBUG_IN_PROD: bool = True
 
     ENABLE_METRICS: bool = True
 
@@ -104,6 +104,30 @@ class Settings(BaseSettings):
     # Optional comma-separated “query seed” phrases to bias retrieval.
     # Example: "auth,db session,fastapi router,github sync,repo pipeline"
     REPO_RAG_QUERY_SEEDS: str = ""
+
+    EMBEDDINGS_PROVIDER: str = "off"
+    EMBEDDINGS_MODEL: str = "text-embedding-3-small"
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+
+    # If true, chunk build will attempt to embed chunks too.
+    EMBED_CHUNKS_ON_BUILD: bool = False
+
+    # --- PR workflow (Level 3) ---
+    ENABLE_PR_WORKFLOW: bool = False
+
+    # Paths allowed to be modified by PR workflow (relative to repo root)
+    PR_ALLOWLIST_DIRS: List[str] = Field(
+        default_factory=lambda: ["backend/", "onehaven/backend/"]
+    )
+
+    # Hard caps so you don’t nuke the repo by accident
+    PR_MAX_FILES_CHANGED: int = 8
+    PR_MAX_LINES_CHANGED: int = 400
+
+    # Patch application/test settings
+    PR_TEST_CMD: str = "pytest -q"
+    PR_TIMEOUT_SECONDS: int = 900
 
 
     GITHUB_EXCLUDE_PREFIXES: list[str] = [
