@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -68,16 +68,16 @@ def _line_chunks(lines: list[str], chunk_lines: int, overlap: int) -> Iterable[t
             break
         start += step
 
+
 def _simple_keyword_score(text: str, q_terms: List[str]) -> float:
     """
     Cheap relevance scoring for FTS-like behavior without needing SQLite FTS tables.
     """
-    t = text.lower()
+    t = (text or "").lower()
     score = 0.0
     for term in q_terms:
         if not term:
             continue
-        # count occurrences (cheap)
         score += float(t.count(term))
     return score
 
@@ -86,6 +86,7 @@ def _tokenize(q: str) -> List[str]:
     q = (q or "").strip().lower()
     parts = [p for p in q.replace("/", " ").replace(":", " ").split() if len(p) >= 2]
     return parts[:20]
+
 
 def _truncate(s: str, max_chars: int) -> str:
     if max_chars <= 0:
@@ -98,7 +99,6 @@ def _truncate(s: str, max_chars: int) -> str:
 def chunk_snapshot(db: Session, snapshot_id: int, force: bool = False) -> dict:
     """
     Build repo_chunks rows for a snapshot using RepoFile.content_text.
-    FTS5 stays in sync via triggers created in migrations.ensure_schema().
     """
     if force:
         db.query(RepoChunk).filter(RepoChunk.snapshot_id == snapshot_id).delete()
@@ -125,7 +125,9 @@ def chunk_snapshot(db: Session, snapshot_id: int, force: bool = False) -> dict:
             continue
 
         lines = rf.content_text.splitlines(keepends=True)
-        for start_line, end_line, chunk_text in _line_chunks(lines, settings.REPO_CHUNK_LINES, settings.REPO_CHUNK_OVERLAP):
+        for start_line, end_line, chunk_text in _line_chunks(
+            lines, settings.REPO_CHUNK_LINES, settings.REPO_CHUNK_OVERLAP
+        ):
             chunk_text = _truncate(chunk_text, settings.REPO_CHUNK_MAX_CHARS)
             symbols = _extract_symbols(chunk_text)
             symbols_json = json.dumps(symbols) if symbols else None
@@ -149,14 +151,6 @@ def chunk_snapshot(db: Session, snapshot_id: int, force: bool = False) -> dict:
 # -----------------------
 # Retrieval
 # -----------------------
-def _sqlite_fts_available(db: Session) -> bool:
-    try:
-        db.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_chunks_fts'")).fetchone()
-        return True
-    except Exception:
-        return False
-
-
 async def search_chunks(
     db: Session,
     snapshot_id: int,
@@ -164,12 +158,18 @@ async def search_chunks(
     top_k: int = 10,
     mode: str = "auto",
     path_contains: Optional[str] = None,
-) -> Tuple[str, List[RepoChunk]]:
+) -> Tuple[str, List[ChunkHit]]:
     """
-    Returns (mode_used, chunks)
-    mode: auto|fts|embeddings
+    Returns (mode_used, hits)
+    mode: auto | fts | embeddings
+
+    Note:
+      - We do not depend on SQLite FTS tables here.
+      - "fts" means "keyword scoring fallback".
+      - Embeddings mode requires RepoChunk.embedding_json to be populated by a separate embed step.
     """
-    top_k = max(1, min(int(top_k), settings.RAG_MAX_TOP_K))
+    cap = int(getattr(settings, "RAG_MAX_TOP_K", 20) or 20)
+    top_k = max(1, min(int(top_k), cap))
     mode = (mode or "auto").lower().strip()
 
     # base query
@@ -178,43 +178,70 @@ async def search_chunks(
         q = q.filter(RepoChunk.path.contains(path_contains))
 
     # pull candidates (cap for safety)
-    candidates = q.order_by(RepoChunk.id.asc()).limit(2000).all()
+    candidates: List[RepoChunk] = q.order_by(RepoChunk.id.asc()).limit(2000).all()
 
-    if mode == "embeddings" or (mode == "auto" and settings.EMBEDDINGS_PROVIDER.lower() != "off"):
-        # require embeddings exist on rows
-        emb_rows = [c for c in candidates if c.embedding_json]
+    def to_hits(chunks: List[RepoChunk], scores: Optional[List[float]] = None) -> List[ChunkHit]:
+        out: List[ChunkHit] = []
+        if scores is None:
+            scores = [None] * len(chunks)  # type: ignore
+        for c, s in zip(chunks, scores):
+            out.append(
+                ChunkHit(
+                    id=c.id,
+                    path=c.path,
+                    start_line=c.start_line,
+                    end_line=c.end_line,
+                    score=s,
+                    chunk_text=c.chunk_text,
+                )
+            )
+        return out
+
+    # ---- embeddings path ----
+    if mode == "embeddings" or (mode == "auto" and (settings.EMBEDDINGS_PROVIDER or "off").lower() != "off"):
+        emb_rows = [c for c in candidates if getattr(c, "embedding_json", None)]
         if emb_rows:
             qvec = (await embed_texts([query]))[0]
             qnorm = math.sqrt(sum(x * x for x in qvec)) or 1.0
 
             scored: List[Tuple[float, RepoChunk]] = []
             for c in emb_rows:
-                vec = loads_embedding(c.embedding_json or "[]")
-                # we stored scaled int norms; recover approximate norm:
+                vec = loads_embedding(getattr(c, "embedding_json", None) or "[]")
+
+                # optional stored norm (if your model has this column)
                 cnorm = None
-                if c.embedding_norm:
-                    cnorm = float(c.embedding_norm) / 1_000_000.0
+                en = getattr(c, "embedding_norm", None)
+                if en:
+                    # if you store scaled ints, this recovers approx float
+                    try:
+                        cnorm = float(en) / 1_000_000.0
+                    except Exception:
+                        cnorm = None
+
                 s = cosine_similarity(qvec, vec, a_norm=qnorm, b_norm=cnorm)
                 scored.append((s, c))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            return "embeddings", [c for _, c in scored[:top_k]]
+            top = scored[:top_k]
+            return "embeddings", to_hits([c for _, c in top], [float(s) for s, _ in top])
 
-        # fallback if no embeddings present
+        # if forced embeddings but none exist, fall back
         if mode == "embeddings":
-            return "fts", _fts_fallback(candidates, query, top_k)
+            chunks = _keyword_fallback(candidates, query, top_k)
+            return "fts", to_hits(chunks)
 
-    # default: fts-like fallback
-    return "fts", _fts_fallback(candidates, query, top_k)
+    # ---- default keyword fallback ----
+    chunks = _keyword_fallback(candidates, query, top_k)
+    return "fts", to_hits(chunks)
 
 
-def _fts_fallback(candidates: List[RepoChunk], query: str, top_k: int) -> List[RepoChunk]:
+def _keyword_fallback(candidates: List[RepoChunk], query: str, top_k: int) -> List[RepoChunk]:
     terms = _tokenize(query)
-    scored = []
+    scored: List[Tuple[float, RepoChunk]] = []
     for c in candidates:
         scored.append((_simple_keyword_score(c.chunk_text, terms), c))
     scored.sort(key=lambda x: x[0], reverse=True)
-    # filter out pure zeros unless we’d return nothing
+
     nonzero = [c for s, c in scored if s > 0.0]
     if nonzero:
         return nonzero[:top_k]
