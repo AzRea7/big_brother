@@ -1,3 +1,4 @@
+# backend/app/ai/prompts.py
 from __future__ import annotations
 
 SYSTEM_PROMPT = """You are an execution planner for Austin.
@@ -29,6 +30,17 @@ Output format MUST be EXACTLY:
 4) Motivation
 - one sentence
 """
+
+# ✅ Compatibility: planner.py expects USER_PROMPT_TEMPLATE.
+# Keep this name stable so imports don’t break.
+USER_PROMPT_TEMPLATE = """Generate today's plan using ONLY the tasks provided.
+
+Tasks will be provided as JSON. Use the SYSTEM rules and output format exactly.
+
+Tasks:
+{tasks_json}
+"""
+
 # -----------------------
 # Repo Finding generation (LLM scan)
 # -----------------------
@@ -92,10 +104,6 @@ def build_repo_tasks_prompt(excerpts: str, count: int) -> list[dict[str, str]]:
         {"role": "user", "content": REPO_TASKS_USER.format(excerpts=excerpts, count=count)},
     ]
 
-
-# -----------------------
-# NEW: Finding -> Task enrichment with chunk retrieval
-# -----------------------
 FINDING_TASK_SYSTEM = """You are a senior engineer turning a single code finding into a production-quality task.
 
 Rules:

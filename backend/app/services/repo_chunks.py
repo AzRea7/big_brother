@@ -1,9 +1,7 @@
-# backend/app/services/repo_chunks.py
 from __future__ import annotations
 
 import json
 import math
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,10 +41,42 @@ def _extract_symbols(lines: list[str]) -> list[str]:
     return out
 
 
+def load_chunk_text(*, db: Session, chunk_id: int) -> dict[str, Any]:
+    """
+    Load a single chunk by id for UI/debug viewing.
+    This is what routes/debug.py is trying to import.
+    """
+    c = db.get(RepoChunk, int(chunk_id))
+    if not c:
+        return {"ok": False, "error": "chunk_not_found", "chunk_id": int(chunk_id)}
+
+    symbols: list[str] = []
+    if c.symbols_json:
+        try:
+            symbols = json.loads(c.symbols_json)
+        except Exception:
+            symbols = []
+
+    return {
+        "ok": True,
+        "chunk": {
+            "id": int(c.id),
+            "snapshot_id": int(c.snapshot_id),
+            "path": str(c.path),
+            "start_line": int(c.start_line),
+            "end_line": int(c.end_line),
+            "symbols": symbols,
+            "chunk_text": str(c.chunk_text or ""),
+            "created_at": c.created_at.isoformat() if getattr(c, "created_at", None) else None,
+        },
+    }
+
+
 def chunk_snapshot(
     db: Session,
     snapshot_id: int,
     *,
+    force: bool = False,
     max_lines: int = 140,
     overlap: int = 25,
     max_chars: int = 7000,
@@ -54,22 +84,33 @@ def chunk_snapshot(
     """
     Build RepoChunk rows from RepoFile content for a snapshot.
 
-    Why line-based chunking:
-    - stable across languages
-    - preserves “where in file” for clickable context
-    - keeps chunks small enough for prompt stuffing
+    If force=False and chunks already exist, this will NO-OP and just return counts.
+    If force=True, it deletes and rebuilds.
 
     Returns: {"snapshot_id":..., "inserted":..., "deleted":..., "total":...}
     """
     max_lines = max(40, int(max_lines))
     overlap = max(0, min(int(overlap), max_lines - 1))
 
+    # If already chunked and not forcing, don't rebuild.
+    existing = db.execute(
+        text("SELECT COUNT(1) FROM repo_chunks WHERE snapshot_id = :sid"),
+        {"sid": snapshot_id},
+    ).scalar()
+    existing_n = int(existing or 0)
+    if existing_n > 0 and not force:
+        return {"snapshot_id": snapshot_id, "inserted": 0, "deleted": 0, "total": existing_n, "skipped": True}
+
     # wipe existing chunks for snapshot (simplest + consistent)
-    deleted = db.execute(text("DELETE FROM repo_chunks WHERE snapshot_id = :sid"), {"sid": snapshot_id}).rowcount or 0
+    deleted = (
+        db.execute(text("DELETE FROM repo_chunks WHERE snapshot_id = :sid"), {"sid": snapshot_id}).rowcount or 0
+    )
     db.commit()
 
     files = db.scalars(
-        select(RepoFile).where(RepoFile.snapshot_id == snapshot_id).where(RepoFile.content_kind == "text")
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot_id)
+        .where(RepoFile.content_kind == "text")
     ).all()
 
     inserted = 0
@@ -94,7 +135,7 @@ def chunk_snapshot(
                 i = end
                 continue
 
-            # avoid absurd chunks (minifies, etc.)
+            # avoid absurd chunks (minified, etc.)
             if len(chunk_text) > max_chars:
                 chunk_text = chunk_text[:max_chars] + "\n...<truncated>..."
 
@@ -120,8 +161,12 @@ def chunk_snapshot(
 
     db.commit()
 
-    total = db.execute(text("SELECT COUNT(1) FROM repo_chunks WHERE snapshot_id = :sid"), {"sid": snapshot_id}).scalar()
-    return {"snapshot_id": snapshot_id, "inserted": inserted, "deleted": deleted, "total": int(total or 0)}
+    total = db.execute(
+        text("SELECT COUNT(1) FROM repo_chunks WHERE snapshot_id = :sid"),
+        {"sid": snapshot_id},
+    ).scalar()
+
+    return {"snapshot_id": snapshot_id, "inserted": inserted, "deleted": int(deleted), "total": int(total or 0)}
 
 
 def _fts_available(db: Session) -> bool:
@@ -220,7 +265,6 @@ def search_chunks_fts(
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    # cosine similarity = dot(a,b) / (||a|| * ||b||)
     dot = 0.0
     na = 0.0
     nb = 0.0
@@ -248,19 +292,37 @@ async def build_embeddings_for_snapshot(
     db: Session,
     *,
     snapshot_id: int,
+    force: bool = False,
     batch_size: int = 64,
     max_chunks: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Generate embeddings for all chunks in a snapshot (if EMBEDDINGS_ENABLED=true).
 
+    If force=True, deletes existing embeddings for this snapshot+model before re-embedding.
+
     Stores rows in repo_chunk_embeddings.
-    Safe to re-run: it only embeds chunks missing (chunk_id, model).
+    Safe to re-run: it only embeds chunks missing (chunk_id, model) unless force=True.
     """
     if not embeddings_enabled():
         return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0, "error": "EMBEDDINGS_ENABLED=false"}
 
     model = embedding_model_name()
+
+    if force:
+        # delete embeddings for all chunks in this snapshot for this model
+        db.execute(
+            text(
+                """
+                DELETE FROM repo_chunk_embeddings
+                WHERE model = :m AND chunk_id IN (
+                  SELECT id FROM repo_chunks WHERE snapshot_id = :sid
+                )
+                """
+            ),
+            {"sid": snapshot_id, "m": model},
+        )
+        db.commit()
 
     # find chunk ids that do not yet have embeddings for this model
     sql = """
@@ -277,12 +339,11 @@ async def build_embeddings_for_snapshot(
         ids = ids[: int(max_chunks)]
 
     if not ids:
-        return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0}
+        return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0, "model": model}
 
     embedded = 0
     skipped = 0
 
-    # batch embed
     for i in range(0, len(ids), int(batch_size)):
         batch_ids = ids[i : i + int(batch_size)]
         chunks = db.scalars(select(RepoChunk).where(RepoChunk.id.in_(batch_ids))).all()
@@ -294,7 +355,6 @@ async def build_embeddings_for_snapshot(
             if not t:
                 skipped += 1
                 continue
-            # Keep request size reasonable
             t = t[:6000]
             texts.append(t)
             chunk_id_order.append(int(c.id))
@@ -304,7 +364,6 @@ async def build_embeddings_for_snapshot(
 
         vectors = await embed_texts(texts)
         if len(vectors) != len(chunk_id_order):
-            # If provider returns weird shapes, fail hard to avoid misalignment.
             raise RuntimeError("Embeddings provider returned mismatched vector count.")
 
         now = datetime.utcnow()
@@ -349,8 +408,6 @@ async def search_chunks_embeddings(
         params["p"] = f"%{path_contains}%"
         path_filter_sql = " AND c.path LIKE :p "
 
-    # Pull candidate vectors for this snapshot + model.
-    # For MVP: load all for snapshot (OK for moderate repos).
     sql = f"""
     SELECT
       c.id, c.snapshot_id, c.path, c.start_line, c.end_line,
@@ -361,6 +418,7 @@ async def search_chunks_embeddings(
     WHERE c.snapshot_id = :sid
       {path_filter_sql}
     """
+
     rows = db.execute(text(sql), params).fetchall()
 
     scored: list[ChunkHit] = []
@@ -395,7 +453,7 @@ async def search_chunks(
 ) -> tuple[str, list[ChunkHit]]:
     """
     mode:
-      - auto: embeddings if enabled AND embeddings exist, else fts if available, else fallback
+      - auto: embeddings if enabled AND embeddings exist, else fts if available, else none
       - embeddings: force embeddings
       - fts: force fts
     """
@@ -413,7 +471,6 @@ async def search_chunks(
 
     # auto:
     if embeddings_enabled():
-        # cheap existence check: do we have any embeddings for this snapshot/model?
         model = embedding_model_name()
         row = db.execute(
             text(
@@ -437,5 +494,4 @@ async def search_chunks(
         hits = search_chunks_fts(db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains)
         return "fts", hits
 
-    # fallback: return nothing (or could do naive substring later)
     return "none", []
