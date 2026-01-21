@@ -38,7 +38,9 @@ def _guard_debug(request: Request) -> None:
     """
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
-    require_api_key(request)
+
+    require_api_key(request.headers.get("X-API-Key"))
+
 
 
 # -----------------------

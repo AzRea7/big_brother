@@ -16,7 +16,7 @@ from ..config import settings
 from ..models import RepoChunk, RepoFile, RepoFinding, RepoSnapshot, Task
 
 from .code_signals import compute_signal_counts_for_files, count_markers_in_text
-from .repo_rag import search_chunks
+from .repo_chunks import search_chunks  # ✅ all retrieval lives in repo_chunks.py
 
 
 def _repo_link(snapshot: RepoSnapshot, path: str, line: int | None = None) -> str:
@@ -104,7 +104,6 @@ def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int = 14) -
     if not llm.enabled():
         raise RuntimeError("LLM not enabled. Set LLM_ENABLED=true, OPENAI_BASE_URL, OPENAI_MODEL.")
 
-    # NOTE: keep your existing prompt contract (your repo already has this)
     system = "You are a strict code reviewer. Output JSON only."
     user = {"snapshot_id": snapshot_id, "repo": snap.repo, "branch": snap.branch, "files": payload_files}
 
@@ -232,7 +231,7 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str = "haven", l
 
 
 # -------------------------
-# ✅ Finding-driven retrieval → LLM task generation
+# Finding-driven retrieval → LLM task generation
 # -------------------------
 
 @dataclass
@@ -250,11 +249,6 @@ class SuggestedTask:
 
 
 def _finding_query(f: RepoFinding) -> str:
-    """
-    Turn a finding into a retrieval query (title/category/evidence/reco).
-    This is the upgrade you asked for: retrieval keyed off actual findings,
-    not generic seed queries.
-    """
     parts = [
         f.title or "",
         f.category or "",
@@ -287,20 +281,13 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
     chunks_per_finding: int = 3,
 ) -> list[SuggestedTask]:
     """
-    Generates tasks using:
-      findings → query → retrieve chunks → send excerpts to LLM
-
-    Uses your existing generate_repo_tasks_json() contract by creating synthetic
-    "file_summaries" with excerpt text drawn from chunks.
-
-    If chunks do not exist yet, raise (caller can fall back).
+    findings → query → retrieve chunks (repo_chunks.search_chunks) → LLM tasks
     """
     if not getattr(settings, "LLM_ENABLED", False):
         return []
     if not getattr(settings, "OPENAI_MODEL", None):
         return []
 
-    # We need chunks to exist for RAG.
     chunk_exists = db.scalar(select(RepoChunk.id).where(RepoChunk.snapshot_id == snapshot.id).limit(1))
     if chunk_exists is None:
         raise RuntimeError("No RepoChunk rows found. Run /debug/repo/chunks/build first.")
@@ -316,48 +303,54 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
     if not findings:
         return []
 
-    # Build synthetic evidence “files”
     file_summaries: list[dict[str, Any]] = []
+
     for f in findings:
         q = _finding_query(f)
 
-        # First try scoped to the finding's file path (when present)
-        search = search_chunks(
-            db=db,
+        # 1) scoped search (path bias)
+        mode, hits = await search_chunks(
+            db,
             snapshot_id=snapshot.id,
             query=q,
             top_k=chunks_per_finding,
             mode="auto",
             path_contains=f.path,
         )
-        chunks = search.get("results", []) or []
 
-        # If nothing found, broaden search
-        if not chunks:
-            search = search_chunks(db=db, snapshot_id=snapshot.id, query=q, top_k=chunks_per_finding, mode="auto")
-            chunks = search.get("results", []) or []
+        # 2) fallback: broad search
+        if not hits:
+            mode, hits = await search_chunks(
+                db,
+                snapshot_id=snapshot.id,
+                query=q,
+                top_k=chunks_per_finding,
+                mode="auto",
+                path_contains=None,
+            )
 
         finding_header = _format_finding_block(f)
 
-        for c in chunks:
+        for h in hits:
             excerpt = (
                 f"{finding_header}\n"
+                f"[RETRIEVAL]\n"
+                f"mode={mode}\n"
                 f"[CODE_CHUNK]\n"
-                f"path={c.get('path')} lines={c.get('start_line')}-{c.get('end_line')}\n"
-                f"{c.get('chunk_text','')}"
+                f"path={h.path} lines={h.start_line}-{h.end_line}\n"
+                f"{h.chunk_text}"
             )
             excerpt = excerpt[: int(getattr(settings, "REPO_TASK_EXCERPT_CHARS", 1200))]
 
             sig = count_markers_in_text(excerpt)
             file_summaries.append(
                 {
-                    "path": str(c.get("path") or f.path or "unknown"),
+                    "path": str(h.path or f.path or "unknown"),
                     "excerpt": excerpt,
                     **sig,
                 }
             )
 
-    # Provide global signal counts (stable)
     files = db.scalars(
         select(RepoFile)
         .where(RepoFile.snapshot_id == snapshot.id)
@@ -408,7 +401,7 @@ async def generate_tasks_from_findings_llm(
     chunks_per_finding: int = 3,
 ) -> dict[str, Any]:
     """
-    Public service: use retrieval-driven LLM generation, then CREATE Task rows (deduped).
+    Public service: retrieval-driven LLM generation, then CREATE Task rows (deduped).
     """
     snap = db.get(RepoSnapshot, snapshot_id)
     if not snap:

@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     DB_URL: str = "sqlite:///./data/app.db"
 
     # Auth
-    API_KEY: str = "change-me"
+    API_KEY: str = "9f4a6c8b1a2e4f7c8e9d0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b"
     ENV: str = "dev"  # dev | prod | ci
     DISABLE_DEBUG_IN_PROD: bool = True
 
