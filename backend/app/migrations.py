@@ -47,6 +47,10 @@ def ensure_schema(engine: Engine) -> None:
     """
     SQLite-friendly schema upgrades.
     Runs every startup (init_db calls ensure_schema()).
+
+    NOTE:
+    - Keep this idempotent (CREATE IF NOT EXISTS / ALTER-if-missing).
+    - Avoid executing SQL at import time.
     """
     insp = inspect(engine)
     tables = set(insp.get_table_names())
@@ -209,7 +213,7 @@ def ensure_schema(engine: Engine) -> None:
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_findings_path ON repo_findings(path)")
 
     # -----------------------
-    # ✅ Level 2 RAG: repo_chunks
+    # Level 2 RAG: repo_chunks
     # -----------------------
     if "repo_chunks" not in tables:
         _ensure(
@@ -247,7 +251,6 @@ def ensure_schema(engine: Engine) -> None:
 
     # Optional: FTS5 for chunk retrieval
     if _sqlite_has_fts5(engine):
-        # Create the FTS virtual table (contentless is simplest, but we want rowid=id)
         _ensure(
             engine,
             """
@@ -256,7 +259,6 @@ def ensure_schema(engine: Engine) -> None:
             """,
         )
 
-        # Triggers to keep FTS in sync
         _ensure(
             engine,
             """
@@ -285,20 +287,44 @@ def ensure_schema(engine: Engine) -> None:
             """,
         )
 
-# --- repo_chunk_embeddings (for embeddings-based rerank) ---
-db.execute("""
-CREATE TABLE IF NOT EXISTS repo_chunk_embeddings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    snapshot_id INTEGER NOT NULL,
-    chunk_id INTEGER NOT NULL,
-    model TEXT NOT NULL,
-    embedding_json TEXT NOT NULL,
-    embedding_norm REAL,
-    created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(snapshot_id, chunk_id, model)
-);
-""")
+    # -----------------------
+    # Level 2.5: repo_chunk_embeddings (cosine rerank)
+    #
+    # MUST match SQLAlchemy model:
+    # - chunk_id (FK repo_chunks.id)
+    # - model (string)
+    # - vector_json (TEXT: JSON list[float])
+    # - embedding_norm (REAL)
+    # - created_at
+    # -----------------------
+    if "repo_chunk_embeddings" not in tables:
+        _ensure(
+            engine,
+            """
+            CREATE TABLE IF NOT EXISTS repo_chunk_embeddings (
+              id INTEGER PRIMARY KEY,
+              chunk_id INTEGER NOT NULL,
+              model VARCHAR(120) NOT NULL,
+              vector_json TEXT NOT NULL,
+              embedding_norm REAL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(chunk_id, model)
+            )
+            """,
+        )
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model)")
+    else:
+        # best-effort add columns if table already exists
+        for col, ddl in [
+            ("chunk_id", "INTEGER"),
+            ("model", "VARCHAR(120)"),
+            ("vector_json", "TEXT"),
+            ("embedding_norm", "REAL"),
+            ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+        ]:
+            if not _has_column(engine, "repo_chunk_embeddings", col):
+                _add_column_sqlite(engine, "repo_chunk_embeddings", col, ddl)
 
-db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_snapshot ON repo_chunk_embeddings(snapshot_id);")
-db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id);")
-db.execute("CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model);")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id)")
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model)")

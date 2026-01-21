@@ -1,30 +1,30 @@
 # backend/app/routes/debug.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Request
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Task
+from ..services.notifier import send_email, send_webhook
 from ..services.planner import generate_daily_plan
-from ..services.notifier import send_webhook, send_email
-from ..services.security import require_api_key, debug_is_allowed
-
-from ..services.repo_rag import chunk_snapshot, search_chunks, load_chunk_text
-from ..services.repo_findings import (
-    scan_repo_findings_llm,
-    list_findings,
-    tasks_from_findings,
-    generate_tasks_from_findings_llm,
-)
+from ..services.security import debug_is_allowed, require_api_key
 
 from ..services.repo_chunks import (
-    chunk_snapshot,
     build_embeddings_for_snapshot,
-    search_chunks,
+    chunk_snapshot,
     load_chunk_text,
+    search_chunks,
+)
+from ..services.repo_findings import (
+    generate_tasks_from_findings_llm,
+    list_findings,
+    scan_repo_findings_llm,
+    tasks_from_findings,
 )
 
 router = APIRouter(prefix="/debug", tags=["debug"])
@@ -34,19 +34,16 @@ def _guard_debug(request: Request) -> None:
     """
     Enforce production safety:
     - Optionally disable debug endpoints entirely in prod
-    - Require X-API-Key for access (at least in prod; configurable in require_api_key)
+    - Require X-API-Key for access
     """
     if not debug_is_allowed():
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Not found")
-
     require_api_key(request)
 
 
 # -----------------------
 # Existing debug utilities
 # -----------------------
-
 @router.get("/tasks/summary")
 def tasks_summary(
     request: Request,
@@ -132,70 +129,70 @@ def notify_email(request: Request, body: EmailBody):
 # -----------------------
 # Repo: chunks + search
 # -----------------------
+@router.post("/repo/chunks/build")
+def build_repo_chunks(
+    request: Request,
+    snapshot_id: int = Query(..., ge=1),
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    _guard_debug(request)
+    return chunk_snapshot(db, snapshot_id, force=force)
+
 
 @router.post("/repo/chunks/embed")
 async def embed_repo_chunks(
+    request: Request,
     snapshot_id: int = Query(..., ge=1),
     force: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     """
     Build embeddings for all chunks in a snapshot.
-    Requires EMBEDDINGS_ENABLED=true and OPENAI_API_KEY set.
     """
+    _guard_debug(request)
     return await build_embeddings_for_snapshot(db, snapshot_id, force=force)
-
-@router.post("/repo/chunks/build")
-def build_repo_chunks(
-    snapshot_id: int = Query(..., ge=1),
-    force: bool = Query(False),
-    db: Session = Depends(get_db),
-):
-    """
-    Build repo chunks for a snapshot (and FTS index).
-    If force=true, it rebuilds from scratch.
-    """
-    return chunk_snapshot(db, snapshot_id, force=force)
 
 
 @router.get("/repo/chunks/search")
-async def rag_search(
+async def repo_chunks_search(
+    request: Request,
     snapshot_id: int = Query(..., ge=1),
     q: str = Query(..., min_length=2),
-    top_k: int = Query(16, ge=1, le=100),
+    top_k: int = Query(8, ge=1, le=30),
+    mode: str = Query("auto"),
+    path_contains: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    hits = await search_chunks(db, snapshot_id, q, top_k=top_k)
-    return {"snapshot_id": snapshot_id, "query": q, "hits": hits}
+    _guard_debug(request)
+    return await search_chunks(
+        db=db,
+        snapshot_id=snapshot_id,
+        query=q,
+        top_k=top_k,
+        mode=mode,
+        path_contains=path_contains,
+    )
 
 
-@router.get("/repo/chunks/get")
-def rag_get_chunk(
-    snapshot_id: int = Query(..., ge=1),
-    path: str = Query(..., min_length=1),
-    start_line: int = Query(..., ge=1),
-    end_line: int = Query(..., ge=1),
+@router.get("/repo/chunks/load")
+def repo_chunks_load(
+    request: Request,
+    chunk_id: int = Query(..., ge=1),
     db: Session = Depends(get_db),
 ):
-    txt = load_chunk_text(db, snapshot_id, path, start_line, end_line)
-    return {
-        "snapshot_id": snapshot_id,
-        "path": path,
-        "start_line": start_line,
-        "end_line": end_line,
-        "chunk_text": txt,
-    }
+    _guard_debug(request)
+    return load_chunk_text(db=db, chunk_id=chunk_id)
 
 
 # -----------------------
 # Repo: findings
 # -----------------------
-
 @router.post("/repo/scan_llm")
 def repo_scan_llm(
     request: Request,
-    snapshot_id: int = Query(...),
-    max_files: int = Query(14),
+    snapshot_id: int = Query(..., ge=1),
+    max_files: int = Query(14, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     _guard_debug(request)
@@ -205,8 +202,8 @@ def repo_scan_llm(
 @router.get("/repo/findings")
 def repo_findings_list(
     request: Request,
-    snapshot_id: int = Query(...),
-    limit: int = Query(50),
+    snapshot_id: int = Query(..., ge=1),  # ✅ fixed Query(.)
+    limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     _guard_debug(request)
@@ -237,13 +234,12 @@ def repo_findings_list(
 # -----------------------
 # Repo: findings -> tasks
 # -----------------------
-
 @router.post("/repo/tasks_from_findings")
 def repo_tasks_from_findings(
     request: Request,
-    snapshot_id: int = Query(...),
+    snapshot_id: int = Query(..., ge=1),
     project: str = Query("haven"),
-    limit: int = Query(12),
+    limit: int = Query(12, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     """
@@ -256,19 +252,15 @@ def repo_tasks_from_findings(
 @router.post("/repo/tasks_generate")
 async def repo_tasks_generate_llm(
     request: Request,
-    snapshot_id: int = Query(...),
+    snapshot_id: int = Query(..., ge=1),
     project: str = Query("haven"),
-    max_findings: int = Query(10),
-    chunks_per_finding: int = Query(3),
+    max_findings: int = Query(10, ge=1, le=100),
+    chunks_per_finding: int = Query(3, ge=0, le=10),
     db: Session = Depends(get_db),
 ):
     """
     LLM + Retrieval task generation:
-      Findings -> (title/category/evidence query) -> retrieve chunks -> generate tasks -> create Task rows.
-
-    Requirements:
-      - chunks must exist (run /debug/repo/chunks/build first)
-      - LLM_ENABLED + model configured
+      Findings -> retrieve chunks -> generate tasks -> create Task rows.
     """
     _guard_debug(request)
     return await generate_tasks_from_findings_llm(
