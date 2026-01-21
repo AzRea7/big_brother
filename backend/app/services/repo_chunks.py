@@ -1,3 +1,4 @@
+# backend/app/services/repo_chunks.py
 from __future__ import annotations
 
 import json
@@ -41,10 +42,22 @@ def _extract_symbols(lines: list[str]) -> list[str]:
     return out
 
 
+def _dialect_name(db: Session) -> str:
+    """
+    Used to detect postgres vs sqlite without importing engine types.
+    """
+    try:
+        bind = db.get_bind()
+        if bind is None:
+            return ""
+        return str(getattr(bind.dialect, "name", "") or "").lower()
+    except Exception:
+        return ""
+
+
 def load_chunk_text(*, db: Session, chunk_id: int) -> dict[str, Any]:
     """
     Load a single chunk by id for UI/debug viewing.
-    This is what routes/debug.py is trying to import.
     """
     c = db.get(RepoChunk, int(chunk_id))
     if not c:
@@ -92,7 +105,6 @@ def chunk_snapshot(
     max_lines = max(40, int(max_lines))
     overlap = max(0, min(int(overlap), max_lines - 1))
 
-    # If already chunked and not forcing, don't rebuild.
     existing = db.execute(
         text("SELECT COUNT(1) FROM repo_chunks WHERE snapshot_id = :sid"),
         {"sid": snapshot_id},
@@ -101,7 +113,6 @@ def chunk_snapshot(
     if existing_n > 0 and not force:
         return {"snapshot_id": snapshot_id, "inserted": 0, "deleted": 0, "total": existing_n, "skipped": True}
 
-    # wipe existing chunks for snapshot (simplest + consistent)
     deleted = (
         db.execute(text("DELETE FROM repo_chunks WHERE snapshot_id = :sid"), {"sid": snapshot_id}).rowcount or 0
     )
@@ -135,7 +146,6 @@ def chunk_snapshot(
                 i = end
                 continue
 
-            # avoid absurd chunks (minified, etc.)
             if len(chunk_text) > max_chars:
                 chunk_text = chunk_text[:max_chars] + "\n...<truncated>..."
 
@@ -169,6 +179,9 @@ def chunk_snapshot(
     return {"snapshot_id": snapshot_id, "inserted": inserted, "deleted": int(deleted), "total": int(total or 0)}
 
 
+# -----------------------------
+# SQLite FTS (existing behavior)
+# -----------------------------
 def _fts_available(db: Session) -> bool:
     """
     We create FTS in migrations.ensure_schema if SQLite supports it.
@@ -200,9 +213,7 @@ def _normalize_fts_query(q: str) -> str:
         t = t.strip()
         if not t:
             continue
-        # escape quotes
         t = t.replace('"', "")
-        # if token has punctuation, quote it
         if re.search(r"[^A-Za-z0-9_:/.-]", t):
             cleaned.append(f'"{t}"')
         else:
@@ -257,13 +268,71 @@ def search_chunks_fts(
                 end_line=int(r[4]),
                 chunk_text=str(r[5]),
                 symbols_json=r[6],
-                # bm25 smaller is better; invert to “score higher is better”
                 score=float(-r[7]) if r[7] is not None else None,
             )
         )
     return out
 
 
+# -----------------------------
+# Postgres FTS (NEW)
+# -----------------------------
+def search_chunks_postgres_fts(
+    db: Session,
+    *,
+    snapshot_id: int,
+    query: str,
+    top_k: int = 10,
+    path_contains: Optional[str] = None,
+) -> list[ChunkHit]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    params: dict[str, Any] = {"sid": snapshot_id, "q": q, "k": int(top_k)}
+    path_filter_sql = ""
+    if path_contains:
+        params["p"] = f"%{path_contains}%"
+        path_filter_sql = " AND c.path ILIKE :p "
+
+    # No extensions required; uses built-in Postgres text search.
+    sql = f"""
+    SELECT
+      c.id, c.snapshot_id, c.path, c.start_line, c.end_line,
+      c.chunk_text, c.symbols_json,
+      ts_rank_cd(
+        to_tsvector('english', coalesce(c.chunk_text,'')),
+        plainto_tsquery('english', :q)
+      ) AS rank
+    FROM repo_chunks c
+    WHERE c.snapshot_id = :sid
+      {path_filter_sql}
+      AND to_tsvector('english', coalesce(c.chunk_text,'')) @@ plainto_tsquery('english', :q)
+    ORDER BY rank DESC
+    LIMIT :k
+    """
+
+    rows = db.execute(text(sql), params).fetchall()
+    out: list[ChunkHit] = []
+    for r in rows:
+        out.append(
+            ChunkHit(
+                id=int(r[0]),
+                snapshot_id=int(r[1]),
+                path=str(r[2]),
+                start_line=int(r[3]),
+                end_line=int(r[4]),
+                chunk_text=str(r[5]),
+                symbols_json=r[6],
+                score=float(r[7]) if r[7] is not None else None,
+            )
+        )
+    return out
+
+
+# -----------------------------
+# Embeddings (existing behavior)
+# -----------------------------
 def _cosine(a: list[float], b: list[float]) -> float:
     dot = 0.0
     na = 0.0
@@ -298,11 +367,6 @@ async def build_embeddings_for_snapshot(
 ) -> dict[str, Any]:
     """
     Generate embeddings for all chunks in a snapshot (if EMBEDDINGS_ENABLED=true).
-
-    If force=True, deletes existing embeddings for this snapshot+model before re-embedding.
-
-    Stores rows in repo_chunk_embeddings.
-    Safe to re-run: it only embeds chunks missing (chunk_id, model) unless force=True.
     """
     if not embeddings_enabled():
         return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0, "error": "EMBEDDINGS_ENABLED=false"}
@@ -310,7 +374,6 @@ async def build_embeddings_for_snapshot(
     model = embedding_model_name()
 
     if force:
-        # delete embeddings for all chunks in this snapshot for this model
         db.execute(
             text(
                 """
@@ -324,7 +387,6 @@ async def build_embeddings_for_snapshot(
         )
         db.commit()
 
-    # find chunk ids that do not yet have embeddings for this model
     sql = """
     SELECT c.id
     FROM repo_chunks c
@@ -453,11 +515,15 @@ async def search_chunks(
 ) -> tuple[str, list[ChunkHit]]:
     """
     mode:
-      - auto: embeddings if enabled AND embeddings exist, else fts if available, else none
+      - auto: embeddings if enabled AND embeddings exist,
+              else postgres fts if postgres,
+              else sqlite fts if available,
+              else none
       - embeddings: force embeddings
-      - fts: force fts
+      - fts: force best-available text search
     """
     mode = (mode or "auto").strip().lower()
+    dialect = _dialect_name(db)
 
     if mode == "embeddings":
         return "embeddings", await search_chunks_embeddings(
@@ -465,6 +531,10 @@ async def search_chunks(
         )
 
     if mode == "fts":
+        if dialect.startswith("postgres"):
+            return "fts_pg", search_chunks_postgres_fts(
+                db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
+            )
         return "fts", search_chunks_fts(
             db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
         )
@@ -489,6 +559,12 @@ async def search_chunks(
                 db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
             )
             return "embeddings", hits
+
+    if dialect.startswith("postgres"):
+        hits = search_chunks_postgres_fts(
+            db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
+        )
+        return "fts_pg", hits
 
     if _fts_available(db):
         hits = search_chunks_fts(db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains)

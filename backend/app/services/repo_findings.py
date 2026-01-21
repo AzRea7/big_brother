@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -83,9 +84,12 @@ def _pick_files_for_scan(files: list[RepoFile]) -> list[RepoFile]:
     return text_files[:cap]
 
 
-def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int = 14) -> dict[str, Any]:
+async def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int = 14) -> dict[str, Any]:
     """
     LLM-driven findings: pick a small set of high-signal files, send excerpts, store RepoFinding rows.
+
+    IMPORTANT FIX:
+      Some LLMClient implementations return a coroutine from chat(). We safely await it if needed.
     """
     snap = db.get(RepoSnapshot, snapshot_id)
     if not snap:
@@ -108,11 +112,13 @@ def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int = 14) -
     user = {"snapshot_id": snapshot_id, "repo": snap.repo, "branch": snap.branch, "files": payload_files}
 
     raw_text = llm.chat(system=system, user=json.dumps(user), temperature=0.2, max_tokens=1800)
+    if inspect.isawaitable(raw_text):
+        raw_text = await raw_text  # ✅ fixes: 'coroutine' object has no attribute 'strip'
 
     try:
-        data = json.loads(_strip_code_fences(raw_text))
+        data = json.loads(_strip_code_fences(str(raw_text)))
     except Exception:
-        data = _extract_json_object_lenient(raw_text)
+        data = _extract_json_object_lenient(str(raw_text))
 
     findings = data.get("findings") or []
     if not isinstance(findings, list):

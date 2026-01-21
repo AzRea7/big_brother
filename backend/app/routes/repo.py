@@ -64,11 +64,11 @@ router = APIRouter(prefix="/debug/repo", tags=["repo-debug"])
 
 
 def _guard_debug(request: Request) -> None:
-    # "debug routes disappear in prod" safety
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
-    # API key safety
-    require_api_key(request)
+
+    require_api_key(request.headers.get("X-API-Key"))
+
 
 
 @router.post("/sync")
