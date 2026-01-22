@@ -6,7 +6,7 @@ import re
 from typing import Any, Optional
 
 
-SYSTEM_PROMPT = """You are a senior engineering manager generating tasks from provided repository evidence.
+SYSTEM_PROMPT = """You are a senior engineering manager generating tasks from repository evidence.
 
 You MUST return ONLY valid JSON (no markdown, no backticks, no commentary).
 Your output MUST be a JSON OBJECT with top-level key "tasks".
@@ -16,7 +16,7 @@ Schema:
   "tasks": [
     {
       "title": "short, concrete",
-      "notes": "What/Why/How + small checklist",
+      "notes": "What/Why/How + evidence citations",
       "tags": "comma,separated,tags",
       "priority": 1-5,
       "estimated_minutes": 15-240,
@@ -29,11 +29,17 @@ Schema:
   ]
 }
 
-Rules:
+Hard rules:
 - Output MUST be an OBJECT. Do NOT output a bare JSON array.
-- Use ONLY file paths present in the provided evidence_files[*].path.
+- If extra_evidence contains retrieval packs with finding_fingerprint, create EXACTLY 1 task per pack.
+- You MUST choose ONE primary evidence chunk per task and set:
+  - path = that chunk.path
+  - line = that chunk.start_line
+- Notes MUST include at least one evidence citation formatted exactly:
+  [EVIDENCE path:Lstart-Lend] short excerpt...
+- DoD MUST include a runnable verification command containing either "pytest" or "curl".
 - Prefer reliability/security/correctness/observability/tests over style.
-- Include tags: repo,autogen and (when relevant) signal:*.
+- Include tags: repo,autogen and (when relevant) signal:* and finding:<fingerprint>.
 - Keep strings short to avoid truncation.
 """
 
@@ -76,16 +82,17 @@ def build_prompt(
         "evidence_files": evidence_files,
         "instructions": [
             'Return a JSON OBJECT with top-level key "tasks". Do NOT return a bare JSON array.',
-            "Create at most 4 tasks (match max_findings upstream).",
+            "If extra_evidence includes retrieval packs, generate EXACTLY 1 task per pack.",
             "Prefer high-impact fixes (auth/security, secrets, timeouts/retries, validation, DB integrity, error handling, tests).",
             "Avoid pure style/lint unless there are no other issues.",
-            "If excerpts contain [FINDING] blocks, generate exactly ONE task per finding.",
             "Each task must include: title, notes, tags, priority, estimated_minutes, blocks_me, path, line(optional), starter, dod.",
             "Tags must include: repo,autogen.",
-            "ALWAYS include at least one signal tag when applicable (signal:timeout, signal:auth, signal:validation, etc.).",
+            "When using retrieval packs, tags MUST include finding:<fingerprint>.",
+            "Notes MUST cite evidence with: [EVIDENCE path:Lx-Ly] ...",
+            "DoD MUST contain either pytest or curl.",
             "Do not invent files not provided.",
             "Return JSON only. No markdown. No code fences.",
-            "Keep notes <= 600 chars. Keep dod <= 220 chars. Keep starter <= 140 chars.",
+            "Keep notes <= 900 chars. Keep dod <= 240 chars. Keep starter <= 140 chars.",
         ],
     }
 
@@ -250,10 +257,6 @@ def _normalize_tasks_schema(obj: Any) -> dict[str, Any]:
 
 
 def _clean_path(path_val: Any) -> str:
-    """
-    Only accept plausible repo-relative file paths.
-    Reject repo roots / branch strings / nulls.
-    """
     if path_val is None:
         return "unknown"
     s = str(path_val).strip()
@@ -263,8 +266,6 @@ def _clean_path(path_val: Any) -> str:
 
     if low in ("null", "none", "false", "true"):
         return "unknown"
-
-    # reject obvious non-file patterns seen in your logs
     if low.endswith("/main") or low.endswith("/master"):
         return "unknown"
     if low.count("/") <= 1 and "." not in low:
@@ -288,7 +289,7 @@ def _coerce_task_fields(t: dict[str, Any]) -> dict[str, Any]:
     if not starter:
         starter = "Open the referenced file and locate the exact code path (5 min)."
     if not dod:
-        dod = "Fix implemented and verified with a concrete command (pytest or curl repro)."
+        dod = "Fix implemented and verified with pytest or a curl reproduction."
 
     pr = t.get("priority", 3)
     try:
@@ -346,28 +347,21 @@ async def generate_repo_tasks_json(
         extra_evidence=extra_evidence,
     )
 
-    # JSON-mode if supported; llm.py will retry without response_format if gateway rejects.
     raw = await client.chat(
         system=SYSTEM_PROMPT,
         user=user_prompt,
         temperature=0.2,
-        max_tokens=650,
+        max_tokens=900,
         response_format={"type": "json_object"},
     )
 
-    try:
-        parsed = _json_loads_best_effort(raw)
-        data = _normalize_tasks_schema(parsed)
+    parsed = _json_loads_best_effort(raw)
+    data = _normalize_tasks_schema(parsed)
 
-        normalized_tasks: list[dict[str, Any]] = []
-        for t in data.get("tasks", []):
-            if not isinstance(t, dict):
-                continue
-            normalized_tasks.append(_coerce_task_fields(t))
+    normalized_tasks: list[dict[str, Any]] = []
+    for t in data.get("tasks", []):
+        if not isinstance(t, dict):
+            continue
+        normalized_tasks.append(_coerce_task_fields(t))
 
-        return {"tasks": normalized_tasks}
-    except Exception as e:
-        raise RuntimeError(
-            "Repo task LLM returned non-JSON or truncated JSON. "
-            f"First 500 chars:\n{str(raw)[:500]}"
-        ) from e
+    return {"tasks": normalized_tasks}
