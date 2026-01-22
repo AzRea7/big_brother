@@ -31,35 +31,32 @@ Output format MUST be EXACTLY:
 - one sentence
 """
 
-# ✅ Compatibility: planner.py expects USER_PROMPT_TEMPLATE.
-# Keep this name stable so imports don’t break.
-USER_PROMPT_TEMPLATE = """Generate today's plan using ONLY the tasks provided.
-
-Tasks will be provided as JSON. Use the SYSTEM rules and output format exactly.
-
-Tasks:
-{tasks_json}
-"""
-
 # -----------------------
-# Repo Finding generation (LLM scan)
+# Repo Findings generation
 # -----------------------
+
 REPO_FINDINGS_SYSTEM = """You are a strict code reviewer.
-You must produce actionable, specific findings grounded in the provided code excerpts.
-Avoid generic advice. Cite concrete evidence from the excerpts.
+Return ONLY valid JSON (no markdown, no backticks) with schema:
+{"findings":[{"path":"...","line":123,"category":"security|reliability|correctness|observability|maintainability|performance|testing|docs","severity":1,"title":"...","evidence":"...","recommendation":"...","acceptance":"..."}]}
+
+Rules:
+- findings must be a list (can be empty)
+- severity must be int 1-5 (5 = highest)
+- line must be int or null
+- Keep findings <= 8 total
+- Keep each string short (<= 240 chars) to avoid truncation
+- Prefer real issues over style/lint (only return style if nothing else)
 """
 
 REPO_FINDINGS_USER = """Analyze this repository snapshot excerpt set and produce findings.
 
-Return JSON as a list of objects with fields:
-- path: string
-- line: integer | null
-- category: string (security|reliability|correctness|observability|maintainability|performance|testing|docs)
-- severity: integer 1-5 (5 = highest)
-- title: string (short)
-- evidence: string (quote or close paraphrase from excerpt)
-- recommendation: string (concrete change)
-- acceptance: string (how to verify)
+Return JSON object with top-level key "findings" (NOT a bare list).
+
+Severity rubric:
+- 5: auth bypass, secret exposure, SQL injection, critical data loss
+- 4: missing auth on endpoints, unsafe defaults, broken retries/timeouts, missing validation
+- 3: correctness bugs, bad error handling, missing tests for core flows
+- 1-2: lint/style only if no other issues exist
 
 EXCERPTS:
 {excerpts}
@@ -73,25 +70,43 @@ def build_repo_findings_prompt(excerpts: str) -> list[dict[str, str]]:
     ]
 
 
+def repo_findings_user(excerpts: str) -> str:
+    # Some callers import repo_findings_user directly.
+    return REPO_FINDINGS_USER.format(excerpts=excerpts)
+
+
 # -----------------------
 # Repo Tasks generation (LLM "top tasks" scan)
 # -----------------------
+
 REPO_TASKS_SYSTEM = """You are an engineering manager generating a small set of high-impact tasks.
 Each task must be concrete, testable, and tied to a file path + evidence from the provided excerpts.
 Avoid vague "improve X" language.
+Return ONLY valid JSON (no markdown, no backticks).
+
+Your output MUST be a JSON OBJECT with top-level key "tasks".
+Do NOT return a bare JSON array.
 """
 
 REPO_TASKS_USER = """From these excerpts, propose {count} tasks.
 
-Return JSON list, each item:
-- title
-- notes
-- priority (1-5)
-- estimated_minutes
-- tags (comma-separated)
-- link (repo://... style if possible)
-- starter (2-5 min first action)
-- dod (definition of done)
+Return JSON OBJECT:
+{{
+  "tasks": [
+    {{
+      "title": "...",
+      "notes": "...",
+      "priority": 1-5,
+      "estimated_minutes": 15-240,
+      "tags": "repo,autogen,...",
+      "link": "repo://... if possible",
+      "starter": "2-5 min first action",
+      "dod": "definition of done w/ verification command",
+      "path": "repo/relative/path.ext",
+      "line": 123 | null
+    }}
+  ]
+}}
 
 EXCERPTS:
 {excerpts}
@@ -104,6 +119,11 @@ def build_repo_tasks_prompt(excerpts: str, count: int) -> list[dict[str, str]]:
         {"role": "user", "content": REPO_TASKS_USER.format(excerpts=excerpts, count=count)},
     ]
 
+
+# -----------------------
+# Finding -> Task (single)
+# -----------------------
+
 FINDING_TASK_SYSTEM = """You are a senior engineer turning a single code finding into a production-quality task.
 
 Rules:
@@ -111,6 +131,7 @@ Rules:
 - Use the provided code chunks. Do not hallucinate code that is not in chunks.
 - Produce a task that a developer can complete in one sitting.
 - Include a minimal verification step (test, curl, or log evidence).
+Return ONLY valid JSON object.
 """
 
 FINDING_TASK_USER = """Turn this single finding into a high-quality task.

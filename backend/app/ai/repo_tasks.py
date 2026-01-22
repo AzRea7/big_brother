@@ -3,64 +3,41 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from typing import Any, Optional
 
-from ..config import settings
 from .llm import LLMClient
 
-SYSTEM_PROMPT = """You are a senior engineer and technical program manager.
-You generate actionable engineering tasks from a repository snapshot.
 
-Hard rules:
-- EVERY task MUST be grounded in provided evidence excerpts.
-- If you cannot cite evidence for a task, DO NOT include that task.
-- Return JSON only.
+SYSTEM_PROMPT = """You are a senior engineering manager generating tasks from provided repository evidence.
 
-Task schema (strict):
+You MUST return ONLY valid JSON (no markdown, no backticks, no commentary).
+Your output MUST be a JSON OBJECT with top-level key "tasks".
+
+Schema:
 {
   "tasks": [
     {
-      "title": "string (specific, actionable, NOT generic refactor)",
-      "notes": "string (what + why + concrete plan)",
-      "priority": 1..5,
-      "estimated_minutes": 5..480,
+      "title": "short, concrete",
+      "notes": "What/Why/How + small checklist",
+      "tags": "comma,separated,tags",
+      "priority": 1-5,
+      "estimated_minutes": 15-240,
       "blocks_me": true|false,
-      "tags": "comma-separated tags like repo,autogen,security|perf|reliability,signal:todo",
-      "path": "repo-relative file path",
-      "line": number|null,
-      "link": "repo://...#path:Lline",
-      "starter": "2-5 minute first step",
-      "dod": "definition of done (measurable)",
-      "evidence": {
-        "path": "same as path",
-        "line": number|null,
-        "quote": "short quote from excerpt (<=200 chars)"
-      }
+      "path": "repo/relative/path.ext",
+      "line": 123 | null,
+      "starter": "2-5 min first action",
+      "dod": "definition of done w/ verification command"
     }
   ]
 }
 
-Quality rules:
-- Prefer tasks like: add auth to a route, add rate limiting, tighten input validation,
-  fix N+1 query, add caching, improve error handling, add tests around a risky area.
-- Avoid: "refactor X" unless you specify EXACTLY what and why with evidence.
-- If evidence is only NOTE comments, treat it as low value (skip unless it points to real risk).
+Rules:
+- Output MUST be an OBJECT. Do NOT output a bare JSON array.
+- Use ONLY file paths present in the provided evidence.
+- Prefer reliability/security/correctness/observability over style.
+- Include at least one tag like: repo,autogen and (when relevant) signal:*.
+- Keep strings reasonably short to avoid truncation.
 """
-
-
-@dataclass(frozen=True)
-class PromptBudgets:
-    max_files: int = 18
-    max_chars_per_file: int = 800
-    max_total_chars: int = 12_000  # rough token bound
-
-
-def _trim(s: str, n: int) -> str:
-    s = (s or "").replace("\r\n", "\n")
-    if len(s) <= n:
-        return s
-    return s[: max(0, n - 20)] + "\n...<truncated>..."
 
 
 def build_prompt(
@@ -71,34 +48,26 @@ def build_prompt(
     snapshot_id: int,
     signal_counts: dict[str, Any],
     file_summaries: list[dict[str, Any]],
-    # Optional extra evidence (e.g., retrieved chunks)
     extra_evidence: Optional[list[dict[str, Any]]] = None,
 ) -> str:
-    budgets = PromptBudgets(
-        max_files=int(getattr(settings, "REPO_TASK_MAX_FILES", 18)),
-        max_chars_per_file=int(getattr(settings, "REPO_TASK_EXCERPT_CHARS", 800)),
-        max_total_chars=int(getattr(settings, "REPO_TASK_MAX_TOTAL_CHARS", 12_000)),
-    )
-
-    ranked = file_summaries[: budgets.max_files]
-
+    # Keep payload deterministic + bounded; model should not “invent” context.
     evidence_files: list[dict[str, Any]] = []
     running_chars = 0
+    hard_cap_chars = 28_000  # safety cap to reduce truncation risk
 
-    for f in ranked:
-        path = f.get("path") or ""
-        excerpt = _trim(f.get("excerpt") or "", budgets.max_chars_per_file)
-
+    for fs in file_summaries or []:
         item = {
-            "path": path,
-            "signals": {k: int(v or 0) for k, v in (f.get("signals") or {}).items()},
-            "excerpt": excerpt,
+            "path": str(fs.get("path") or "")[:600],
+            "excerpt": str(fs.get("excerpt") or "")[:2000],
         }
+        # include any signal:* counts if present
+        for k, v in (fs or {}).items():
+            if k.startswith("signal:"):
+                item[k] = v
 
         item_json = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        if running_chars + len(item_json) > budgets.max_total_chars:
+        if running_chars + len(item_json) > hard_cap_chars:
             break
-
         evidence_files.append(item)
         running_chars += len(item_json)
 
@@ -110,8 +79,12 @@ def build_prompt(
         "signal_counts": signal_counts,
         "evidence_files": evidence_files,
         "instructions": [
-            "Generate 5–12 tasks.",
-            "Prefer tasks that improve reliability, security, DX, tests, and production-readiness.",
+            # Key change: force object schema + one-per-finding behavior when applicable
+            'Return a JSON OBJECT with top-level key "tasks". Do NOT return a bare JSON array.',
+            "Prefer tasks that improve reliability, security, correctness, observability, tests, production-readiness.",
+            "Avoid pure style/lint tasks unless there is nothing else.",
+            # If excerpts include findings headers, enforce 1:1 mapping (works great for your tasks_generate flow)
+            "If excerpts contain [FINDING] blocks, generate exactly ONE task per finding.",
             "Each task must include: title, notes, tags, priority(1-5), estimated_minutes, blocks_me, path, line(optional), starter, dod.",
             "Tags must include: repo,autogen.",
             "ALWAYS include at least one signal tag when applicable (signal:timeout, signal:auth, signal:validation, etc.).",
@@ -126,18 +99,172 @@ def build_prompt(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _extract_json_object_lenient(raw: str) -> dict[str, Any]:
-    s = (raw or "").strip()
-    s = re.sub(r"^```(?:json)?\s*", "", s.strip(), flags=re.IGNORECASE)
-    s = re.sub(r"\s*```$", "", s.strip())
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s*```$", "", s).strip()
+    return s
 
-    first = s.find("{")
-    last = s.rfind("}")
-    if first == -1 or last == -1 or last <= first:
-        raise ValueError(f"No JSON object found. First 400 chars: {raw[:400]}")
 
-    candidate = s[first : last + 1]
-    return json.loads(candidate)
+def _balanced_json_span(text: str, start_idx: int) -> tuple[int, int] | None:
+    """
+    Return (start,end) indices for the first balanced JSON object/array starting at start_idx.
+    Supports {...} and [...] with nested structures.
+    """
+    if start_idx < 0 or start_idx >= len(text):
+        return None
+
+    opener = text[start_idx]
+    if opener not in "{[":
+        return None
+    closer = "}" if opener == "{" else "]"
+
+    stack = [opener]
+    i = start_idx + 1
+    in_str = False
+    esc = False
+
+    while i < len(text):
+        ch = text[i]
+
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None
+            top = stack[-1]
+            expected = "}" if top == "{" else "]"
+            if ch != expected:
+                # mismatched bracket; give up
+                return None
+            stack.pop()
+            if not stack:
+                return (start_idx, i)
+        i += 1
+
+    return None
+
+
+def _json_loads_best_effort(raw: str) -> Any:
+    """
+    Accept:
+      - full JSON object string
+      - full JSON array string
+      - text that contains a JSON object/array somewhere inside
+    """
+    s = _strip_code_fences(str(raw or ""))
+
+    # Fast path: direct parse if it *looks* like JSON
+    if s.startswith("{") or s.startswith("["):
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+
+    # Otherwise, find first '{' or '[' and extract balanced span
+    first_obj = s.find("{")
+    first_arr = s.find("[")
+    starts = [i for i in (first_obj, first_arr) if i != -1]
+    if not starts:
+        raise ValueError(f"No JSON object/array found. First 400 chars:\n{s[:400]}")
+
+    start = min(starts)
+    span = _balanced_json_span(s, start)
+    if not span:
+        raise ValueError(f"Found JSON start but could not balance brackets. First 400 chars:\n{s[:400]}")
+
+    cand = s[span[0] : span[1] + 1]
+    return json.loads(cand)
+
+
+def _normalize_tasks_schema(obj: Any) -> dict[str, Any]:
+    """
+    Normalize to:
+      {"tasks":[...]}
+    Accepts:
+      - {"tasks":[...]}
+      - [...]  (wrap)
+      - {"title":...} (single task object) (wrap)
+      - {"items":[...]} / {"suggestions":[...]} (wrap)
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get("tasks"), list):
+            return {"tasks": [x for x in obj["tasks"] if isinstance(x, dict)]}
+
+        for alt in ("items", "suggestions", "results"):
+            if isinstance(obj.get(alt), list):
+                return {"tasks": [x for x in obj[alt] if isinstance(x, dict)]}
+
+        # single task object heuristic
+        if any(k in obj for k in ("title", "notes", "dod", "starter")):
+            return {"tasks": [obj]}
+
+        return {"tasks": []}
+
+    if isinstance(obj, list):
+        return {"tasks": [x for x in obj if isinstance(x, dict)]}
+
+    return {"tasks": []}
+
+
+def _coerce_task_fields(t: dict[str, Any]) -> dict[str, Any]:
+    title = str(t.get("title") or "").strip()[:240] or "Untitled repo task"
+    notes = str(t.get("notes") or "").strip()[:4000]
+    tags = str(t.get("tags") or "repo,autogen").strip()[:300]
+    path = str(t.get("path") or "unknown").strip()[:600]
+    starter = str(t.get("starter") or "").strip()[:1000] or None
+    dod = str(t.get("dod") or "").strip()[:1000] or None
+
+    # priority
+    pr = t.get("priority", 3)
+    try:
+        pr_i = int(pr)
+    except Exception:
+        pr_i = 3
+    pr_i = max(1, min(5, pr_i))
+
+    # estimated minutes
+    em = t.get("estimated_minutes", 60)
+    try:
+        em_i = int(em)
+    except Exception:
+        em_i = 60
+    em_i = max(15, min(240, em_i))
+
+    # blocks_me
+    blocks_me = bool(t.get("blocks_me", False))
+
+    # line
+    line = t.get("line")
+    line_i: int | None = int(line) if isinstance(line, int) else None
+
+    return {
+        "title": title,
+        "notes": notes,
+        "tags": tags,
+        "priority": pr_i,
+        "estimated_minutes": em_i,
+        "blocks_me": blocks_me,
+        "path": path,
+        "line": line_i,
+        "starter": starter,
+        "dod": dod,
+    }
 
 
 async def generate_repo_tasks_json(
@@ -161,12 +288,22 @@ async def generate_repo_tasks_json(
         extra_evidence=extra_evidence,
     )
 
-    raw = await client.chat(system=SYSTEM_PROMPT, user=user_prompt, temperature=0.2, max_tokens=900)
+    # Slightly smaller output reduces truncation and malformed JSON.
+    raw = await client.chat(system=SYSTEM_PROMPT, user=user_prompt, temperature=0.2, max_tokens=750)
 
     try:
-        return _extract_json_object_lenient(raw)
+        parsed = _json_loads_best_effort(raw)
+        data = _normalize_tasks_schema(parsed)
+
+        normalized_tasks: list[dict[str, Any]] = []
+        for t in data.get("tasks", []):
+            if not isinstance(t, dict):
+                continue
+            normalized_tasks.append(_coerce_task_fields(t))
+
+        return {"tasks": normalized_tasks}
     except Exception as e:
         raise RuntimeError(
             "Repo task LLM returned non-JSON or truncated JSON. "
-            f"First 500 chars:\n{raw[:500]}"
+            f"First 500 chars:\n{str(raw)[:500]}"
         ) from e

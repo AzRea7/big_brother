@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,23 @@ _SEVERITY_MAP = {
     "high": 4,
     "critical": 5,
 }
+
+# These categories are what you actually care about for “high signal” findings.
+# If the model emits other categories, we’ll map them into one of these.
+_ALLOWED_CATEGORIES = {
+    "security",
+    "auth",
+    "reliability",
+    "correctness",
+    "observability",
+    "performance",
+    "testing",
+    "maintainability",
+    "docs",
+}
+
+# Model sometimes emits garbage like "false"/"true" into string fields.
+_BAD_LITERAL_STRINGS = {"false", "true", "null", "none", "n/a", "na"}
 
 
 def _fingerprint(f: dict[str, Any]) -> str:
@@ -65,6 +82,125 @@ def _coerce_severity(x: Any) -> int:
         return 3
 
 
+def _normalize_acceptance(a: Any) -> str:
+    """
+    Fix the exact failure mode you saw: acceptance becomes boolean-ish junk like "false"
+    (or empty/too short). This keeps tasks DoD from turning into garbage.
+
+    We do NOT try to be clever; we just ensure the field is usable.
+    """
+    s = str(a or "").strip()
+    if not s or s.lower() in _BAD_LITERAL_STRINGS or len(s) < 8:
+        return (
+            "Acceptance: fix implemented and verified with a concrete check "
+            "(pytest for affected area and/or a curl reproduction for the endpoint)."
+        )
+    return s[:1200]
+
+
+def _clean_text(v: Any, *, max_len: int) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in _BAD_LITERAL_STRINGS:
+        return None
+    return s[:max_len]
+
+
+def _normalize_category(cat: Any) -> str:
+    """
+    Model categories can drift ("style", "lint", "code quality", etc.).
+    We normalize into a stable set so downstream logic is deterministic.
+    """
+    s = str(cat or "").strip().lower()
+    if not s or s in _BAD_LITERAL_STRINGS:
+        return "maintainability"
+
+    # Common aliases
+    alias_map = {
+        "authentication": "auth",
+        "authorization": "auth",
+        "security": "security",
+        "sec": "security",
+        "reliability": "reliability",
+        "stability": "reliability",
+        "correctness": "correctness",
+        "bug": "correctness",
+        "observability": "observability",
+        "logging": "observability",
+        "metrics": "observability",
+        "performance": "performance",
+        "perf": "performance",
+        "test": "testing",
+        "tests": "testing",
+        "testing": "testing",
+        "docs": "docs",
+        "documentation": "docs",
+        "maintainability": "maintainability",
+        "refactor": "maintainability",
+        "style": "maintainability",  # we don’t want a dedicated “style” bucket
+        "lint": "maintainability",
+        "formatting": "maintainability",
+    }
+    s = alias_map.get(s, s)
+
+    # If still unknown, collapse to maintainability
+    if s not in _ALLOWED_CATEGORIES:
+        return "maintainability"
+    return s
+
+
+def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
+    """
+    Deterministic guardrails that stabilize output quality even when the model wobbles.
+
+    - If it smells like auth/secrets/keys -> raise severity floor.
+    - If it’s obviously style-only -> cap severity.
+    """
+    title = (f.get("title") or "").lower()
+    evidence = (f.get("evidence") or "").lower()
+    rec = (f.get("recommendation") or "").lower()
+    path = (f.get("path") or "").lower()
+    cat = (f.get("category") or "").lower()
+
+    joined = " ".join([title, evidence, rec, path, cat])
+
+    sev = int(f.get("severity") or 3)
+
+    # Upgrade floor for security-ish signals
+    security_tokens = [
+        "api key",
+        "x-api-key",
+        "authorization",
+        "bearer",
+        "jwt",
+        "csrf",
+        "sql injection",
+        "injection",
+        "secret",
+        "password",
+        "token",
+        "cors",
+        "auth",
+        "login",
+        "session",
+        "oauth",
+    ]
+    if any(t in joined for t in security_tokens):
+        sev = max(sev, 3)
+        # If path itself is strongly auth-ish, bump further
+        if any(p in path for p in ["auth", "security", "middleware", "deps.py", "oauth", "jwt"]):
+            sev = max(sev, 4)
+
+    # Downgrade obvious style-only findings
+    style_tokens = ["trailing whitespace", "whitespace", "formatting", "line too long", "rename variable", "typo"]
+    if any(t in joined for t in style_tokens) and not any(t in joined for t in security_tokens):
+        sev = min(sev, 2)
+
+    f["severity"] = max(1, min(5, sev))
+    return f
+
+
 def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
     """
     Prefer files that have content and are larger (often more "core" code).
@@ -81,6 +217,12 @@ def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
 
 
 def _build_prompt_context(files: list[RepoFile]) -> str:
+    """
+    Build a bounded excerpt bundle.
+
+    Key design: excerpts are your “budget.” Too big -> truncation -> broken JSON.
+    So we obey REPO_TASK_MAX_TOTAL_CHARS strictly.
+    """
     chunks: list[str] = []
     total = 0
 
@@ -103,9 +245,13 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
     Drop un-actionable garbage:
       - missing title
       - missing file_path/path
+
     Normalize:
       - severity -> int 1..5
+      - category -> stable enum-ish bucket
       - line_start/line -> int|None
+      - acceptance -> never boolean-ish junk
+      - evidence/recommendation lengths bounded
     """
     if not isinstance(f, dict):
         return None
@@ -120,6 +266,7 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     sev = _coerce_severity(f.get("severity"))
+    cat = _normalize_category(f.get("category"))
 
     line = None
     line_start = f.get("line_start") or f.get("line")
@@ -129,16 +276,23 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
         except Exception:
             line = None
 
-    return {
-        "category": str(f.get("category") or "maintainability")[:48],
+    evidence = _clean_text(f.get("evidence"), max_len=1600)
+    recommendation = _clean_text(f.get("recommendation"), max_len=1600)
+    acceptance = _normalize_acceptance(f.get("acceptance"))
+
+    out = {
+        "category": cat[:48],
         "severity": int(sev),
         "title": title[:240],
         "path": path,
         "line": line,
-        "evidence": (str(f.get("evidence")) if f.get("evidence") else None),
-        "recommendation": (str(f.get("recommendation")) if f.get("recommendation") else None),
-        "acceptance": (str(f.get("acceptance")) if f.get("acceptance") else None),
+        "evidence": evidence,
+        "recommendation": recommendation,
+        "acceptance": acceptance,
     }
+
+    out = _apply_guardrails(out)
+    return out
 
 
 async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, int]:
@@ -149,9 +303,23 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
     files = _pick_top_files(db, snapshot_id)
     context = _build_prompt_context(files)
 
+    # Prompt tightening: bias the model to high-signal categories and cap output.
+    # We keep compatibility with your existing prompts module by adding a strict “policy header”
+    # inside the user prompt (so we don’t have to restructure the prompts file right now).
+    policy = (
+        "PRIORITY POLICY:\n"
+        "- Prefer findings about: auth/security, secrets, DB/data integrity, retries/timeouts, validation, error handling, tests.\n"
+        "- Avoid style/lint unless there are no other issues.\n"
+        "- Keep findings <= 8.\n"
+        "- Keep strings short.\n"
+        "- acceptance MUST be a human sentence (not true/false).\n"
+        "\n"
+    )
+    user_prompt = repo_findings_user(policy + context)
+
     resp = await chat_completion_json(
         system=REPO_FINDINGS_SYSTEM,
-        user=repo_findings_user(context),
+        user=user_prompt,
     )
 
     findings = resp.get("findings") or []
@@ -249,6 +417,7 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
                 "title": r.title,
                 "evidence": r.evidence,
                 "recommendation": r.recommendation,
+                "acceptance": getattr(r, "acceptance", None),
                 "fingerprint": r.fingerprint,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
@@ -298,6 +467,11 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
             notes_parts.append(f"Evidence:\n{f.evidence}")
         if f.recommendation:
             notes_parts.append(f"Recommendation:\n{f.recommendation}")
+
+        # Acceptance normalization matters here too: it becomes your DoD “truth anchor.”
+        acceptance = _normalize_acceptance(getattr(f, "acceptance", None))
+        notes_parts.append(acceptance)
+
         notes = "\n\n".join(notes_parts) if notes_parts else "Generated from repo findings."
 
         db.add(
@@ -311,7 +485,7 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
                 tags=tags,
                 link=link,
                 starter="Open the file and reproduce/confirm the issue in 2–5 minutes.",
-                dod="Change is implemented + minimal test/verification step is documented in the task notes.",
+                dod=acceptance,
                 created_at=datetime.utcnow(),
                 completed=False,
             )
