@@ -16,7 +16,7 @@ Schema:
   "tasks": [
     {
       "title": "short, concrete",
-      "notes": "What/Why/How + evidence citations",
+      "notes": "Must include evidence citations like: [EVIDENCE path:Lx-Ly] ...",
       "tags": "comma,separated,tags",
       "priority": 1-5,
       "estimated_minutes": 15-240,
@@ -24,22 +24,24 @@ Schema:
       "path": "repo/relative/path.ext",
       "line": 123 | null,
       "starter": "2-5 min first action",
-      "dod": "definition of done w/ verification command"
+      "dod": "definition of done with a runnable verification command (pytest or curl)"
     }
   ]
 }
 
 Hard rules:
 - Output MUST be an OBJECT. Do NOT output a bare JSON array.
-- If extra_evidence contains retrieval packs with finding_fingerprint, create EXACTLY 1 task per pack.
-- You MUST choose ONE primary evidence chunk per task and set:
-  - path = that chunk.path
-  - line = that chunk.start_line
-- Notes MUST include at least one evidence citation formatted exactly:
-  [EVIDENCE path:Lstart-Lend] short excerpt...
-- DoD MUST include a runnable verification command containing either "pytest" or "curl".
-- Prefer reliability/security/correctness/observability/tests over style.
-- Include tags: repo,autogen and (when relevant) signal:* and finding:<fingerprint>.
+- Use ONLY file paths present in evidence_files[*].path.
+- Prefer security/reliability/correctness/observability/tests over style.
+- For EACH task, choose ONE primary chunk from evidence_files and:
+  - set task.path to that chunk path
+  - set task.line to the START line shown in that chunk header if available
+- notes MUST include 1-3 citations in this exact format:
+  [EVIDENCE <path>:L<start>-L<end>] <1 sentence why it matters>
+- dod MUST include at least one runnable verification command:
+  - pytest -q ...
+  - curl -i ...
+- Include tags: repo,autogen and (when relevant) signal:*.
 - Keep strings short to avoid truncation.
 """
 
@@ -56,12 +58,12 @@ def build_prompt(
 ) -> str:
     evidence_files: list[dict[str, Any]] = []
     running_chars = 0
-    hard_cap_chars = 20_000  # smaller => less truncation
+    hard_cap_chars = 20_000
 
     for fs in file_summaries or []:
         item = {
             "path": str(fs.get("path") or "")[:600],
-            "excerpt": str(fs.get("excerpt") or "")[:1400],
+            "excerpt": str(fs.get("excerpt") or "")[:1600],
         }
         for k, v in (fs or {}).items():
             if k.startswith("signal:"):
@@ -82,17 +84,15 @@ def build_prompt(
         "evidence_files": evidence_files,
         "instructions": [
             'Return a JSON OBJECT with top-level key "tasks". Do NOT return a bare JSON array.',
-            "If extra_evidence includes retrieval packs, generate EXACTLY 1 task per pack.",
+            "Create at most 4 tasks.",
+            "Create exactly ONE task per [FINDING] in extra_evidence if present.",
+            "Each task MUST cite evidence using [EVIDENCE path:Lx-Ly].",
+            "Each task MUST include a runnable verification command in DoD (pytest or curl).",
             "Prefer high-impact fixes (auth/security, secrets, timeouts/retries, validation, DB integrity, error handling, tests).",
             "Avoid pure style/lint unless there are no other issues.",
-            "Each task must include: title, notes, tags, priority, estimated_minutes, blocks_me, path, line(optional), starter, dod.",
-            "Tags must include: repo,autogen.",
-            "When using retrieval packs, tags MUST include finding:<fingerprint>.",
-            "Notes MUST cite evidence with: [EVIDENCE path:Lx-Ly] ...",
-            "DoD MUST contain either pytest or curl.",
             "Do not invent files not provided.",
             "Return JSON only. No markdown. No code fences.",
-            "Keep notes <= 900 chars. Keep dod <= 240 chars. Keep starter <= 140 chars.",
+            "Keep notes <= 800 chars. Keep dod <= 240 chars. Keep starter <= 140 chars.",
         ],
     }
 
@@ -266,6 +266,7 @@ def _clean_path(path_val: Any) -> str:
 
     if low in ("null", "none", "false", "true"):
         return "unknown"
+
     if low.endswith("/main") or low.endswith("/master"):
         return "unknown"
     if low.count("/") <= 1 and "." not in low:
@@ -287,9 +288,9 @@ def _coerce_task_fields(t: dict[str, Any]) -> dict[str, Any]:
     dod = str(t.get("dod") or "").strip()[:1000]
 
     if not starter:
-        starter = "Open the referenced file and locate the exact code path (5 min)."
+        starter = "Open the linked code chunk and identify the failing behavior (5 min)."
     if not dod:
-        dod = "Fix implemented and verified with pytest or a curl reproduction."
+        dod = "Fix implemented and verified with pytest -q or curl repro."
 
     pr = t.get("priority", 3)
     try:
@@ -351,7 +352,7 @@ async def generate_repo_tasks_json(
         system=SYSTEM_PROMPT,
         user=user_prompt,
         temperature=0.2,
-        max_tokens=900,
+        max_tokens=750,
         response_format={"type": "json_object"},
     )
 
