@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -116,10 +116,9 @@ def _repair_truncated_json(s: str) -> str:
     """
     Best-effort repair for truncated LLM JSON.
 
-    Handles the common failure mode you hit:
+    Handles the common failure mode:
       - JSON ends with a '}' but is missing the closing ']' for an array inside it.
-      - naive repair appends ']' AFTER '}', creating invalid nesting and the
-        "Expecting ',' delimiter" JSONDecodeError.
+      - naive repair appends ']' AFTER '}', creating invalid nesting.
 
     Strategy:
       1) Trim to last '}' or ']'
@@ -143,7 +142,7 @@ def _repair_truncated_json(s: str) -> str:
     # 3) Count open/close tokens outside strings
     opens_curly, closes_curly, opens_brack, closes_brack = _count_brackets_outside_strings(s)
 
-    # If we have too many closing braces/brackets, trim extras from the end only
+    # Trim extras from end only (rare but safe)
     extra_curly = max(0, closes_curly - opens_curly)
     extra_brack = max(0, closes_brack - opens_brack)
     while extra_curly > 0 and s.rstrip().endswith("}"):
@@ -163,23 +162,18 @@ def _repair_truncated_json(s: str) -> str:
     missing_curly = max(0, opens_curly - closes_curly)
 
     # 4) Insert missing ']' BEFORE the final '}' when we end with an object close.
-    # This is the key fix for your error.
     if missing_brack > 0:
         stripped = s.rstrip()
         if stripped.endswith("}"):
             insert_at = stripped.rfind("}")
-            # Insert all missing brackets before the last '}' (keeps nesting valid)
             s = stripped[:insert_at] + ("]" * missing_brack) + stripped[insert_at:]
-            missing_brack = 0
         else:
             s = stripped + ("]" * missing_brack)
-            missing_brack = 0
 
     # 5) Append missing '}' at the end
     if missing_curly > 0:
         s = s.rstrip() + ("}" * missing_curly)
 
-    # Final trailing-comma cleanup
     s = _TRAILING_COMMA_RE.sub(r"\1", s)
     return s
 
@@ -243,6 +237,8 @@ class LLMClient:
         user: str,
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        response_format: Optional[dict[str, Any]] = None,
+        extra_payload: Optional[dict[str, Any]] = None,
     ) -> str:
         if not self.enabled():
             raise LLMError("LLM not enabled. Set LLM_ENABLED=true and OPENAI_BASE_URL + OPENAI_MODEL.")
@@ -263,6 +259,11 @@ class LLMClient:
             "max_tokens": int(max_tokens),
         }
 
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if extra_payload:
+            payload.update(extra_payload)
+
         timeout = httpx.Timeout(
             connect=10.0,
             read=float(getattr(settings, "LLM_READ_TIMEOUT_S", 600.0)),
@@ -270,20 +271,35 @@ class LLMClient:
             pool=10.0,
         )
 
-        try:
+        async def _post(p: dict[str, Any]) -> dict[str, Any]:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(url, headers=headers, content=json.dumps(payload))
+                r = await client.post(url, headers=headers, content=json.dumps(p))
                 r.raise_for_status()
-                data = r.json()
+                return r.json()
+
+        try:
+            data = await _post(payload)
         except httpx.HTTPStatusError as e:
             body = ""
+            status = e.response.status_code
             try:
                 body = e.response.text
             except Exception:
                 body = ""
-            raise LLMError(
-                f"LLM HTTP error {e.response.status_code} from {url}. Response body: {body[:800]}"
-            ) from e
+
+            # Some gateways reject response_format; retry once without it.
+            if response_format is not None and status in (400, 404, 422):
+                payload.pop("response_format", None)
+                try:
+                    data = await _post(payload)
+                except Exception as e2:
+                    raise LLMError(
+                        f"LLM HTTP error {status} from {url}. Response body: {body[:800]}"
+                    ) from e2
+            else:
+                raise LLMError(
+                    f"LLM HTTP error {status} from {url}. Response body: {body[:800]}"
+                ) from e
         except Exception as e:
             raise LLMError(f"LLM request failed to {url}: {e}") from e
 
@@ -299,8 +315,15 @@ class LLMClient:
         user: str,
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        response_format: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        raw = await self.chat(system=system, user=user, temperature=temperature, max_tokens=max_tokens)
+        raw = await self.chat(
+            system=system,
+            user=user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
 
         # strict attempt first
         try:
@@ -319,4 +342,11 @@ async def chat_completion_json(system: str, user: str) -> dict[str, Any]:
     llm = LLMClient()
     if not llm.enabled():
         raise LLMError("LLM is disabled (LLM_ENABLED=false or missing OPENAI_BASE_URL/OPENAI_MODEL).")
-    return await llm.chat_json(system=system, user=user, temperature=0.2, max_tokens=2000)
+    # Use JSON-mode when supported; fallback is handled inside LLMClient.chat()
+    return await llm.chat_json(
+        system=system,
+        user=user,
+        temperature=0.2,
+        max_tokens=2000,
+        response_format={"type": "json_object"},
+    )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -37,6 +38,57 @@ _ALLOWED_CATEGORIES = {
 
 # Model sometimes emits garbage like "false"/"true" into string fields.
 _BAD_LITERAL_STRINGS = {"false", "true", "null", "none", "n/a", "na"}
+
+# Bias file selection toward likely high-signal areas (without embeddings).
+_HIGH_SIGNAL_HINTS = [
+    # auth/security
+    "auth",
+    "security",
+    "token",
+    "jwt",
+    "oauth",
+    "api_key",
+    "x-api-key",
+    "authorization",
+    "bearer",
+    "secret",
+    "password",
+    "cors",
+    "csrf",
+    # reliability
+    "timeout",
+    "retry",
+    "backoff",
+    "rate limit",
+    "ratelimit",
+    "throttle",
+    "429",
+    "circuit",
+    # db/data
+    "alembic",
+    "migration",
+    "transaction",
+    "commit",
+    "rollback",
+    "constraint",
+    "foreign key",
+    # api correctness
+    "validation",
+    "pydantic",
+    "fastapi",
+    "status_code",
+    "exception",
+    # observability/tests
+    "logging",
+    "logger",
+    "metrics",
+    "prometheus",
+    "trace",
+    "request_id",
+    "pytest",
+    "test_",
+]
+_HINT_RE = re.compile("|".join(re.escape(x) for x in _HIGH_SIGNAL_HINTS), re.IGNORECASE)
 
 
 def _fingerprint(f: dict[str, Any]) -> str:
@@ -201,19 +253,67 @@ def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
     return f
 
 
+def _file_signal_score(rf: RepoFile) -> int:
+    """
+    Score a file by:
+      1) path hints (auth/db/middleware/tests/etc.)
+      2) early-content hints (avoid scanning full text)
+      3) size as a weak tie-breaker
+
+    This is deliberately cheap and deterministic.
+    """
+    score = 0
+    path = (getattr(rf, "path", "") or "").lower()
+    if path:
+        # path hints are strong because they cost nothing
+        if any(x in path for x in ["auth", "security", "middleware", "deps", "oauth", "jwt"]):
+            score += 8
+        if any(x in path for x in ["db", "models", "migrations", "alembic"]):
+            score += 6
+        if any(x in path for x in ["routes", "api", "routers", "main.py"]):
+            score += 4
+        if any(x in path for x in ["test", "tests"]):
+            score += 3
+
+    text = (getattr(rf, "content_text", None) or "")
+    if text:
+        # only scan first N chars to keep it fast and predictable
+        head = text[:5000]
+        score += len(_HINT_RE.findall(head))
+
+    size = int(getattr(rf, "size", 0) or 0)
+    # size is a weak tie-breaker
+    score += min(5, size // 20_000)
+
+    return score
+
+
 def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
     """
-    Prefer files that have content and are larger (often more "core" code).
-    Hard cap to keep prompt bounded.
+    Prefer files that have content and are likely to contain high-signal issues.
+
+    Important: this replaces “largest files only”, which often selects junk (e.g., big data files)
+    and misses auth/middleware/routing where the real bugs live.
     """
     q = (
         db.query(RepoFile)
         .filter(RepoFile.snapshot_id == snapshot_id)
         .filter(RepoFile.content_text.isnot(None))
-        .order_by(RepoFile.size.desc())
     )
-    files = q.limit(settings.REPO_TASK_MAX_FILES * 3).all()
-    return files[: settings.REPO_TASK_MAX_FILES]
+    files = q.all()
+
+    scored: list[tuple[int, int, RepoFile]] = []
+    for rf in files:
+        score = _file_signal_score(rf)
+        size = int(getattr(rf, "size", 0) or 0)
+        scored.append((score, size, rf))
+
+    # Highest score first, then larger size
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    hard_cap = int(getattr(settings, "REPO_TASK_MAX_FILES", 20) or 20)
+    hard_cap = max(10, min(40, hard_cap))
+    return [rf for _, _, rf in scored[:hard_cap]]
 
 
 def _build_prompt_context(files: list[RepoFile]) -> str:
@@ -226,12 +326,15 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
     chunks: list[str] = []
     total = 0
 
+    max_excerpt = int(getattr(settings, "REPO_TASK_EXCERPT_CHARS", 800) or 800)
+    max_total = int(getattr(settings, "REPO_TASK_MAX_TOTAL_CHARS", 12_000) or 12_000)
+
     for rf in files:
         text = rf.content_text or ""
-        excerpt = text[: settings.REPO_TASK_EXCERPT_CHARS]
+        excerpt = text[:max_excerpt]
 
         block = f"\n--- FILE: {rf.path}\n{excerpt}\n"
-        if total + len(block) > settings.REPO_TASK_MAX_TOTAL_CHARS:
+        if total + len(block) > max_total:
             break
 
         chunks.append(block)
@@ -304,8 +407,6 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
     context = _build_prompt_context(files)
 
     # Prompt tightening: bias the model to high-signal categories and cap output.
-    # We keep compatibility with your existing prompts module by adding a strict “policy header”
-    # inside the user prompt (so we don’t have to restructure the prompts file right now).
     policy = (
         "PRIORITY POLICY:\n"
         "- Prefer findings about: auth/security, secrets, DB/data integrity, retries/timeouts, validation, error handling, tests.\n"
@@ -462,7 +563,7 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
         link = f"repo://snapshot/{snapshot_id}#{f.path}" + (f":L{f.line}" if f.line else "")
         tags = ",".join(["repo", "autogen", f"category:{f.category}", f"severity:{sev}", fp_tag])
 
-        notes_parts = []
+        notes_parts: list[str] = []
         if f.evidence:
             notes_parts.append(f"Evidence:\n{f.evidence}")
         if f.recommendation:

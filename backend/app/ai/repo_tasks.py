@@ -31,10 +31,10 @@ Schema:
 
 Rules:
 - Output MUST be an OBJECT. Do NOT output a bare JSON array.
-- Use ONLY file paths present in the provided evidence.
-- Prefer reliability/security/correctness/observability over style.
-- Include at least one tag like: repo,autogen and (when relevant) signal:*.
-- Keep strings reasonably short to avoid truncation.
+- Use ONLY file paths present in the provided evidence_files[*].path.
+- Prefer reliability/security/correctness/observability/tests over style.
+- Include tags: repo,autogen and (when relevant) signal:*.
+- Keep strings short to avoid truncation.
 """
 
 
@@ -50,12 +50,12 @@ def build_prompt(
 ) -> str:
     evidence_files: list[dict[str, Any]] = []
     running_chars = 0
-    hard_cap_chars = 22_000  # tighter cap reduces truncation frequency
+    hard_cap_chars = 20_000  # smaller => less truncation
 
     for fs in file_summaries or []:
         item = {
             "path": str(fs.get("path") or "")[:600],
-            "excerpt": str(fs.get("excerpt") or "")[:1600],
+            "excerpt": str(fs.get("excerpt") or "")[:1400],
         }
         for k, v in (fs or {}).items():
             if k.startswith("signal:"):
@@ -76,16 +76,16 @@ def build_prompt(
         "evidence_files": evidence_files,
         "instructions": [
             'Return a JSON OBJECT with top-level key "tasks". Do NOT return a bare JSON array.',
-            "Prefer tasks that improve reliability, security, correctness, observability, tests, production-readiness.",
-            "Avoid pure style/lint tasks unless there is nothing else.",
+            "Create at most 4 tasks (match max_findings upstream).",
+            "Prefer high-impact fixes (auth/security, secrets, timeouts/retries, validation, DB integrity, error handling, tests).",
+            "Avoid pure style/lint unless there are no other issues.",
             "If excerpts contain [FINDING] blocks, generate exactly ONE task per finding.",
-            "Each task must include: title, notes, tags, priority(1-5), estimated_minutes, blocks_me, path, line(optional), starter, dod.",
+            "Each task must include: title, notes, tags, priority, estimated_minutes, blocks_me, path, line(optional), starter, dod.",
             "Tags must include: repo,autogen.",
             "ALWAYS include at least one signal tag when applicable (signal:timeout, signal:auth, signal:validation, etc.).",
             "Do not invent files not provided.",
             "Return JSON only. No markdown. No code fences.",
-            # important: keep fields short to reduce truncation risk
-            "Keep notes <= 600 chars. Keep dod <= 200 chars. Keep starter <= 120 chars.",
+            "Keep notes <= 600 chars. Keep dod <= 220 chars. Keep starter <= 140 chars.",
         ],
     }
 
@@ -103,10 +103,6 @@ def _strip_code_fences(s: str) -> str:
 
 
 def _balanced_json_span(text: str, start_idx: int) -> tuple[int, int] | None:
-    """
-    Return (start,end) indices for the first balanced JSON object/array starting at start_idx.
-    Supports {...} and [...] with nested structures.
-    """
     if start_idx < 0 or start_idx >= len(text):
         return None
 
@@ -155,22 +151,10 @@ def _balanced_json_span(text: str, start_idx: int) -> tuple[int, int] | None:
 
 
 def _repair_truncated_json(s: str, start_idx: int) -> str:
-    """
-    Repair a truncated JSON object/array that started at start_idx by:
-      - tracking bracket stack
-      - tracking whether we're inside a string
-      - if truncated inside a string, close it safely
-      - append missing closing brackets/braces
-
-    This turns many "cut off mid-output" responses into valid JSON.
-    """
     prefix = s[:start_idx]
     body = s[start_idx:]
 
-    if not body:
-        return s
-
-    if body[0] not in "{[":
+    if not body or body[0] not in "{[":
         return s
 
     stack: list[str] = [body[0]]
@@ -205,20 +189,15 @@ def _repair_truncated_json(s: str, start_idx: int) -> str:
                 if ch == expected:
                     stack.pop()
                     if not stack:
-                        # already complete; return as-is
                         return prefix + body
         i += 1
 
     repaired = body
-
-    # If we ended inside a string, close it.
     if in_str:
-        # If last char was a backslash, the quote we add would be escaped.
         if esc:
             repaired += "\\\\"
         repaired += '"'
 
-    # Now close any remaining brackets/braces.
     while stack:
         top = stack.pop()
         repaired += "}" if top == "{" else "]"
@@ -227,25 +206,15 @@ def _repair_truncated_json(s: str, start_idx: int) -> str:
 
 
 def _json_loads_best_effort(raw: str) -> Any:
-    """
-    Accept:
-      - full JSON object string
-      - full JSON array string
-      - text that contains a JSON object/array somewhere inside
-      - truncated JSON object/array that can be repaired
-    """
     s = _strip_code_fences(str(raw or ""))
 
-    # Fast path
     if s.startswith("{") or s.startswith("["):
         try:
             return json.loads(s)
         except Exception:
-            # attempt repair from 0
             repaired = _repair_truncated_json(s, 0)
             return json.loads(repaired)
 
-    # Find first '{' or '['
     first_obj = s.find("{")
     first_arr = s.find("[")
     starts = [i for i in (first_obj, first_arr) if i != -1]
@@ -254,38 +223,24 @@ def _json_loads_best_effort(raw: str) -> Any:
 
     start = min(starts)
 
-    # Try balanced extraction
     span = _balanced_json_span(s, start)
     if span:
         cand = s[span[0] : span[1] + 1]
         return json.loads(cand)
 
-    # Not balanced => truncated. Try repair.
     repaired = _repair_truncated_json(s, start)
-    return json.loads(repaired[start:])  # parse repaired JSON from start
+    return json.loads(repaired[start:])
 
 
 def _normalize_tasks_schema(obj: Any) -> dict[str, Any]:
-    """
-    Normalize to:
-      {"tasks":[...]}
-    Accepts:
-      - {"tasks":[...]}
-      - [...]  (wrap)
-      - {"title":...} (single task object) (wrap)
-      - {"items":[...]} / {"suggestions":[...]} (wrap)
-    """
     if isinstance(obj, dict):
         if isinstance(obj.get("tasks"), list):
             return {"tasks": [x for x in obj["tasks"] if isinstance(x, dict)]}
-
         for alt in ("items", "suggestions", "results"):
             if isinstance(obj.get(alt), list):
                 return {"tasks": [x for x in obj[alt] if isinstance(x, dict)]}
-
         if any(k in obj for k in ("title", "notes", "dod", "starter")):
             return {"tasks": [obj]}
-
         return {"tasks": []}
 
     if isinstance(obj, list):
@@ -294,16 +249,46 @@ def _normalize_tasks_schema(obj: Any) -> dict[str, Any]:
     return {"tasks": []}
 
 
+def _clean_path(path_val: Any) -> str:
+    """
+    Only accept plausible repo-relative file paths.
+    Reject repo roots / branch strings / nulls.
+    """
+    if path_val is None:
+        return "unknown"
+    s = str(path_val).strip()
+    if not s:
+        return "unknown"
+    low = s.lower()
+
+    if low in ("null", "none", "false", "true"):
+        return "unknown"
+
+    # reject obvious non-file patterns seen in your logs
+    if low.endswith("/main") or low.endswith("/master"):
+        return "unknown"
+    if low.count("/") <= 1 and "." not in low:
+        return "unknown"
+    if "." not in low.split("/")[-1]:
+        return "unknown"
+
+    return s[:600]
+
+
 def _coerce_task_fields(t: dict[str, Any]) -> dict[str, Any]:
     title = str(t.get("title") or "").strip()[:240] or "Untitled repo task"
     notes = str(t.get("notes") or "").strip()[:4000]
     tags = str(t.get("tags") or "repo,autogen").strip()[:300]
 
-    path_val = t.get("path")
-    path = str(path_val).strip()[:600] if path_val is not None else "unknown"
+    path = _clean_path(t.get("path"))
 
-    starter = str(t.get("starter") or "").strip()[:1000] or None
-    dod = str(t.get("dod") or "").strip()[:1000] or None
+    starter = str(t.get("starter") or "").strip()[:1000]
+    dod = str(t.get("dod") or "").strip()[:1000]
+
+    if not starter:
+        starter = "Open the referenced file and locate the exact code path (5 min)."
+    if not dod:
+        dod = "Fix implemented and verified with a concrete command (pytest or curl repro)."
 
     pr = t.get("priority", 3)
     try:
@@ -348,7 +333,6 @@ async def generate_repo_tasks_json(
     file_summaries: list[dict[str, Any]],
     extra_evidence: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    # Local import to avoid circulars if your llm module imports prompts.
     from .llm import LLMClient
 
     client = LLMClient()
@@ -362,8 +346,14 @@ async def generate_repo_tasks_json(
         extra_evidence=extra_evidence,
     )
 
-    # Lower max_tokens => fewer truncations. Repair logic handles the rest.
-    raw = await client.chat(system=SYSTEM_PROMPT, user=user_prompt, temperature=0.2, max_tokens=520)
+    # JSON-mode if supported; llm.py will retry without response_format if gateway rejects.
+    raw = await client.chat(
+        system=SYSTEM_PROMPT,
+        user=user_prompt,
+        temperature=0.2,
+        max_tokens=650,
+        response_format={"type": "json_object"},
+    )
 
     try:
         parsed = _json_loads_best_effort(raw)
