@@ -31,6 +31,51 @@ Output format MUST be EXACTLY:
 - one sentence
 """
 
+USER_PROMPT_TEMPLATE = """You are Goal Autopilot, a helpful planning assistant.
+
+You will be given:
+- a list of Tasks (some may be completed)
+- optional Goals
+- a target project filter
+
+Your job is to generate a practical daily plan.
+
+Output MUST be plain text (not JSON). Use this structure exactly:
+
+Daily Plan — Goal Autopilot ({project})
+
+1) Top 3
+- **[id]** Title (estimated_minutes min)
+  Starter (2 min): ...
+  DoD: ...
+  Next: ...
+
+2) Doable Now
+- **[id]** Title (...)
+  Starter: ...
+  DoD: ...
+
+3) Quick Wins
+- **[id]** Title (...)
+
+4) Motivation
+- One short paragraph.
+
+Rules:
+- Prefer incomplete tasks first.
+- If there are no tasks for the project, create 1 placeholder task suggestion and explain how to add tasks.
+- Keep it realistic: timebox, concrete next steps, no fluff.
+- Never invent IDs that look real; use [new] for placeholder.
+Project filter: {project}
+
+TASKS (JSON):
+{tasks_json}
+
+GOALS (JSON):
+{goals_json}
+"""
+
+
 # -----------------------
 # Repo Findings generation
 # -----------------------
