@@ -6,7 +6,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -37,12 +37,92 @@ def _strip_code_fences(s: str) -> str:
     return s.strip()
 
 
+def _maybe_unwrap_openai_chat_response(raw_text: str) -> str:
+    """
+    Some OpenAI-compatible servers return the whole response JSON as a string.
+    If so, extract choices[0].message.content.
+    """
+    txt = (raw_text or "").strip()
+    if not txt:
+        return txt
+    if txt.startswith("{") and txt.endswith("}"):
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            return raw_text
+        if isinstance(obj, dict) and isinstance(obj.get("choices"), list) and obj["choices"]:
+            c0 = obj["choices"][0]
+            if isinstance(c0, dict):
+                msg = c0.get("message")
+                if isinstance(msg, dict):
+                    content = msg.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content
+    return raw_text
+
+
+def _remove_trailing_commas(s: str) -> str:
+    prev = None
+    cur = s
+    for _ in range(6):
+        prev = cur
+        cur = re.sub(r",\s*([}\]])", r"\1", cur)
+        if cur == prev:
+            break
+    return cur
+
+
+def _balanced_json_objects_in_text(s: str) -> list[str]:
+    """
+    Extract balanced {...} objects by tracking brace depth.
+    Returns all balanced objects (largest first).
+    """
+    text = s or ""
+    out: list[str] = []
+    depth = 0
+    start: int | None = None
+
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    out.append(text[start : i + 1])
+                    start = None
+
+    out.sort(key=len, reverse=True)
+    return out
+
+
 def _extract_json_object_lenient(raw: str) -> dict[str, Any]:
     """
-    Local models often wrap JSON in text/fences.
-    We take the first {...} blob and parse it.
+    Try to find and parse a JSON object in messy model output.
     """
     s = _strip_code_fences(raw)
+
+    # direct
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+        return {"findings": obj}
+    except Exception:
+        pass
+
+    # balanced candidates
+    for cand in _balanced_json_objects_in_text(s):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+
+    # first..last brace
     first = s.find("{")
     last = s.rfind("}")
     if first == -1 or last == -1 or last <= first:
@@ -50,15 +130,123 @@ def _extract_json_object_lenient(raw: str) -> dict[str, Any]:
     return json.loads(s[first : last + 1])
 
 
-def _pick_files_for_scan(files: list[RepoFile]) -> list[RepoFile]:
+def _json_loads_best_effort(raw_text: str) -> dict[str, Any]:
     """
-    Choose a small set of high-signal files.
-    We bias toward:
-      - backend/app/* (fastapi, db, routes, services)
-      - infra (docker, ci)
-      - auth/config/env
+    Best-effort dict parse.
     """
+    content = _maybe_unwrap_openai_chat_response(str(raw_text))
+    content = _strip_code_fences(content)
 
+    try:
+        obj = json.loads(content)
+        if isinstance(obj, dict):
+            return obj
+        return {"findings": obj}
+    except Exception:
+        pass
+
+    repaired = _remove_trailing_commas(content)
+    if repaired != content:
+        try:
+            obj = json.loads(repaired)
+            if isinstance(obj, dict):
+                return obj
+            return {"findings": obj}
+        except Exception:
+            pass
+
+    return _extract_json_object_lenient(repaired)
+
+
+def _normalize_findings_schema(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Accept multiple schemas:
+      - {"findings":[...]}
+      - {"issues":[...]} (lint-style output)
+    """
+    findings = data.get("findings")
+    if isinstance(findings, list):
+        return [x for x in findings if isinstance(x, dict)]
+
+    issues = data.get("issues")
+    if isinstance(issues, list):
+        out: list[dict[str, Any]] = []
+        for it in issues:
+            if not isinstance(it, dict):
+                continue
+            msg = str(it.get("message") or "Issue").strip()
+            out.append(
+                {
+                    "path": str(it.get("path") or "").strip(),
+                    "line": it.get("line") if isinstance(it.get("line"), int) else None,
+                    "category": "lint",
+                    "severity": 2,
+                    "title": msg[:240],
+                    "evidence": msg[:1200],
+                    "recommendation": "Fix the reported issue; run ruff/pytest to confirm it’s resolved.",
+                    "acceptance": "Lint/CI passes; no regressions.",
+                }
+            )
+        return out
+
+    return []
+
+
+def _salvage_findings_from_truncated_text(raw_text: str) -> list[dict[str, Any]]:
+    """
+    If the model returns truncated / invalid JSON for the full document,
+    salvage *any complete finding objects*.
+
+    Approach:
+      - find the first occurrence of '"findings"' then scan for balanced {...}
+      - parse each object; keep only objects that have at least 'path' + 'title' keys
+    """
+    content = _maybe_unwrap_openai_chat_response(str(raw_text))
+    content = _strip_code_fences(content)
+    content = _remove_trailing_commas(content)
+
+    idx = content.lower().find('"findings"')
+    scope = content[idx:] if idx != -1 else content
+
+    objs = _balanced_json_objects_in_text(scope)
+
+    out: list[dict[str, Any]] = []
+    for cand in objs:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        # Candidate could be the outer {"findings":[...]} or an inner finding object.
+        if "findings" in obj and isinstance(obj.get("findings"), list):
+            for it in obj["findings"]:
+                if isinstance(it, dict) and (it.get("path") or it.get("title")):
+                    out.append(it)
+            continue
+
+        # Inner object heuristic: must look like a finding
+        if (obj.get("path") or obj.get("title")) and any(
+            k in obj for k in ("evidence", "recommendation", "acceptance", "category", "severity")
+        ):
+            out.append(obj)
+
+    # de-dup by (path,line,title)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for f in out:
+        key = f"{f.get('path')}|{f.get('line')}|{f.get('title')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+
+    # keep a reasonable number (avoid accidentally grabbing tons of objects)
+    return deduped[:50]
+
+
+def _pick_files_for_scan(files: list[RepoFile]) -> list[RepoFile]:
     def score(p: str) -> int:
         p = (p or "").lower()
         s = 0
@@ -85,12 +273,6 @@ def _pick_files_for_scan(files: list[RepoFile]) -> list[RepoFile]:
 
 
 async def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int = 14) -> dict[str, Any]:
-    """
-    LLM-driven findings: pick a small set of high-signal files, send excerpts, store RepoFinding rows.
-
-    IMPORTANT FIX:
-      Some LLMClient implementations return a coroutine from chat(). We safely await it if needed.
-    """
     snap = db.get(RepoSnapshot, snapshot_id)
     if not snap:
         return {"snapshot_id": snapshot_id, "created": 0, "skipped": 0, "detail": "snapshot not found"}
@@ -106,23 +288,59 @@ async def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int =
 
     llm = LLMClient()
     if not llm.enabled():
-        raise RuntimeError("LLM not enabled. Set LLM_ENABLED=true, OPENAI_BASE_URL, OPENAI_MODEL.")
+        return {
+            "snapshot_id": snapshot_id,
+            "created": 0,
+            "skipped": 0,
+            "scanned_files": len(payload_files),
+            "detail": "LLM not enabled (set LLM_ENABLED=true, OPENAI_BASE_URL, OPENAI_MODEL)",
+        }
 
-    system = "You are a strict code reviewer. Output JSON only."
+    # IMPORTANT: Shorter, stricter output reduces malformed JSON.
+    system = (
+        "You are a strict code reviewer.\n"
+        "Return ONLY valid JSON (no markdown, no backticks) with schema:\n"
+        '{"findings":[{"path":"...","line":123,"category":"...","severity":1,"title":"...","evidence":"...","recommendation":"...","acceptance":"..."}]}\n'
+        "Rules:\n"
+        "- findings must be a list (can be empty)\n"
+        "- severity must be int 1-5\n"
+        "- line must be int or null\n"
+        "- Keep findings <= 8 total\n"
+        "- Keep each string short (<= 240 chars) to avoid truncation\n"
+    )
+
     user = {"snapshot_id": snapshot_id, "repo": snap.repo, "branch": snap.branch, "files": payload_files}
 
-    raw_text = llm.chat(system=system, user=json.dumps(user), temperature=0.2, max_tokens=1800)
+    raw_text = llm.chat(system=system, user=json.dumps(user), temperature=0.1, max_tokens=1200)
     if inspect.isawaitable(raw_text):
-        raw_text = await raw_text  # ✅ fixes: 'coroutine' object has no attribute 'strip'
+        raw_text = await raw_text
+
+    raw_str = str(raw_text)
+
+    findings: list[dict[str, Any]] = []
+    parse_error: str | None = None
 
     try:
-        data = json.loads(_strip_code_fences(str(raw_text)))
-    except Exception:
-        data = _extract_json_object_lenient(str(raw_text))
+        data = _json_loads_best_effort(raw_str)
+        findings = _normalize_findings_schema(data)
+    except Exception as e:
+        parse_error = f"{type(e).__name__}: {e}"
+        findings = _salvage_findings_from_truncated_text(raw_str)
 
-    findings = data.get("findings") or []
-    if not isinstance(findings, list):
-        raise RuntimeError(f"LLM returned invalid findings: {str(data)[:400]}")
+    if not findings:
+        preview = _strip_code_fences(_maybe_unwrap_openai_chat_response(raw_str))[:1200]
+        return {
+            "snapshot_id": snapshot_id,
+            "repo": snap.repo,
+            "created": 0,
+            "skipped": 0,
+            "scanned_files": len(payload_files),
+            "error": f"LLM output parse failed ({parse_error}) and salvage found 0 complete findings"
+            if parse_error
+            else "LLM returned 0 findings",
+            "raw_preview": preview,
+            "detail": "Model did not return usable findings. Try a more JSON-compliant model or lower temperature.",
+        }
 
     existing = db.scalars(select(RepoFinding).where(RepoFinding.snapshot_id == snapshot_id)).all()
     existing_keys = {f.fingerprint for f in existing if f.fingerprint}
@@ -138,9 +356,9 @@ async def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int =
         severity = int(f.get("severity") or 3)
         severity = max(1, min(5, severity))
         title = str(f.get("title") or "Finding").strip()[:240]
-        evidence = str(f.get("evidence") or "").strip()
-        recommendation = str(f.get("recommendation") or "").strip()
-        acceptance = str(f.get("acceptance") or "").strip()
+        evidence = str(f.get("evidence") or "").strip()[:2000]
+        recommendation = str(f.get("recommendation") or "").strip()[:2000]
+        acceptance = str(f.get("acceptance") or "").strip()[:1000]
 
         fp = str(f.get("fingerprint") or "").strip()
         if not fp:
@@ -175,6 +393,7 @@ async def scan_repo_findings_llm(db: Session, snapshot_id: int, max_files: int =
         "created": created,
         "skipped": skipped,
         "scanned_files": len(payload_files),
+        "salvaged": True if parse_error else False,
     }
 
 
@@ -191,10 +410,6 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50) -> list[RepoFi
 
 
 def tasks_from_findings(db: Session, snapshot_id: int, project: str = "haven", limit: int = 12) -> dict[str, Any]:
-    """
-    Deterministic conversion: RepoFinding -> Task (no LLM).
-    This is your safe fallback / baseline.
-    """
     snap = db.get(RepoSnapshot, snapshot_id)
     if not snap:
         return {"created": 0, "skipped": 0, "detail": "snapshot not found"}
@@ -286,9 +501,6 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
     max_findings: int = 10,
     chunks_per_finding: int = 3,
 ) -> list[SuggestedTask]:
-    """
-    findings → query → retrieve chunks (repo_chunks.search_chunks) → LLM tasks
-    """
     if not getattr(settings, "LLM_ENABLED", False):
         return []
     if not getattr(settings, "OPENAI_MODEL", None):
@@ -314,7 +526,6 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
     for f in findings:
         q = _finding_query(f)
 
-        # 1) scoped search (path bias)
         mode, hits = await search_chunks(
             db,
             snapshot_id=snapshot.id,
@@ -324,7 +535,6 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
             path_contains=f.path,
         )
 
-        # 2) fallback: broad search
         if not hits:
             mode, hits = await search_chunks(
                 db,
@@ -349,18 +559,10 @@ async def _llm_generate_tasks_from_findings_with_retrieval(
             excerpt = excerpt[: int(getattr(settings, "REPO_TASK_EXCERPT_CHARS", 1200))]
 
             sig = count_markers_in_text(excerpt)
-            file_summaries.append(
-                {
-                    "path": str(h.path or f.path or "unknown"),
-                    "excerpt": excerpt,
-                    **sig,
-                }
-            )
+            file_summaries.append({"path": str(h.path or f.path or "unknown"), "excerpt": excerpt, **sig})
 
     files = db.scalars(
-        select(RepoFile)
-        .where(RepoFile.snapshot_id == snapshot.id)
-        .where(RepoFile.content_kind == "text")
+        select(RepoFile).where(RepoFile.snapshot_id == snapshot.id).where(RepoFile.content_kind == "text")
     ).all()
     signal_counts = compute_signal_counts_for_files(files)
 
@@ -406,9 +608,6 @@ async def generate_tasks_from_findings_llm(
     max_findings: int = 10,
     chunks_per_finding: int = 3,
 ) -> dict[str, Any]:
-    """
-    Public service: retrieval-driven LLM generation, then CREATE Task rows (deduped).
-    """
     snap = db.get(RepoSnapshot, snapshot_id)
     if not snap:
         return {"snapshot_id": snapshot_id, "created": 0, "skipped": 0, "detail": "snapshot not found"}
