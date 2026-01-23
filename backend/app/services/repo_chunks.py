@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,13 +10,26 @@ from typing import Any, Optional
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..models import RepoChunk, RepoChunkEmbedding, RepoFile
-from ..ai.embeddings import embed_texts
+from .repo_embeddings import (
+    cosine_similarity,
+    embed_texts,
+    embedding_model_name,
+    embeddings_enabled,
+)
 
 
 @dataclass(frozen=True)
 class ChunkHit:
+    """A single retrieved chunk hit.
+
+    score is a *mode-agnostic quality score* in [0, 1] where higher is better.
+
+    - Postgres FTS: ts_rank_cd already behaves roughly like [0,1] → clamped.
+    - SQLite FTS5 bm25: lower is better → score = 1 / (1 + bm25)
+    - Embeddings: cosine similarity in [-1,1] → score = clamp((cos+1)/2)
+    """
+
     id: int
     snapshot_id: int
     path: str
@@ -43,9 +55,7 @@ def _extract_symbols(lines: list[str]) -> list[str]:
 
 
 def _dialect_name(db: Session) -> str:
-    """
-    Used to detect postgres vs sqlite without importing engine types.
-    """
+    """Detect postgres vs sqlite without importing engine types."""
     try:
         bind = db.get_bind()
         if bind is None:
@@ -55,10 +65,16 @@ def _dialect_name(db: Session) -> str:
         return ""
 
 
+def _clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
 def load_chunk_text(*, db: Session, chunk_id: int) -> dict[str, Any]:
-    """
-    Load a single chunk by id for UI/debug viewing.
-    """
+    """Load a single chunk by id for UI/debug viewing."""
     c = db.get(RepoChunk, int(chunk_id))
     if not c:
         return {"ok": False, "error": "chunk_not_found", "chunk_id": int(chunk_id)}
@@ -94,14 +110,7 @@ def chunk_snapshot(
     overlap: int = 25,
     max_chars: int = 7000,
 ) -> dict[str, Any]:
-    """
-    Build RepoChunk rows from RepoFile content for a snapshot.
-
-    If force=False and chunks already exist, this will NO-OP and just return counts.
-    If force=True, it deletes and rebuilds.
-
-    Returns: {"snapshot_id":..., "inserted":..., "deleted":..., "total":...}
-    """
+    """Build RepoChunk rows from RepoFile content for a snapshot."""
     max_lines = max(40, int(max_lines))
     overlap = max(0, min(int(overlap), max_lines - 1))
 
@@ -179,34 +188,18 @@ def chunk_snapshot(
     return {"snapshot_id": snapshot_id, "inserted": inserted, "deleted": int(deleted), "total": int(total or 0)}
 
 
-# -----------------------------
-# SQLite FTS (existing behavior)
-# -----------------------------
 def _fts_available(db: Session) -> bool:
-    """
-    We create FTS in migrations.ensure_schema if SQLite supports it.
-    This checks presence of the virtual table.
-    """
     try:
-        row = db.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_chunks_fts'")
-        ).fetchone()
+        row = db.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='repo_chunks_fts'")).fetchone()
         return bool(row)
     except Exception:
         return False
 
 
 def _normalize_fts_query(q: str) -> str:
-    """
-    Minimal FTS hygiene:
-    - split into tokens
-    - quote tokens with special chars
-    - join with OR so you get recall
-    """
     q = (q or "").strip()
     if not q:
         return ""
-
     toks = re.split(r"\s+", q)
     cleaned: list[str] = []
     for t in toks:
@@ -231,7 +224,6 @@ def search_chunks_fts(
 ) -> list[ChunkHit]:
     if not _fts_available(db):
         return []
-
     q = _normalize_fts_query(query)
     if not q:
         return []
@@ -246,19 +238,23 @@ def search_chunks_fts(
     SELECT
       c.id, c.snapshot_id, c.path, c.start_line, c.end_line,
       c.chunk_text, c.symbols_json,
-      bm25(repo_chunks_fts) as rank
+      bm25(repo_chunks_fts) as bm25_rank
     FROM repo_chunks_fts
     JOIN repo_chunks c ON c.id = repo_chunks_fts.rowid
     WHERE c.snapshot_id = :sid
       AND repo_chunks_fts MATCH :q
       {path_filter_sql}
-    ORDER BY rank
+    ORDER BY bm25_rank ASC
     LIMIT :k
     """
 
     rows = db.execute(text(sql), params).fetchall()
     out: list[ChunkHit] = []
     for r in rows:
+        bm25_rank = float(r[7]) if r[7] is not None else None
+        score = None
+        if bm25_rank is not None and bm25_rank >= 0.0:
+            score = 1.0 / (1.0 + bm25_rank)
         out.append(
             ChunkHit(
                 id=int(r[0]),
@@ -268,15 +264,12 @@ def search_chunks_fts(
                 end_line=int(r[4]),
                 chunk_text=str(r[5]),
                 symbols_json=r[6],
-                score=float(-r[7]) if r[7] is not None else None,
+                score=score,
             )
         )
     return out
 
 
-# -----------------------------
-# Postgres FTS (NEW)
-# -----------------------------
 def search_chunks_postgres_fts(
     db: Session,
     *,
@@ -285,6 +278,13 @@ def search_chunks_postgres_fts(
     top_k: int = 10,
     path_contains: Optional[str] = None,
 ) -> list[ChunkHit]:
+    """
+    Postgres full-text search.
+
+    IMPORTANT:
+    - websearch_to_tsquery behaves more like a real user search box (supports quoting, OR/AND).
+    - plainto_tsquery behaves like strict AND of all terms, often too strict for code chunks.
+    """
     q = (query or "").strip()
     if not q:
         return []
@@ -295,19 +295,18 @@ def search_chunks_postgres_fts(
         params["p"] = f"%{path_contains}%"
         path_filter_sql = " AND c.path ILIKE :p "
 
-    # No extensions required; uses built-in Postgres text search.
     sql = f"""
     SELECT
       c.id, c.snapshot_id, c.path, c.start_line, c.end_line,
       c.chunk_text, c.symbols_json,
       ts_rank_cd(
         to_tsvector('english', coalesce(c.chunk_text,'')),
-        plainto_tsquery('english', :q)
+        websearch_to_tsquery('english', :q)
       ) AS rank
     FROM repo_chunks c
     WHERE c.snapshot_id = :sid
       {path_filter_sql}
-      AND to_tsvector('english', coalesce(c.chunk_text,'')) @@ plainto_tsquery('english', :q)
+      AND to_tsvector('english', coalesce(c.chunk_text,'')) @@ websearch_to_tsquery('english', :q)
     ORDER BY rank DESC
     LIMIT :k
     """
@@ -315,6 +314,7 @@ def search_chunks_postgres_fts(
     rows = db.execute(text(sql), params).fetchall()
     out: list[ChunkHit] = []
     for r in rows:
+        rank = float(r[7]) if r[7] is not None else None
         out.append(
             ChunkHit(
                 id=int(r[0]),
@@ -324,52 +324,23 @@ def search_chunks_postgres_fts(
                 end_line=int(r[4]),
                 chunk_text=str(r[5]),
                 symbols_json=r[6],
-                score=float(r[7]) if r[7] is not None else None,
+                score=_clamp01(rank) if rank is not None else None,
             )
         )
     return out
 
 
-# -----------------------------
-# Embeddings (existing behavior)
-# -----------------------------
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for i in range(min(len(a), len(b))):
-        av = float(a[i])
-        bv = float(b[i])
-        dot += av * bv
-        na += av * av
-        nb += bv * bv
-    denom = math.sqrt(na) * math.sqrt(nb)
-    if denom <= 1e-12:
-        return 0.0
-    return dot / denom
-
-
-def embeddings_enabled() -> bool:
-    return bool(getattr(settings, "EMBEDDINGS_ENABLED", False))
-
-
-def embedding_model_name() -> str:
-    return str(getattr(settings, "OPENAI_EMBEDDING_MODEL", "") or "text-embedding-3-small")
-
 
 async def build_embeddings_for_snapshot(
     db: Session,
-    *,
     snapshot_id: int,
+    *,
     force: bool = False,
     batch_size: int = 64,
     max_chunks: Optional[int] = None,
 ) -> dict[str, Any]:
-    """
-    Generate embeddings for all chunks in a snapshot (if EMBEDDINGS_ENABLED=true).
-    """
     if not embeddings_enabled():
-        return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0, "error": "EMBEDDINGS_ENABLED=false"}
+        return {"snapshot_id": snapshot_id, "embedded": 0, "skipped": 0, "error": "embeddings_disabled"}
 
     model = embedding_model_name()
 
@@ -445,6 +416,22 @@ async def build_embeddings_for_snapshot(
     return {"snapshot_id": snapshot_id, "embedded": embedded, "skipped": skipped, "model": model}
 
 
+def _snapshot_has_embeddings(db: Session, *, snapshot_id: int, model: str) -> bool:
+    row = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM repo_chunk_embeddings e
+            JOIN repo_chunks c ON c.id = e.chunk_id
+            WHERE c.snapshot_id = :sid AND e.model = :m
+            LIMIT 1
+            """
+        ),
+        {"sid": snapshot_id, "m": model},
+    ).fetchone()
+    return bool(row)
+
+
 async def search_chunks_embeddings(
     db: Session,
     *,
@@ -457,7 +444,6 @@ async def search_chunks_embeddings(
         return []
 
     model = embedding_model_name()
-
     q = (query or "").strip()
     if not q:
         return []
@@ -485,8 +471,9 @@ async def search_chunks_embeddings(
 
     scored: list[ChunkHit] = []
     for r in rows:
-        vec = json.loads(r[7])
-        score = _cosine(q_vec, vec)
+        vec = json.loads(r[7]) if r[7] else []
+        cos = cosine_similarity([float(x) for x in q_vec], [float(x) for x in vec])
+        score = _clamp01((float(cos) + 1.0) / 2.0)
         scored.append(
             ChunkHit(
                 id=int(r[0]),
@@ -496,7 +483,7 @@ async def search_chunks_embeddings(
                 end_line=int(r[4]),
                 chunk_text=str(r[5]),
                 symbols_json=r[6],
-                score=float(score),
+                score=score,
             )
         )
 
@@ -513,17 +500,20 @@ async def search_chunks(
     mode: str = "auto",
     path_contains: Optional[str] = None,
 ) -> tuple[str, list[ChunkHit]]:
-    """
-    mode:
-      - auto: embeddings if enabled AND embeddings exist,
-              else postgres fts if postgres,
-              else sqlite fts if available,
-              else none
-      - embeddings: force embeddings
-      - fts: force best-available text search
-    """
     mode = (mode or "auto").strip().lower()
     dialect = _dialect_name(db)
+    top_k = max(1, min(int(top_k), 50))
+
+    def _best_fts() -> tuple[str, list[ChunkHit]]:
+        if dialect.startswith("postgres"):
+            return "fts_pg", search_chunks_postgres_fts(
+                db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
+            )
+        if _fts_available(db):
+            return "fts", search_chunks_fts(
+                db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
+            )
+        return "none", []
 
     if mode == "embeddings":
         return "embeddings", await search_chunks_embeddings(
@@ -531,43 +521,30 @@ async def search_chunks(
         )
 
     if mode == "fts":
-        if dialect.startswith("postgres"):
-            return "fts_pg", search_chunks_postgres_fts(
-                db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
-            )
-        return "fts", search_chunks_fts(
-            db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
-        )
+        return _best_fts()
 
-    # auto:
+    fts_mode, fts_hits = _best_fts()
+
     if embeddings_enabled():
         model = embedding_model_name()
-        row = db.execute(
-            text(
-                """
-                SELECT 1
-                FROM repo_chunk_embeddings e
-                JOIN repo_chunks c ON c.id = e.chunk_id
-                WHERE c.snapshot_id = :sid AND e.model = :m
-                LIMIT 1
-                """
-            ),
-            {"sid": snapshot_id, "m": model},
-        ).fetchone()
-        if row:
-            hits = await search_chunks_embeddings(
-                db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
-            )
-            return "embeddings", hits
+        if _snapshot_has_embeddings(db, snapshot_id=snapshot_id, model=model):
+            min_hits = max(2, top_k // 3)
+            best_score = max((h.score or 0.0) for h in fts_hits) if fts_hits else 0.0
+            fts_looks_weak = (len(fts_hits) < min_hits) or (best_score < 0.15)
 
-    if dialect.startswith("postgres"):
-        hits = search_chunks_postgres_fts(
-            db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
-        )
-        return "fts_pg", hits
+            if fts_looks_weak:
+                emb_hits = await search_chunks_embeddings(
+                    db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains
+                )
+                by_id: dict[int, ChunkHit] = {h.id: h for h in fts_hits}
+                for h in emb_hits:
+                    prev = by_id.get(h.id)
+                    if prev is None or (h.score or 0.0) > (prev.score or 0.0):
+                        by_id[h.id] = h
 
-    if _fts_available(db):
-        hits = search_chunks_fts(db, snapshot_id=snapshot_id, query=query, top_k=top_k, path_contains=path_contains)
-        return "fts", hits
+                merged = list(by_id.values())
+                merged.sort(key=lambda h: float(h.score or 0.0), reverse=True)
+                return "auto_mix", merged[:top_k]
 
-    return "none", []
+    # ✅ FIX: return exactly (mode, hits)
+    return fts_mode, fts_hits

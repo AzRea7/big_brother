@@ -1,4 +1,3 @@
-# backend/app/ai/prompts.py
 from __future__ import annotations
 
 SYSTEM_PROMPT = """You are an execution planner for Austin.
@@ -76,13 +75,9 @@ GOALS (JSON):
 """
 
 
-# -----------------------
-# Repo Findings generation
-# -----------------------
-
-REPO_FINDINGS_SYSTEM = """You are a strict code reviewer.
+REPO_FINDINGS_SYSTEM = """You are a senior engineer doing a high-signal repository risk review.
 Return ONLY valid JSON (no markdown, no backticks) with schema:
-{"findings":[{"path":"...","line":123,"category":"security|reliability|correctness|observability|maintainability|performance|testing|docs","severity":1,"title":"...","evidence":"...","recommendation":"...","acceptance":"..."}]}
+{"findings":[{"path":"...","line":123,"category":"security|auth|reliability|correctness|observability|maintainability|performance|testing|docs","severity":1,"title":"...","evidence":"...","recommendation":"...","acceptance":"..."}]}
 
 Rules:
 - findings must be a list (can be empty)
@@ -90,12 +85,23 @@ Rules:
 - line must be int or null
 - Keep findings <= 8 total
 - Keep each string short (<= 240 chars) to avoid truncation
-- Prefer real issues over style/lint (only return style if nothing else)
+- Prefer real issues over style/lint.
+- Do NOT return trailing whitespace / formatting nitpicks unless it causes a real bug.
+- Findings MUST have specific evidence (path + concrete snippet/behavior) and a testable recommendation.
+- If you cannot provide good evidence, do not include the finding.
 """
 
 REPO_FINDINGS_USER = """Analyze this repository snapshot excerpt set and produce findings.
 
 Return JSON object with top-level key "findings" (NOT a bare list).
+
+Priority bias (ONLY return findings in these categories unless there is truly nothing):
+- security/auth correctness
+- API key flows / secrets leakage
+- data integrity / migrations
+- retries/timeouts
+- exception handling / error boundaries
+- missing tests for core flows
 
 Severity rubric:
 - 5: auth bypass, secret exposure, SQL injection, critical data loss
@@ -112,93 +118,4 @@ def build_repo_findings_prompt(excerpts: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": REPO_FINDINGS_SYSTEM},
         {"role": "user", "content": REPO_FINDINGS_USER.format(excerpts=excerpts)},
-    ]
-
-
-def repo_findings_user(excerpts: str) -> str:
-    # Some callers import repo_findings_user directly.
-    return REPO_FINDINGS_USER.format(excerpts=excerpts)
-
-
-# -----------------------
-# Repo Tasks generation (LLM "top tasks" scan)
-# -----------------------
-
-REPO_TASKS_SYSTEM = """You are an engineering manager generating a small set of high-impact tasks.
-Each task must be concrete, testable, and tied to a file path + evidence from the provided excerpts.
-Avoid vague "improve X" language.
-Return ONLY valid JSON (no markdown, no backticks).
-
-Your output MUST be a JSON OBJECT with top-level key "tasks".
-Do NOT return a bare JSON array.
-"""
-
-REPO_TASKS_USER = """From these excerpts, propose {count} tasks.
-
-Return JSON OBJECT:
-{{
-  "tasks": [
-    {{
-      "title": "...",
-      "notes": "...",
-      "priority": 1-5,
-      "estimated_minutes": 15-240,
-      "tags": "repo,autogen,...",
-      "link": "repo://... if possible",
-      "starter": "2-5 min first action",
-      "dod": "definition of done w/ verification command",
-      "path": "repo/relative/path.ext",
-      "line": 123 | null
-    }}
-  ]
-}}
-
-EXCERPTS:
-{excerpts}
-"""
-
-
-def build_repo_tasks_prompt(excerpts: str, count: int) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": REPO_TASKS_SYSTEM},
-        {"role": "user", "content": REPO_TASKS_USER.format(excerpts=excerpts, count=count)},
-    ]
-
-
-# -----------------------
-# Finding -> Task (single)
-# -----------------------
-
-FINDING_TASK_SYSTEM = """You are a senior engineer turning a single code finding into a production-quality task.
-
-Rules:
-- Be specific: reference exact files and what to change.
-- Use the provided code chunks. Do not hallucinate code that is not in chunks.
-- Produce a task that a developer can complete in one sitting.
-- Include a minimal verification step (test, curl, or log evidence).
-Return ONLY valid JSON object.
-"""
-
-FINDING_TASK_USER = """Turn this single finding into a high-quality task.
-
-Return JSON object with:
-- title
-- notes (include: What/Why/How + small checklist)
-- starter (2-5 minute first action)
-- dod (definition of done)
-- priority (1-5)
-- estimated_minutes (15-180)
-
-Finding:
-{finding_json}
-
-Top relevant code chunks (each has path + line range):
-{chunks_text}
-"""
-
-
-def build_finding_task_prompt(finding_json: str, chunks_text: str) -> list[dict[str, str]]:
-    return [
-        {"role": "system", "content": FINDING_TASK_SYSTEM},
-        {"role": "user", "content": FINDING_TASK_USER.format(finding_json=finding_json, chunks_text=chunks_text)},
     ]

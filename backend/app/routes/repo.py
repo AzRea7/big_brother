@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
@@ -46,7 +46,6 @@ except Exception:  # pragma: no cover
     search_chunks = None  # type: ignore
     load_chunk_text = None  # type: ignore
 
-
 # --- Level 3 PR workflow (optional, gated) ---
 # If you haven't added services/patch_workflow.py yet, these endpoints will return 501-ish errors.
 try:
@@ -66,9 +65,7 @@ router = APIRouter(prefix="/debug/repo", tags=["repo-debug"])
 def _guard_debug(request: Request) -> None:
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
-
     require_api_key(request.headers.get("X-API-Key"))
-
 
 
 @router.post("/sync")
@@ -324,7 +321,7 @@ def debug_repo_chunks_build(
     _guard_debug(request)
 
     if build_chunks_for_snapshot is None:
-        raise HTTPException(status_code=500, detail="Chunk builder not available (repo_taskgen missing build_chunks_for_snapshot).")
+        raise HTTPException(status_code=500, detail="Chunk builder not available (services.repo_chunks missing).")
 
     JOBS_TOTAL.labels(job="repo_chunks_build", status="start").inc()
     try:
@@ -335,17 +332,27 @@ def debug_repo_chunks_build(
         JOBS_TOTAL.labels(job="repo_chunks_build", status="error").inc()
         raise
 
+
 @router.post("/chunks/embed")
 async def debug_repo_chunks_embed(
     request: Request,
     snapshot_id: int = Query(..., ge=1),
     force: bool = Query(False),
     db: Session = Depends(get_db),
-):
+) -> dict[str, Any]:
     _guard_debug(request)
     if build_embeddings_for_snapshot is None:
-        raise HTTPException(status_code=501, detail="Embeddings not available (missing services.repo_chunks)")
-    return await build_embeddings_for_snapshot(db, snapshot_id, force=force)
+        raise HTTPException(status_code=501, detail="Embeddings not available (missing services.repo_chunks).")
+
+    JOBS_TOTAL.labels(job="repo_chunks_embed", status="start").inc()
+    try:
+        out = await build_embeddings_for_snapshot(db, snapshot_id, force=force)
+        JOBS_TOTAL.labels(job="repo_chunks_embed", status="ok").inc()
+        return out
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_chunks_embed", status="error").inc()
+        raise
+
 
 @router.get("/chunks/search")
 async def debug_repo_chunks_search(
@@ -353,13 +360,54 @@ async def debug_repo_chunks_search(
     snapshot_id: int = Query(..., ge=1),
     q: str = Query(..., min_length=2),
     top_k: int = Query(16, ge=1, le=100),
+    mode: str = Query("auto", max_length=20),
     db: Session = Depends(get_db),
-):
+) -> dict[str, Any]:
+    """
+    Search chunks using the retrieval provider interface.
+
+    IMPORTANT:
+      services.repo_chunks.search_chunks returns: (mode_used, hits[list[ChunkHit]])
+      We return hits as dicts to keep JSON stable.
+    """
     _guard_debug(request)
     if search_chunks is None:
         raise HTTPException(status_code=501, detail="Chunk search not available")
-    hits = await search_chunks(db, snapshot_id, q, top_k=top_k)
-    return {"snapshot_id": snapshot_id, "query": q, "hits": hits}
+
+    JOBS_TOTAL.labels(job="repo_chunks_search", status="start").inc()
+    try:
+        mode_used, hits = await search_chunks(
+            db,
+            snapshot_id=snapshot_id,
+            query=q,
+            top_k=int(top_k),
+            mode=str(mode or "auto"),
+        )
+        JOBS_TOTAL.labels(job="repo_chunks_search", status="ok").inc()
+        return {
+            "snapshot_id": snapshot_id,
+            "query": q,
+            "mode_used": mode_used,
+            "hits": [h.__dict__ for h in hits],
+        }
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_chunks_search", status="error").inc()
+        raise
+
+
+@router.get("/chunks/get")
+def debug_repo_chunk_get(
+    request: Request,
+    chunk_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Load a single chunk body for UI/debug.
+    """
+    _guard_debug(request)
+    if load_chunk_text is None:
+        raise HTTPException(status_code=501, detail="Chunk loader not available")
+    return load_chunk_text(db=db, chunk_id=chunk_id)
 
 
 # -------------------------------------------------------------------
@@ -394,7 +442,7 @@ def debug_repo_patch_validate(
 
 
 @router.post("/patch/apply")
-def debug_repo_patch_apply(
+async def debug_repo_patch_apply(
     request: Request,
     snapshot_id: int = Query(...),
     run_tests: bool = Query(True),
@@ -404,7 +452,8 @@ def debug_repo_patch_apply(
     """
     Apply patch in sandbox + optionally run tests.
 
-    Requires services/patch_workflow.py
+    IMPORTANT:
+      services.patch_workflow.apply_unified_diff_in_sandbox is async → route must await.
     """
     _guard_debug(request)
 
@@ -413,7 +462,7 @@ def debug_repo_patch_apply(
 
     JOBS_TOTAL.labels(job="repo_patch_apply", status="start").inc()
     try:
-        out = apply_unified_diff_in_sandbox(
+        out = await apply_unified_diff_in_sandbox(
             db=db,
             snapshot_id=snapshot_id,
             patch_text=patch_text,
@@ -440,6 +489,8 @@ def debug_repo_pr_create(
     Create a PR from a validated/applied patch run.
 
     Requires services/patch_workflow.py (and GitHub credentials in settings).
+
+    HARD GATE is enforced in the service: valid + applied + tests_ran + tests_ok.
     """
     _guard_debug(request)
 

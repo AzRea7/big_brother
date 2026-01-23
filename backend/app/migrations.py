@@ -1,4 +1,3 @@
-# backend/app/migrations.py
 from __future__ import annotations
 
 from sqlalchemy import Engine, inspect, text
@@ -251,11 +250,12 @@ def ensure_schema(engine: Engine) -> None:
 
     # Optional: FTS5 for chunk retrieval
     if _sqlite_has_fts5(engine):
+        # NOTE: include symbols_json for better retrieval context. This stays compatible with older data.
         _ensure(
             engine,
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS repo_chunks_fts
-            USING fts5(chunk_text, path, content='repo_chunks', content_rowid='id');
+            USING fts5(chunk_text, path, symbols_json, content='repo_chunks', content_rowid='id');
             """,
         )
 
@@ -263,7 +263,8 @@ def ensure_schema(engine: Engine) -> None:
             engine,
             """
             CREATE TRIGGER IF NOT EXISTS repo_chunks_ai AFTER INSERT ON repo_chunks BEGIN
-              INSERT INTO repo_chunks_fts(rowid, chunk_text, path) VALUES (new.id, new.chunk_text, new.path);
+              INSERT INTO repo_chunks_fts(rowid, chunk_text, path, symbols_json)
+              VALUES (new.id, new.chunk_text, new.path, new.symbols_json);
             END;
             """,
         )
@@ -271,8 +272,8 @@ def ensure_schema(engine: Engine) -> None:
             engine,
             """
             CREATE TRIGGER IF NOT EXISTS repo_chunks_ad AFTER DELETE ON repo_chunks BEGIN
-              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path)
-              VALUES('delete', old.id, old.chunk_text, old.path);
+              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path, symbols_json)
+              VALUES('delete', old.id, old.chunk_text, old.path, old.symbols_json);
             END;
             """,
         )
@@ -280,9 +281,10 @@ def ensure_schema(engine: Engine) -> None:
             engine,
             """
             CREATE TRIGGER IF NOT EXISTS repo_chunks_au AFTER UPDATE ON repo_chunks BEGIN
-              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path)
-              VALUES('delete', old.id, old.chunk_text, old.path);
-              INSERT INTO repo_chunks_fts(rowid, chunk_text, path) VALUES (new.id, new.chunk_text, new.path);
+              INSERT INTO repo_chunks_fts(repo_chunks_fts, rowid, chunk_text, path, symbols_json)
+              VALUES('delete', old.id, old.chunk_text, old.path, old.symbols_json);
+              INSERT INTO repo_chunks_fts(rowid, chunk_text, path, symbols_json)
+              VALUES (new.id, new.chunk_text, new.path, new.symbols_json);
             END;
             """,
         )
@@ -290,12 +292,8 @@ def ensure_schema(engine: Engine) -> None:
     # -----------------------
     # Level 2.5: repo_chunk_embeddings (cosine rerank)
     #
-    # MUST match SQLAlchemy model:
-    # - chunk_id (FK repo_chunks.id)
-    # - model (string)
-    # - vector_json (TEXT: JSON list[float])
-    # - embedding_norm (REAL)
-    # - created_at
+    # Kept embedding_norm because you already had it in your schema.
+    # If your SQLAlchemy model doesn't include it yet, it's harmless as a nullable column.
     # -----------------------
     if "repo_chunk_embeddings" not in tables:
         _ensure(
@@ -328,3 +326,105 @@ def ensure_schema(engine: Engine) -> None:
 
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id)")
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model)")
+
+    # -----------------------
+    # Level 3: Patch runs + Pull requests
+    #
+    # These must exist for the gated PR workflow to be "working" end-to-end:
+    # validate diff -> apply in sandbox -> run tests -> only then open PR.
+    # -----------------------
+
+    # ---- repo_patch_runs ----
+    if "repo_patch_runs" not in tables:
+        _ensure(
+            engine,
+            """
+            CREATE TABLE IF NOT EXISTS repo_patch_runs (
+              id INTEGER PRIMARY KEY,
+              snapshot_id INTEGER NOT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+              patch_text TEXT NOT NULL,
+
+              files_changed INTEGER,
+              lines_changed INTEGER,
+              file_paths_json TEXT,
+
+              valid BOOLEAN DEFAULT 0,
+              validation_error TEXT,
+
+              applied BOOLEAN DEFAULT 0,
+              apply_error TEXT,
+
+              tests_ran BOOLEAN DEFAULT 0,
+              tests_ok BOOLEAN DEFAULT 0,
+              test_output TEXT,
+
+              sandbox_path VARCHAR(800),
+              diff_output TEXT
+            )
+            """,
+        )
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_patch_runs_snapshot ON repo_patch_runs(snapshot_id)")
+    else:
+        for col, ddl in [
+            ("snapshot_id", "INTEGER"),
+            ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+            ("patch_text", "TEXT"),
+            ("files_changed", "INTEGER"),
+            ("lines_changed", "INTEGER"),
+            ("file_paths_json", "TEXT"),
+            ("valid", "BOOLEAN DEFAULT 0"),
+            ("validation_error", "TEXT"),
+            ("applied", "BOOLEAN DEFAULT 0"),
+            ("apply_error", "TEXT"),
+            ("tests_ran", "BOOLEAN DEFAULT 0"),
+            ("tests_ok", "BOOLEAN DEFAULT 0"),
+            ("test_output", "TEXT"),
+            ("sandbox_path", "VARCHAR(800)"),
+            ("diff_output", "TEXT"),
+        ]:
+            if not _has_column(engine, "repo_patch_runs", col):
+                _add_column_sqlite(engine, "repo_patch_runs", col, ddl)
+
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_patch_runs_snapshot ON repo_patch_runs(snapshot_id)")
+
+    # ---- repo_pull_requests ----
+    if "repo_pull_requests" not in tables:
+        _ensure(
+            engine,
+            """
+            CREATE TABLE IF NOT EXISTS repo_pull_requests (
+              id INTEGER PRIMARY KEY,
+              snapshot_id INTEGER NOT NULL,
+              patch_run_id INTEGER,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+              repo VARCHAR(200) NOT NULL,
+              branch VARCHAR(100) NOT NULL,
+
+              pr_number INTEGER,
+              pr_url VARCHAR(500),
+
+              title VARCHAR(300) NOT NULL,
+              body TEXT
+            )
+            """,
+        )
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_pull_requests_snapshot ON repo_pull_requests(snapshot_id)")
+    else:
+        for col, ddl in [
+            ("snapshot_id", "INTEGER"),
+            ("patch_run_id", "INTEGER"),
+            ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+            ("repo", "VARCHAR(200)"),
+            ("branch", "VARCHAR(100)"),
+            ("pr_number", "INTEGER"),
+            ("pr_url", "VARCHAR(500)"),
+            ("title", "VARCHAR(300)"),
+            ("body", "TEXT"),
+        ]:
+            if not _has_column(engine, "repo_pull_requests", col):
+                _add_column_sqlite(engine, "repo_pull_requests", col, ddl)
+
+        _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_pull_requests_snapshot ON repo_pull_requests(snapshot_id)")

@@ -250,6 +250,36 @@ async def repo_chunks_embed(
     return await build_embeddings_for_snapshot(db, snapshot_id=snapshot_id, force=force)
 
 
+def _serialize_chunk_hit(h: Any) -> dict[str, Any]:
+    """
+    Serialize ChunkHit dataclass (or dict-ish) into a stable JSON object.
+    Works whether repo_chunks.search_chunks returns dataclass instances or dicts.
+    """
+    if isinstance(h, dict):
+        return {
+            "id": h.get("id"),
+            "snapshot_id": h.get("snapshot_id"),
+            "path": h.get("path"),
+            "start_line": h.get("start_line"),
+            "end_line": h.get("end_line"),
+            "symbols_json": h.get("symbols_json"),
+            "score": h.get("score"),
+            "chunk_text": h.get("chunk_text"),
+        }
+
+    # dataclass / object with attributes
+    return {
+        "id": getattr(h, "id", None),
+        "snapshot_id": getattr(h, "snapshot_id", None),
+        "path": getattr(h, "path", None),
+        "start_line": getattr(h, "start_line", None),
+        "end_line": getattr(h, "end_line", None),
+        "symbols_json": getattr(h, "symbols_json", None),
+        "score": getattr(h, "score", None),
+        "chunk_text": getattr(h, "chunk_text", None),
+    }
+
+
 @router.get("/repo/chunks/search")
 async def repo_chunks_search(
     request: Request,
@@ -258,11 +288,22 @@ async def repo_chunks_search(
     top_k: int = Query(8, ge=1, le=30),
     mode: str = Query("auto"),
     path_contains: Optional[str] = Query(default=None),
+    include_text: bool = Query(False),
     db: Session = Depends(get_db),
 ):
+    """
+    Search repo chunks.
+
+    IMPORTANT CHANGE:
+    - Previously this returned the raw tuple (mode_used, hits) so your CLI printed: ["fts_pg", [...]].
+    - Now it returns a stable JSON object so it’s usable by UI + downstream code, while still showing mode_used.
+
+    If you still want the raw tuple for debugging, you can set include_text=true and inspect hits directly,
+    or just look at mode_used.
+    """
     _guard_debug(request)
-    # Return exactly what the service returns so your CLI shows: ["fts_pg", [...]] etc.
-    return await search_chunks(
+
+    mode_used, hits = await search_chunks(
         db=db,
         snapshot_id=snapshot_id,
         query=q,
@@ -270,6 +311,25 @@ async def repo_chunks_search(
         mode=mode,
         path_contains=path_contains,
     )
+
+    # Serialize hits deterministically
+    serialized = [_serialize_chunk_hit(h) for h in (hits or [])]
+
+    # Optionally strip large fields unless explicitly requested
+    if not include_text:
+        for obj in serialized:
+            obj.pop("chunk_text", None)
+
+    return {
+        "snapshot_id": snapshot_id,
+        "query": q,
+        "mode_requested": mode,
+        "mode_used": mode_used,
+        "top_k": top_k,
+        "path_contains": path_contains,
+        "count": len(serialized),
+        "hits": serialized,
+    }
 
 
 @router.get("/repo/chunks/load")
@@ -299,6 +359,7 @@ async def repo_scan_llm(
 
     JOBS_TOTAL.labels(job="repo_scan_llm", status="start").inc()
     try:
+        # NOTE: services.repo_findings.scan_repo_findings_llm MUST accept max_files now.
         out = await scan_repo_findings_llm(db=db, snapshot_id=snapshot_id, max_files=max_files)
         JOBS_TOTAL.labels(job="repo_scan_llm", status="ok").inc()
         return out

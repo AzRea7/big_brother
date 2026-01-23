@@ -9,6 +9,10 @@ from .llm import LLMClient
 
 
 def _strip_fences_and_extract_json(raw: str) -> dict[str, Any]:
+    """
+    Legacy helper kept for compatibility, but we now prefer LLMClient.chat_json()
+    which already does robust extraction/repair.
+    """
     s = (raw or "").strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE).strip()
     s = re.sub(r"\s*```$", "", s).strip()
@@ -20,6 +24,28 @@ def _strip_fences_and_extract_json(raw: str) -> dict[str, Any]:
     return json.loads(s[first : last + 1])
 
 
+def _cap(s: str, n: int) -> str:
+    s2 = (s or "").strip()
+    return s2 if len(s2) <= n else s2[:n]
+
+
+def _compact_payload(
+    *,
+    signal_counts: dict[str, Any],
+    file_summaries: list[dict[str, Any]],
+    max_files: int,
+    max_excerpt_chars: int,
+) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    for f in (file_summaries or [])[:max_files]:
+        path = _cap(str(f.get("path") or ""), 220)
+        excerpt = _cap(str(f.get("excerpt") or ""), max_excerpt_chars)
+        if not path or not excerpt:
+            continue
+        files.append({"path": path, "excerpt": excerpt})
+    return {"signal_counts": signal_counts or {}, "files": files}
+
+
 def build_findings_prompt(
     *,
     repo: str,
@@ -28,9 +54,11 @@ def build_findings_prompt(
     snapshot_id: int,
     signal_counts: dict[str, Any],
     file_summaries: list[dict[str, Any]],
+    max_files: int = 14,
+    max_excerpt_chars: int = 700,
 ) -> str:
     rules = f"""
-You are scanning a codebase snapshot and must output ONLY JSON.
+You are scanning a codebase snapshot and must output ONLY JSON (a single object).
 
 Repo: {repo}
 Branch: {branch}
@@ -52,7 +80,7 @@ Output JSON schema:
       "path": "repo/relative/path.ext",
       "line": 123 | null,
       "category": "security|auth|secrets|reliability|timeouts|retries|validation|db|api|tests|ops|observability|perf|style",
-      "severity": 1..5,
+      "severity": 1,
       "title": "short actionable title",
       "evidence": "why + short excerpt (<=300 chars)",
       "recommendation": "what to change",
@@ -62,16 +90,19 @@ Output JSON schema:
 }}
 
 Hard rules:
-- JSON only. No markdown.
+- JSON only. No markdown. No prose.
 - Return <= 12 findings.
 - Every finding MUST include a real file path from the provided files list.
 - If you cannot justify a line number, use null.
 """
 
-    payload = {
-        "signal_counts": signal_counts,
-        "files": [{"path": f.get("path"), "excerpt": f.get("excerpt")} for f in (file_summaries or [])],
-    }
+    payload = _compact_payload(
+        signal_counts=signal_counts,
+        file_summaries=file_summaries,
+        max_files=max(1, min(int(max_files), 60)),
+        max_excerpt_chars=max(200, min(int(max_excerpt_chars), 2000)),
+    )
+
     return rules.strip() + "\n\nCONTEXT:\n" + json.dumps(payload, ensure_ascii=False)
 
 
@@ -83,11 +114,13 @@ async def generate_repo_findings_json(
     snapshot_id: int,
     signal_counts: dict[str, Any],
     file_summaries: list[dict[str, Any]],
+    max_files: int = 14,
 ) -> dict[str, Any]:
     client = LLMClient()
     if not client.enabled():
         raise RuntimeError("LLM not enabled (set OPENAI_BASE_URL + OPENAI_MODEL, and LLM_ENABLED=true)")
 
+    # Keep prompt under control for 4k ctx models
     prompt = build_findings_prompt(
         repo=repo,
         branch=branch,
@@ -95,18 +128,28 @@ async def generate_repo_findings_json(
         snapshot_id=snapshot_id,
         signal_counts=signal_counts,
         file_summaries=file_summaries,
+        max_files=max_files,
+        max_excerpt_chars=700,
     )
 
-    raw = await client.chat(
+    # Use chat_json() so:
+    # - LM Studio gets response_format "text"
+    # - We parse + repair JSON on our side
+    obj = await client.chat_json(
         system="You are a senior backend engineer doing a production readiness review.",
         user=prompt,
         temperature=0.1,
         max_tokens=1400,
-        response_format={"type": "json_object"},
+        response_format={"type": "json_object"},  # safe: LLMClient forces text for LM Studio
+        max_input_chars=int(getattr(__import__("app.config", fromlist=["settings"]).settings, "LLM_MAX_INPUT_CHARS", 12_000)),
     )
 
-    if isinstance(raw, str):
-        return _strip_fences_and_extract_json(raw)
-    if isinstance(raw, dict):
-        return raw
-    return {"findings": []}
+    if not isinstance(obj, dict):
+        return {"findings": []}
+
+    findings = obj.get("findings")
+    if not isinstance(findings, list):
+        return {"findings": []}
+
+    # Normalize output: keep it bounded
+    return {"findings": findings[:12]}

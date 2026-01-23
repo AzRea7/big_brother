@@ -2,21 +2,40 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..ai.repo_findings import generate_repo_findings_json
 from ..models import RepoFile, RepoFinding, RepoSnapshot
-from .repo_taskgen import compute_signal_counts  # ✅ exists
-from .repo_taskgen import tasks_from_findings as _tasks_from_findings  # ✅ exists
+
+# IMPORTANT:
+# Avoid circular imports. Do NOT import repo_taskgen at module import time.
+# If you need something from repo_taskgen, import it inside a function.
+
+
+# ----------------------------
+# Public helper: stable repo link builder
+# ----------------------------
+def _repo_link(snapshot: RepoSnapshot, path: str, line: int | None = None) -> str:
+    """
+    Build a stable GitHub link for a file (and optional line).
+    Uses snapshot.repo + snapshot.branch. commit_sha may be null; branch link is fine.
+    """
+    repo = (snapshot.repo or "").strip()
+    branch = (snapshot.branch or "main").strip()
+    p = (path or "").lstrip("/")
+
+    base = f"https://github.com/{repo}/blob/{branch}/{p}"
+    if isinstance(line, int) and line > 0:
+        return f"{base}#L{line}"
+    return base
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-
 def _fingerprint(snapshot_id: int, path: str, title: str) -> str:
     h = hashlib.sha256()
     h.update(f"{snapshot_id}|{path}|{title}".encode("utf-8", errors="ignore"))
@@ -101,11 +120,14 @@ def _norm_acceptance(v: Any) -> str:
     return s[:400]
 
 
-def _pick_file_summaries(db: Session, snapshot_id: int, *, max_files: int = 24) -> list[dict[str, Any]]:
+def _pick_file_summaries(
+    db: Session,
+    snapshot_id: int,
+    *,
+    max_files: int = 24,
+) -> list[dict[str, Any]]:
     """
     Build compact {path, excerpt} list for the LLM scan.
-
-    This replaces the missing select_repo_task_files() dependency.
     """
     files = db.scalars(
         select(RepoFile)
@@ -138,6 +160,8 @@ def _pick_file_summaries(db: Session, snapshot_id: int, *, max_files: int = 24) 
         "cors",
         "csrf",
         "/debug",
+        "rate limit",
+        "429",
     ]
 
     scored: list[tuple[int, RepoFile]] = []
@@ -175,7 +199,6 @@ def _pick_file_summaries(db: Session, snapshot_id: int, *, max_files: int = 24) 
 # ----------------------------
 # Public API used by routes/debug.py
 # ----------------------------
-
 def list_repo_findings(db: Session, snapshot_id: int) -> list[RepoFinding]:
     return list(
         db.scalars(
@@ -186,7 +209,27 @@ def list_repo_findings(db: Session, snapshot_id: int) -> list[RepoFinding]:
     )
 
 
-async def run_llm_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
+def compute_signal_counts(db: Session, snapshot_id: int) -> dict[str, Any]:
+    """
+    Back-compat helper.
+    If you have a canonical signals module elsewhere, you can redirect this later.
+    """
+    files = db.scalars(
+        select(RepoFile)
+        .where(RepoFile.snapshot_id == snapshot_id)
+        .where(RepoFile.content_kind == "text")
+    ).all()
+
+    # Import lazily to avoid circular imports.
+    try:
+        from .code_signals import compute_signal_counts_for_files  # type: ignore
+        return compute_signal_counts_for_files(files)
+    except Exception:
+        # Minimal fallback
+        return {"total_files": len(files), "signals": {}}
+
+
+async def run_llm_scan(db: Session, snapshot_id: int, *, max_files: int = 24) -> dict[str, Any]:
     """
     Canonical LLM findings scan:
       - builds file_summaries from stored RepoFile content
@@ -198,7 +241,7 @@ async def run_llm_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
         raise ValueError(f"snapshot_id {snapshot_id} not found")
 
     signal_counts = compute_signal_counts(db, snapshot_id)
-    file_summaries = _pick_file_summaries(db, snapshot_id, max_files=24)
+    file_summaries = _pick_file_summaries(db, snapshot_id, max_files=int(max_files))
 
     raw = await generate_repo_findings_json(
         repo=snap.repo,
@@ -260,37 +303,26 @@ async def run_llm_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------
-# ✅ Compatibility aliases (routes/debug.py expects these names)
+# ✅ Compatibility aliases (routes/debug.py may expect these names)
 # --------------------------------------------------------------------
-
-async def scan_repo_findings_llm(db: Session, snapshot_id: int) -> dict[str, Any]:
-    """
-    Back-compat alias for debug routes.
-    """
-    return await run_llm_scan(db, snapshot_id)
+async def scan_repo_findings_llm(
+    db: Session,
+    snapshot_id: int,
+    *,
+    max_files: int = 24,
+) -> dict[str, Any]:
+    return await run_llm_scan(db, snapshot_id, max_files=max_files)
 
 
 def list_findings(db: Session, snapshot_id: int) -> list[RepoFinding]:
-    """
-    Back-compat alias for debug routes.
-    """
     return list_repo_findings(db, snapshot_id)
 
 
 def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
-    """
-    Back-compat alias for debug routes.
-
-    routes/debug.py imports tasks_from_findings from this module.
-    The real implementation lives in services/repo_taskgen.py.
-    """
-    return _tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project)
+    # Lazy import to avoid circular import
+    from .repo_taskgen import tasks_from_findings as _impl  # type: ignore
+    return _impl(db=db, snapshot_id=snapshot_id, project=project)
 
 
 async def generate_tasks_from_findings_llm(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
-    """
-    Back-compat alias for debug routes.
-
-    Some older code imports generate_tasks_from_findings_llm; keep it stable too.
-    """
-    return _tasks_from_findings(db=db, snapshot_id=snapshot_id, project=project)
+    return tasks_from_findings(db, snapshot_id, project)

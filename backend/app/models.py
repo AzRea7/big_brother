@@ -248,8 +248,15 @@ class RepoPatchRun(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # Inputs
     patch_text: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Gate C metadata (needed for auditing + safety)
+    files_changed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    lines_changed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    file_paths_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Validation/apply/test results
     valid: Mapped[bool] = mapped_column(Boolean, default=False)
     validation_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -262,6 +269,9 @@ class RepoPatchRun(Base):
 
     sandbox_path: Mapped[Optional[str]] = mapped_column(String(800), nullable=True)
 
+    # Optional: store a compact “diff --stat” style output or git apply output for debugging
+    diff_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     snapshot: Mapped["RepoSnapshot"] = relationship("RepoSnapshot", back_populates="patch_runs")
 
 
@@ -271,12 +281,12 @@ class RepoPullRequest(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     snapshot_id: Mapped[int] = mapped_column(ForeignKey("repo_snapshots.id"), nullable=False)
-    patch_run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("repo_patch_runs.id"), nullable=True)
 
+    patch_run_id: Mapped[Optional[int]] = mapped_column(ForeignKey("repo_patch_runs.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     repo: Mapped[str] = mapped_column(String(200), nullable=False)
-    branch: Mapped[str] = mapped_column(String(100), nullable=False)
+    branch: Mapped[str] = mapped_column(String(100), nullable=False)  # PR head branch name
 
     pr_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     pr_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
