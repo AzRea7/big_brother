@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     # IMPORTANT: base URL should NOT include /v1
     # Example: https://api.openai.com
     OPENAI_BASE_URL: str = ""
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_MODEL: str = ""
+    OPENAI_API_KEY: str = "REDACTED_OPENAI_KEY"
+    OPENAI_MODEL: str = "openai"
 
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_TIMEOUT_S: float = 60.0
@@ -115,17 +115,17 @@ class Settings(BaseSettings):
     REPO_RAG_QUERY_SEEDS: str = ""
 
     # Embeddings
-    EMBEDDINGS_ENABLED: bool = False
+    EMBEDDINGS_ENABLED: bool = True
     EMBEDDINGS_PROVIDER: str = "off"  # off | openai
     EMBEDDINGS_MODEL: str = "text-embedding-3-small"
 
     # If true, chunk build will attempt to embed chunks too.
-    EMBED_CHUNKS_ON_BUILD: bool = False
+    EMBED_CHUNKS_ON_BUILD: bool = True
 
     # -----------------------
     # --- PR workflow (Level 3) ---
     # -----------------------
-    ENABLE_PR_WORKFLOW: bool = False
+    ENABLE_PR_WORKFLOW: bool = True
 
     # Paths allowed to be modified by PR workflow (relative to repo root)
     PR_ALLOWLIST_DIRS: List[str] = Field(default_factory=lambda: ["backend/", "onehaven/backend/"])

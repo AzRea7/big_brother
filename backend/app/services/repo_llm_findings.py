@@ -9,7 +9,51 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from ..ai.llm import chat_completion_json
-from ..ai.prompts import REPO_FINDINGS_SYSTEM, repo_findings_user
+
+# ✅ FIX: repo_findings_user may not exist in app.ai.prompts in your current repo state.
+# We import it opportunistically and provide a safe fallback builder.
+from ..ai.prompts import REPO_FINDINGS_SYSTEM  # type: ignore
+
+try:
+    # If your prompts.py defines this, we use it (best case).
+    from ..ai.prompts import repo_findings_user  # type: ignore
+except Exception:
+
+    def repo_findings_user(context: str) -> str:
+        """
+        Fallback prompt builder used when app.ai.prompts.repo_findings_user is missing.
+
+        IMPORTANT:
+        - Returns a single user prompt string.
+        - Keeps output format requirements explicit so chat_completion_json can parse JSON reliably.
+        """
+        return (
+            "You are analyzing a code repository snapshot. "
+            "Return STRICT JSON only with the following schema:\n"
+            "{\n"
+            '  "findings": [\n'
+            "    {\n"
+            '      "category": "security|auth|reliability|correctness|observability|performance|testing|maintainability|docs",\n'
+            '      "severity": 1-5,\n'
+            '      "title": "short title",\n'
+            '      "path": "repo-relative file path",\n'
+            '      "line": 1-or-null,\n'
+            '      "evidence": "what you saw (quote or describe briefly)",\n'
+            '      "recommendation": "what to change",\n'
+            '      "acceptance": "how to verify (concrete command/check) - MUST be a sentence"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Rules:\n"
+            "- Keep findings <= 8.\n"
+            "- Prefer auth/security, secrets, DB integrity, retries/timeouts, validation, error-handling, tests.\n"
+            "- Avoid style-only findings unless nothing else exists.\n"
+            "- acceptance MUST NOT be true/false/null.\n\n"
+            "Context:\n"
+            f"{context}"
+        )
+
+
 from ..config import settings
 from ..models import RepoFile, RepoFinding, Task
 
@@ -190,7 +234,7 @@ def _normalize_category(cat: Any) -> str:
         "documentation": "docs",
         "maintainability": "maintainability",
         "refactor": "maintainability",
-        "style": "maintainability",  # we don’t want a dedicated “style” bucket
+        "style": "maintainability",  # collapse style into maintainability
         "lint": "maintainability",
         "formatting": "maintainability",
     }
@@ -265,7 +309,6 @@ def _file_signal_score(rf: RepoFile) -> int:
     score = 0
     path = (getattr(rf, "path", "") or "").lower()
     if path:
-        # path hints are strong because they cost nothing
         if any(x in path for x in ["auth", "security", "middleware", "deps", "oauth", "jwt"]):
             score += 8
         if any(x in path for x in ["db", "models", "migrations", "alembic"]):
@@ -277,23 +320,21 @@ def _file_signal_score(rf: RepoFile) -> int:
 
     text = (getattr(rf, "content_text", None) or "")
     if text:
-        # only scan first N chars to keep it fast and predictable
         head = text[:5000]
         score += len(_HINT_RE.findall(head))
 
     size = int(getattr(rf, "size", 0) or 0)
-    # size is a weak tie-breaker
     score += min(5, size // 20_000)
 
     return score
 
 
-def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
+def _pick_top_files(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> list[RepoFile]:
     """
     Prefer files that have content and are likely to contain high-signal issues.
 
-    Important: this replaces “largest files only”, which often selects junk (e.g., big data files)
-    and misses auth/middleware/routing where the real bugs live.
+    Supports an explicit max_files override (e.g., routes passing max_files),
+    otherwise uses settings.REPO_TASK_MAX_FILES with safety clamps.
     """
     q = (
         db.query(RepoFile)
@@ -308,11 +349,14 @@ def _pick_top_files(db: Session, snapshot_id: int) -> list[RepoFile]:
         size = int(getattr(rf, "size", 0) or 0)
         scored.append((score, size, rf))
 
-    # Highest score first, then larger size
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    hard_cap = int(getattr(settings, "REPO_TASK_MAX_FILES", 20) or 20)
-    hard_cap = max(10, min(40, hard_cap))
+    if max_files is None:
+        max_files = int(getattr(settings, "REPO_TASK_MAX_FILES", 20) or 20)
+
+    hard_cap = max(10, min(200, int(max_files)))
+    # still keep a sanity bound because prompt budgets exist
+    hard_cap = min(hard_cap, 60)
     return [rf for _, _, rf in scored[:hard_cap]]
 
 
@@ -398,12 +442,19 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, int]:
+async def scan_snapshot_to_findings(
+    db: Session,
+    snapshot_id: int,
+    *,
+    max_files: Optional[int] = None,
+) -> dict[str, int]:
     """
     Core worker: calls LLM and inserts RepoFinding rows.
     Returns {inserted, total_findings}.
+
+    ✅ Supports max_files, so callers can tighten/expand prompt coverage safely.
     """
-    files = _pick_top_files(db, snapshot_id)
+    files = _pick_top_files(db, snapshot_id, max_files=max_files)
     context = _build_prompt_context(files)
 
     # Prompt tightening: bias the model to high-signal categories and cap output.
@@ -477,22 +528,21 @@ async def scan_snapshot_to_findings(db: Session, snapshot_id: int) -> dict[str, 
 
 
 # --------------------------------------------------------------------
-# Public API expected by routes/repo.py (compatibility preserved)
+# Public API expected by services/repo_taskgen.py (compatibility preserved)
 # --------------------------------------------------------------------
 
-async def run_llm_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
+async def run_llm_scan(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> dict[str, Any]:
     """
     Original public entrypoint (used by older routes).
     """
-    return await scan_snapshot_to_findings(db, snapshot_id)
+    return await scan_snapshot_to_findings(db, snapshot_id, max_files=max_files)
 
 
-async def run_llm_repo_scan(db: Session, snapshot_id: int) -> dict[str, Any]:
+async def run_llm_repo_scan(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> dict[str, Any]:
     """
-    NEW compatibility alias: routes/repo.py imports this name.
-    Keep this forever (or update routes) to avoid import-time crashes.
+    Compatibility alias: some routes/services import this name.
     """
-    return await run_llm_scan(db, snapshot_id)
+    return await run_llm_scan(db, snapshot_id, max_files=max_files)
 
 
 def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 0) -> dict[str, Any]:
@@ -527,19 +577,31 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
     }
 
 
-def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
+def tasks_from_findings(
+    db: Session,
+    snapshot_id: int,
+    project: str,
+    *,
+    limit: int = 12,
+) -> dict[str, Any]:
     """
     Convert RepoFinding rows into real Task rows.
     Deterministic; doesn't need an LLM.
+
+    ✅ Supports limit, because your debug route calls tasks_from_findings(..., limit=...).
     """
-    findings = (
+    try:
+        limit_n = int(limit)
+    except Exception:
+        limit_n = 12
+    limit_n = max(1, min(200, limit_n))
+
+    q = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
-        .order_by(RepoFinding.id.desc())
-        .all()
+        .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
     )
-
-    findings.sort(key=lambda r: _coerce_severity(getattr(r, "severity", None)), reverse=True)
+    findings = q.limit(limit_n).all()
 
     created = 0
     skipped = 0
@@ -569,7 +631,6 @@ def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str
         if f.recommendation:
             notes_parts.append(f"Recommendation:\n{f.recommendation}")
 
-        # Acceptance normalization matters here too: it becomes your DoD “truth anchor.”
         acceptance = _normalize_acceptance(getattr(f, "acceptance", None))
         notes_parts.append(acceptance)
 

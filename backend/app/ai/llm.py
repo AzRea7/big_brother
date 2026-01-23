@@ -20,6 +20,13 @@ class LLMError(RuntimeError):
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")  # ", }" or ", ]" -> "}" / "]"
 
+# Unquoted key like: { foo: 1 } or , bar : 2  ->  { "foo": 1 }, "bar": 2
+_UNQUOTED_KEY_RE = re.compile(r'(^|[{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+
+# If the model outputs python-ish dicts with single quotes, this helps.
+# We apply this only in lenient repair mode, not as a first pass.
+_SINGLE_QUOTED_STR_RE = re.compile(r"'([^'\\]*(?:\\.[^'\\]*)*)'")  # '...'(with escapes)
+
 
 def _strip_code_fences(s: str) -> str:
     s = (s or "").strip()
@@ -199,12 +206,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
         if stack and stack[-1][0] == kind:
             stack[-1] = (kind, state)
 
-    def next_non_ws(i: int) -> int:
-        j = i
-        while j < len(s) and s[j].isspace():
-            j += 1
-        return j
-
     def starts_value_at(i: int) -> bool:
         if i >= len(s):
             return False
@@ -213,7 +214,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
             return True
         if ch == "-" or ch.isdigit():
             return True
-        # true/false/null
         if s.startswith("true", i) or s.startswith("false", i) or s.startswith("null", i):
             return True
         return False
@@ -225,17 +225,19 @@ def _insert_missing_commas_contextual(s: str) -> str:
         j = i + 1
         esc2 = False
         while j < len(s):
-            ch = s[j]
+            ch2 = s[j]
             if esc2:
                 esc2 = False
-            elif ch == "\\":
+            elif ch2 == "\\":
                 esc2 = True
-            elif ch == '"':
+            elif ch2 == '"':
                 break
             j += 1
         if j >= len(s) or s[j] != '"':
             return False
-        k = next_non_ws(j + 1)
+        k = j + 1
+        while k < len(s) and s[k].isspace():
+            k += 1
         return k < len(s) and s[k] == ":"
 
     i = 0
@@ -250,7 +252,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
                 esc = True
             elif ch == '"':
                 in_str = False
-                # string ended: could be key or value depending on state; state transitions happen on ':' / ',' / closers
             i += 1
             continue
 
@@ -258,34 +259,23 @@ def _insert_missing_commas_contextual(s: str) -> str:
         t = top()
         if t is not None:
             kind, state = t
-            if state == "after_value":
-                j = i
-                if s[j].isspace():
-                    # do not decide until we hit a non-ws char
-                    pass
-                else:
-                    if kind == "obj":
-                        # valid next tokens: ',' or '}' ; if we see a key, insert comma
-                        if ch not in {",", "}"} and is_key_at(i):
-                            out.append(",")
-                            set_state("obj", "need_key")
-                    elif kind == "arr":
-                        # valid next tokens: ',' or ']' ; if we see a value, insert comma
-                        if ch not in {",", "]"} and starts_value_at(i):
-                            out.append(",")
-                            set_state("arr", "need_value")
+            if state == "after_value" and not ch.isspace():
+                if kind == "obj":
+                    if ch not in {",", "}"} and is_key_at(i):
+                        out.append(",")
+                        set_state("obj", "need_key")
+                elif kind == "arr":
+                    if ch not in {",", "]"} and starts_value_at(i):
+                        out.append(",")
+                        set_state("arr", "need_value")
 
-        # Now process the actual character and update state machine
         if ch == '"':
-            # entering string
             out.append(ch)
             in_str = True
             esc = False
-            # If we're in obj and need_key, this is a key
             t2 = top()
             if t2 is not None and t2[0] == "obj" and t2[1] == "need_key":
                 set_state("obj", "need_colon")
-            # If we're in arr and need_value, a string value is starting
             if t2 is not None and t2[0] == "arr" and t2[1] == "need_value":
                 set_state("arr", "after_value")
             i += 1
@@ -294,10 +284,8 @@ def _insert_missing_commas_contextual(s: str) -> str:
         if ch == "{":
             out.append(ch)
             stack.append(("obj", "need_key"))
-            # If we were in an array needing a value, an object counts as a value
             if len(stack) >= 2 and stack[-2][0] == "arr" and stack[-2][1] == "need_value":
                 stack[-2] = ("arr", "after_value")
-            # If we were in an object needing a value, an object counts as a value
             if len(stack) >= 2 and stack[-2][0] == "obj" and stack[-2][1] == "need_value":
                 stack[-2] = ("obj", "after_value")
             i += 1
@@ -306,10 +294,8 @@ def _insert_missing_commas_contextual(s: str) -> str:
         if ch == "[":
             out.append(ch)
             stack.append(("arr", "need_value"))
-            # If we were in an array needing a value, an array counts as a value
             if len(stack) >= 2 and stack[-2][0] == "arr" and stack[-2][1] == "need_value":
                 stack[-2] = ("arr", "after_value")
-            # If we were in an object needing a value, an array counts as a value
             if len(stack) >= 2 and stack[-2][0] == "obj" and stack[-2][1] == "need_value":
                 stack[-2] = ("obj", "after_value")
             i += 1
@@ -317,7 +303,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
 
         if ch == ":":
             out.append(ch)
-            # obj: key -> value
             if stack and stack[-1][0] == "obj" and stack[-1][1] == "need_colon":
                 set_state("obj", "need_value")
             i += 1
@@ -325,13 +310,9 @@ def _insert_missing_commas_contextual(s: str) -> str:
 
         if ch == ",":
             out.append(ch)
-            # comma resets state in current container
             if stack:
                 kind, _state = stack[-1]
-                if kind == "obj":
-                    stack[-1] = ("obj", "need_key")
-                else:
-                    stack[-1] = ("arr", "need_value")
+                stack[-1] = (kind, "need_key" if kind == "obj" else "need_value")
             i += 1
             continue
 
@@ -339,7 +320,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
             out.append(ch)
             if stack and stack[-1][0] == "obj":
                 stack.pop()
-            # closing object completes a value in parent
             if stack:
                 pk, ps = stack[-1]
                 if pk == "arr" and ps == "need_value":
@@ -353,7 +333,6 @@ def _insert_missing_commas_contextual(s: str) -> str:
             out.append(ch)
             if stack and stack[-1][0] == "arr":
                 stack.pop()
-            # closing array completes a value in parent
             if stack:
                 pk, ps = stack[-1]
                 if pk == "arr" and ps == "need_value":
@@ -367,12 +346,8 @@ def _insert_missing_commas_contextual(s: str) -> str:
         if stack:
             kind, state = stack[-1]
             if state == "need_value":
-                # If this position starts a primitive, mark after_value.
                 if starts_value_at(i) and ch not in "{[\"":
-                    if kind == "obj":
-                        stack[-1] = ("obj", "after_value")
-                    else:
-                        stack[-1] = ("arr", "after_value")
+                    stack[-1] = (kind, "after_value")
 
         out.append(ch)
         i += 1
@@ -380,36 +355,213 @@ def _insert_missing_commas_contextual(s: str) -> str:
     return "".join(out)
 
 
+def _quote_unquoted_keys_outside_strings(s: str) -> str:
+    """
+    Convert { foo: 1, bar: 2 } into { "foo": 1, "bar": 2 }.
+
+    IMPORTANT: we only do this outside of double-quoted JSON strings.
+    """
+    s = s or ""
+    out: list[str] = []
+
+    in_str = False
+    esc = False
+    i = 0
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_str = True
+            esc = False
+            out.append(ch)
+            i += 1
+            continue
+
+        # Try match at this position for unquoted key.
+        # We need to run the regex on the remaining substring but preserve prefix group.
+        m = _UNQUOTED_KEY_RE.match(s, i)
+        if m:
+            # m.group(1) includes "{" or "," plus whitespace
+            out.append(m.group(1))
+            out.append(f'"{m.group(2)}"')
+            out.append(m.group(3))
+            i = m.end()
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _replace_single_quoted_strings_lenient(s: str) -> str:
+    """
+    Convert single-quoted strings to double-quoted strings:
+      {'a': 'b'} -> {"a": "b"}
+
+    This is a heuristic. We apply it late, only if other repairs failed.
+    """
+    s = s or ""
+
+    # We must avoid touching apostrophes inside already-double-quoted strings.
+    out: list[str] = []
+    in_dq = False
+    esc = False
+    i = 0
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_dq:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_dq = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_dq = True
+            esc = False
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "'":
+            # parse a single-quoted string token
+            j = i + 1
+            esc2 = False
+            buf: list[str] = []
+            while j < len(s):
+                ch2 = s[j]
+                if esc2:
+                    buf.append(ch2)
+                    esc2 = False
+                elif ch2 == "\\":
+                    esc2 = True
+                elif ch2 == "'":
+                    break
+                else:
+                    buf.append(ch2)
+                j += 1
+
+            if j < len(s) and s[j] == "'":
+                # emit as JSON double-quoted string with proper escaping
+                inner = "".join(buf)
+                inner = inner.replace("\\", "\\\\").replace('"', '\\"')
+                out.append('"')
+                out.append(inner)
+                out.append('"')
+                i = j + 1
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _insert_comma_at_error_pos(s: str, pos: int) -> str:
+    """
+    If json.loads says 'Expecting , delimiter' at position pos,
+    we can often fix by inserting a comma at/near that position.
+    """
+    if not s:
+        return s
+    pos = max(0, min(int(pos), len(s)))
+
+    j = pos
+    while j < len(s) and s[j].isspace():
+        j += 1
+
+    if j < len(s) and s[j] == ",":
+        return s
+
+    return s[:j] + "," + s[j:]
+
+
+def _loads_with_repairs(c: str) -> Any:
+    """
+    Parse JSON with multiple increasingly aggressive repair passes.
+
+    This is designed for local / small models that occasionally emit
+    almost-JSON (missing commas, trailing commas, truncated output, python-ish dicts).
+    """
+    # Attempt 1: raw
+    try:
+        return json.loads(c)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: truncation repair + trailing comma cleanup
+    c2 = _repair_truncated_json(c)
+    c2 = _TRAILING_COMMA_RE.sub(r"\1", c2)
+    try:
+        return json.loads(c2)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 3: contextual commas
+    c3 = _insert_missing_commas_contextual(c2)
+    c3 = _TRAILING_COMMA_RE.sub(r"\1", c3)
+    try:
+        return json.loads(c3)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 4: quote unquoted keys
+    c4 = _quote_unquoted_keys_outside_strings(c3)
+    c4 = _TRAILING_COMMA_RE.sub(r"\1", c4)
+    try:
+        return json.loads(c4)
+    except json.JSONDecodeError as e4:
+        last = e4
+
+    # Attempt 5: single-quote repair (python-ish)
+    c5 = _replace_single_quoted_strings_lenient(c4)
+    c5 = _TRAILING_COMMA_RE.sub(r"\1", c5)
+    try:
+        return json.loads(c5)
+    except json.JSONDecodeError as e5:
+        last = e5
+
+    # Attempt 6: iterative insert-comma at decoder position (only for missing comma)
+    c6 = c5
+    for _ in range(12):
+        try:
+            return json.loads(c6)
+        except json.JSONDecodeError as e:
+            last = e
+            if "Expecting ',' delimiter" not in str(e):
+                break
+            nxt = _insert_comma_at_error_pos(c6, e.pos)
+            if nxt == c6:
+                break
+            c6 = nxt
+
+    raise last
+
+
 def _extract_json_object_lenient(raw: str) -> Any:
     """
     Robust JSON extraction for LLM outputs.
     """
     s = _strip_code_fences(raw)
-
-    def _loads_with_repairs(c: str) -> Any:
-        # Attempt 1: raw
-        try:
-            return json.loads(c)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt 2: truncation repair
-        c2 = _repair_truncated_json(c)
-        try:
-            return json.loads(c2)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt 3: contextual missing-comma repair (handles arrays + objects)
-        c3 = _insert_missing_commas_contextual(c)
-        try:
-            return json.loads(c3)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt 4: truncation + contextual commas
-        c4 = _insert_missing_commas_contextual(c2)
-        return json.loads(c4)
 
     cand = _extract_balanced_json_prefix(s)
     if cand is not None:
@@ -437,6 +589,32 @@ def _truncate_chars(s: str, max_chars: int) -> str:
     return s if len(s) <= max_chars else s[:max_chars]
 
 
+def _best_json_candidate_from_raw(raw: str) -> str:
+    """
+    For the self-heal pass: feed the model only the most-likely JSON-ish chunk,
+    not the whole rambling completion (which wastes tokens and increases truncation).
+    """
+    s = _strip_code_fences(raw)
+
+    cand = _extract_balanced_json_prefix(s)
+    if cand is not None:
+        return cand
+
+    # fallback to widest object span
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        return s[first : last + 1]
+
+    # fallback array span
+    first = s.find("[")
+    last = s.rfind("]")
+    if first != -1 and last != -1 and last > first:
+        return s[first : last + 1]
+
+    return s
+
+
 class LLMClient:
     """
     OpenAI-compatible client.
@@ -455,6 +633,13 @@ class LLMClient:
 
         self.max_input_chars = int(getattr(settings, "LLM_MAX_INPUT_CHARS", 12_000))
         self.read_timeout_s = float(getattr(settings, "LLM_READ_TIMEOUT_S", 600.0))
+        self.enable_self_heal = bool(getattr(settings, "LLM_SELF_HEAL_JSON", True))
+
+        # If your model keeps truncating the fixer response, bump this.
+        self.self_heal_max_tokens = int(getattr(settings, "LLM_SELF_HEAL_MAX_TOKENS", 2200))
+
+        # Hard safety cap so we don't explode the 4k context with the fixer prompt.
+        self.self_heal_max_input_chars = int(getattr(settings, "LLM_SELF_HEAL_MAX_INPUT_CHARS", 18_000))
 
     def enabled(self) -> bool:
         if self.llm_enabled_flag is not None and not bool(self.llm_enabled_flag):
@@ -552,6 +737,43 @@ class LLMClient:
         except Exception:
             return str(data)
 
+    async def _self_heal_json(self, raw: str) -> dict[str, Any]:
+        """
+        If the model produced almost-JSON, ask it to output strictly valid JSON.
+
+        Key fixes vs your current behavior:
+        - Feed the model only the JSON-ish candidate (not the whole completion).
+        - Allow more tokens so the fixer doesn't truncate mid-object.
+        - Still parse with our lenient extractor as a final safety net.
+        """
+        candidate = _best_json_candidate_from_raw(raw)
+        candidate = _truncate_chars(candidate, self.self_heal_max_input_chars)
+
+        fixer_system = "You are a strict JSON formatter. Output ONLY valid JSON. No markdown, no code fences, no commentary."
+        fixer_user = (
+            "Convert the following into valid JSON.\n"
+            "- Output must be a single JSON object.\n"
+            "- Preserve the same structure and keys.\n"
+            "- If input is truncated, return the longest valid JSON object you can complete.\n"
+            "- Do not add any extra text.\n\n"
+            f"RAW:\n{candidate}"
+        )
+
+        fixed = await self.chat(
+            system=fixer_system,
+            user=fixer_user,
+            temperature=0.0,
+            max_tokens=self.self_heal_max_tokens,
+            response_format={"type": "json_object"},
+            force_text_response_format=True,
+            max_input_chars=self.self_heal_max_input_chars,
+        )
+
+        obj = _extract_json_object_lenient(fixed)
+        if not isinstance(obj, dict):
+            raise ValueError("Self-heal JSON result is not a JSON object")
+        return obj
+
     async def chat_json(
         self,
         *,
@@ -579,12 +801,23 @@ class LLMClient:
                 return obj
             raise ValueError("Top-level JSON is not an object")
         except Exception as e:
-            # helpful debug breadcrumb (doesn't spam too hard)
             logger.warning("LLM JSON parse failed, attempting lenient repair: %s", str(e))
+
+        # lenient local repair
+        try:
             obj2 = _extract_json_object_lenient(raw)
             if not isinstance(obj2, dict):
                 raise ValueError("Top-level JSON is not an object after lenient parse")
             return obj2
+        except Exception as e2:
+            logger.warning("Lenient JSON repair failed: %s", str(e2))
+
+        # last resort: ask the model to reformat its own output
+        if self.enable_self_heal:
+            logger.warning("Attempting JSON self-heal pass via LLM")
+            return await self._self_heal_json(raw)
+
+        raise ValueError("Unable to parse JSON from LLM output (strict + lenient failed).")
 
 
 async def chat_completion_json(system: str, user: str) -> dict[str, Any]:

@@ -120,6 +120,19 @@ def _norm_acceptance(v: Any) -> str:
     return s[:400]
 
 
+def _clamp_limit(limit: Any, *, default: int, max_limit: int) -> int:
+    """
+    Defensive clamp: route layer should validate, but service layer must be safe too.
+    """
+    if limit is None:
+        return default
+    try:
+        n = int(limit)
+    except Exception:
+        return default
+    return max(1, min(max_limit, n))
+
+
 def _pick_file_summaries(
     db: Session,
     snapshot_id: int,
@@ -199,12 +212,23 @@ def _pick_file_summaries(
 # ----------------------------
 # Public API used by routes/debug.py
 # ----------------------------
-def list_repo_findings(db: Session, snapshot_id: int) -> list[RepoFinding]:
+def list_repo_findings(db: Session, snapshot_id: int, *, limit: int = 200) -> list[RepoFinding]:
+    """
+    List findings for a snapshot, newest/highest severity first, capped by `limit`.
+
+    Why cap here (not only in routes):
+    - prevents accidental unbounded reads
+    - keeps UI endpoints fast
+    - avoids memory spikes
+    """
+    limit_n = _clamp_limit(limit, default=200, max_limit=2000)
+
     return list(
         db.scalars(
             select(RepoFinding)
             .where(RepoFinding.snapshot_id == snapshot_id)
             .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+            .limit(limit_n)
         ).all()
     )
 
@@ -298,7 +322,7 @@ async def run_llm_scan(db: Session, snapshot_id: int, *, max_files: int = 24) ->
     return {
         "snapshot_id": snapshot_id,
         "inserted": inserted,
-        "total_findings": len(list_repo_findings(db, snapshot_id)),
+        "total_findings": len(list_repo_findings(db, snapshot_id, limit=5000)),  # count-ish
     }
 
 
@@ -314,15 +338,44 @@ async def scan_repo_findings_llm(
     return await run_llm_scan(db, snapshot_id, max_files=max_files)
 
 
-def list_findings(db: Session, snapshot_id: int) -> list[RepoFinding]:
-    return list_repo_findings(db, snapshot_id)
+def list_findings(db: Session, snapshot_id: int, limit: int = 200) -> list[RepoFinding]:
+    """
+    Back-compat name used by routes/debug.py.
+    IMPORTANT: must accept `limit` because debug route passes it.
+    """
+    return list_repo_findings(db, snapshot_id, limit=limit)
 
 
-def tasks_from_findings(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
+def tasks_from_findings(db: Session, snapshot_id: int, project: str, limit: int = 12) -> dict[str, Any]:
+    """
+    Convert findings -> tasks via repo_taskgen implementation, with optional cap.
+
+    Why limit matters:
+    - tasks endpoint should be predictable and cheap
+    - avoids generating/creating too many tasks from a huge scan
+    """
+    limit_n = _clamp_limit(limit, default=12, max_limit=200)
+
     # Lazy import to avoid circular import
     from .repo_taskgen import tasks_from_findings as _impl  # type: ignore
-    return _impl(db=db, snapshot_id=snapshot_id, project=project)
+
+    # Prefer passing limit through if the implementation supports it
+    try:
+        out = _impl(db=db, snapshot_id=snapshot_id, project=project, limit=limit_n)
+    except TypeError:
+        out = _impl(db=db, snapshot_id=snapshot_id, project=project)
+
+    # If impl returns a dict that contains a list, enforce limit anyway (defensive)
+    if isinstance(out, dict):
+        if isinstance(out.get("findings"), list):
+            out["findings"] = out["findings"][:limit_n]
+            out["count"] = len(out["findings"])
+        if isinstance(out.get("tasks"), list):
+            out["tasks"] = out["tasks"][:limit_n]
+            out["count"] = len(out["tasks"])
+    return out
 
 
 async def generate_tasks_from_findings_llm(db: Session, snapshot_id: int, project: str) -> dict[str, Any]:
+    # Kept for compatibility; routes/debug.py also has a separate /repo/tasks_generate path.
     return tasks_from_findings(db, snapshot_id, project)

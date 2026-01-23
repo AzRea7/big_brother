@@ -295,11 +295,8 @@ async def repo_chunks_search(
     Search repo chunks.
 
     IMPORTANT CHANGE:
-    - Previously this returned the raw tuple (mode_used, hits) so your CLI printed: ["fts_pg", [...]].
+    - Previously this returned the raw tuple (mode_used, hits) so your CLI printed: ["fts_pg", [...] ].
     - Now it returns a stable JSON object so it’s usable by UI + downstream code, while still showing mode_used.
-
-    If you still want the raw tuple for debugging, you can set include_text=true and inspect hits directly,
-    or just look at mode_used.
     """
     _guard_debug(request)
 
@@ -312,10 +309,8 @@ async def repo_chunks_search(
         path_contains=path_contains,
     )
 
-    # Serialize hits deterministically
     serialized = [_serialize_chunk_hit(h) for h in (hits or [])]
 
-    # Optionally strip large fields unless explicitly requested
     if not include_text:
         for obj in serialized:
             obj.pop("chunk_text", None)
@@ -359,7 +354,6 @@ async def repo_scan_llm(
 
     JOBS_TOTAL.labels(job="repo_scan_llm", status="start").inc()
     try:
-        # NOTE: services.repo_findings.scan_repo_findings_llm MUST accept max_files now.
         out = await scan_repo_findings_llm(db=db, snapshot_id=snapshot_id, max_files=max_files)
         JOBS_TOTAL.labels(job="repo_scan_llm", status="ok").inc()
         return out
