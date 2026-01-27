@@ -13,19 +13,19 @@ class EmbeddingsError(RuntimeError):
 
 
 def _base_url() -> str:
-    # Many repos already use OPENAI_BASE_URL in settings.
-    return str(getattr(settings, "OPENAI_BASE_URL", "") or "https://api.openai.com")
+    # Many repos already use OPENAI_EMBEDDINGS_BASE_URL in settings.
+    return str(getattr(settings, "OPENAI_EMBEDDINGS_BASE_URL", "") or "https://api.openai.com")
 
 
 def _api_key() -> str:
-    key = str(getattr(settings, "OPENAI_API_KEY", "") or "")
+    key = str(getattr(settings, "OPENAI_EMBEDDINGS_API_KEY", "") or "")
     if not key:
-        raise EmbeddingsError("OPENAI_API_KEY is required for embeddings.")
+        raise EmbeddingsError("OPENAI_EMBEDDINGS_API_KEY is required for embeddings.")
     return key
 
 
 def _model() -> str:
-    return str(getattr(settings, "OPENAI_EMBEDDING_MODEL", "") or "text-embedding-3-small")
+    return str(getattr(settings, "OPENAI_EMBEDDINGS_MODEL", "") or "text-embedding-3-small")
 
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:

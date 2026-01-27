@@ -51,9 +51,10 @@ class Settings(BaseSettings):
     # OpenAI-compatible config
     # IMPORTANT: base URL should NOT include /v1
     # Example: https://api.openai.com
-    OPENAI_BASE_URL: str = ""
-    OPENAI_API_KEY: str = "REDACTED_OPENAI_KEY"
-    OPENAI_MODEL: str = "openai"
+    LLM_BASE_URL: str = ""
+    LLM_API_KEY: str = ""
+    LLM_MODEL: str = ""
+    OPENAI_EMBEDDINGS_API_KEY: str = "REDACTED_OPENAI_KEY"
 
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_TIMEOUT_S: float = 60.0
@@ -113,7 +114,7 @@ class Settings(BaseSettings):
     # Embeddings
     EMBEDDINGS_ENABLED: bool = True
     EMBEDDINGS_PROVIDER: str = "off"  # off | openai
-    EMBEDDINGS_MODEL: str = "text-embedding-3-small"
+    OPENAI_EMBEDDINGS_MODEL: str = "text-embedding-3-small"
 
     # If true, chunk build will attempt to embed chunks too.
     EMBED_CHUNKS_ON_BUILD: bool = True

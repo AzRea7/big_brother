@@ -626,9 +626,9 @@ class LLMClient:
     """
 
     def __init__(self) -> None:
-        self.base_url = (getattr(settings, "OPENAI_BASE_URL", "") or "").rstrip("/")
-        self.api_key = getattr(settings, "OPENAI_API_KEY", None)
-        self.model = (getattr(settings, "OPENAI_MODEL", "") or "").strip()
+        self.base_url = (getattr(settings, "LLM_BASE_URL", "") or "").rstrip("/")
+        self.api_key = getattr(settings, "LLM_API_KEY", None)
+        self.model = (getattr(settings, "LLM_MODEL", "") or "").strip()
         self.llm_enabled_flag = getattr(settings, "LLM_ENABLED", None)
 
         self.max_input_chars = int(getattr(settings, "LLM_MAX_INPUT_CHARS", 12_000))
