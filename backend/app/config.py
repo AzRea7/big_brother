@@ -147,6 +147,18 @@ class Settings(BaseSettings):
     GITHUB_OWNER: str = ""
     GITHUB_REPO: str = ""
     GITHUB_TOKEN: str = ""
+
+    PATCH_MAX_FILES: int = Field(default=8, validation_alias="PATCH_MAX_FILES")
+    PATCH_MAX_CHARS: int = Field(default=200_000, validation_alias="PATCH_MAX_CHARS")
+
+    # Accept either comma-separated string or list in env; easiest is comma-separated.
+    PATCH_ALLOWLIST: List[str] = Field(default_factory=list, validation_alias="PATCH_ALLOWLIST")
+    PATCH_DENYLIST: List[str] = Field(default_factory=list, validation_alias="PATCH_DENYLIST")
+
+    PATCH_RAG_TOP_K: int = Field(default=6, validation_alias="PATCH_RAG_TOP_K")
+    PATCH_LLM_MAX_TOKENS: int = Field(default=2600, validation_alias="PATCH_LLM_MAX_TOKENS")
+    PATCH_LLM_TEMPERATURE: float = Field(default=0.1, validation_alias="PATCH_LLM_TEMPERATURE")
+
     # -----------------------
     # GitHub sync exclusions
     # -----------------------

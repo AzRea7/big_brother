@@ -32,6 +32,17 @@ from ..services.repo_findings import (
     tasks_from_findings,
 )
 
+# NEW: Level 3 diff generation + workflow
+from ..services.patch_generator import generate_unified_diff, PatchGenerationError
+from ..services.patch_workflow import (
+    patch_workflow_enabled,
+    pr_workflow_enabled,
+    pr_workflow_dry_run,
+    validate_unified_diff,
+    apply_unified_diff_in_sandbox,
+    open_pull_request_from_patch_run,
+)
+
 router = APIRouter(prefix="/debug", tags=["debug"])
 
 
@@ -44,7 +55,6 @@ def _guard_debug(request: Request) -> None:
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
 
-    # require_api_key accepts a header param in FastAPI DI, but also works if you pass the string directly.
     require_api_key(request.headers.get("X-API-Key"))
 
 
@@ -267,7 +277,6 @@ def _serialize_chunk_hit(h: Any) -> dict[str, Any]:
             "chunk_text": h.get("chunk_text"),
         }
 
-    # dataclass / object with attributes
     return {
         "id": getattr(h, "id", None),
         "snapshot_id": getattr(h, "snapshot_id", None),
@@ -291,13 +300,6 @@ async def repo_chunks_search(
     include_text: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    """
-    Search repo chunks.
-
-    IMPORTANT CHANGE:
-    - Previously this returned the raw tuple (mode_used, hits) so your CLI printed: ["fts_pg", [...] ].
-    - Now it returns a stable JSON object so it’s usable by UI + downstream code, while still showing mode_used.
-    """
     _guard_debug(request)
 
     mode_used, hits = await search_chunks(
@@ -426,3 +428,216 @@ async def repo_tasks_generate_llm(
         max_findings=max_findings,
         chunks_per_finding=chunks_per_finding,
     )
+
+
+# -----------------------
+# Level 3: PR workflow (generate diff -> sandbox apply/test -> open PR)
+# -----------------------
+class PRGenerateBody(BaseModel):
+    snapshot_id: int
+    finding_id: Optional[int] = None
+    objective: Optional[str] = None
+
+
+class PRWorkflowBody(BaseModel):
+    snapshot_id: int
+    # You can either provide patch_text, OR ask it to generate from finding/objective.
+    patch_text: Optional[str] = None
+    finding_id: Optional[int] = None
+    objective: Optional[str] = None
+    run_tests: bool = True
+    pr_title: Optional[str] = None
+    pr_body: Optional[str] = None
+
+
+def _serialize_patch_run(run: Any) -> dict[str, Any]:
+    return {
+        "run_id": getattr(run, "id", None),
+        "snapshot_id": getattr(run, "snapshot_id", None),
+        "valid": bool(getattr(run, "valid", False)),
+        "validation_error": getattr(run, "validation_error", None),
+        "files_changed": int(getattr(run, "files_changed", 0) or 0),
+        "lines_changed": int(getattr(run, "lines_changed", 0) or 0),
+        "file_paths_json": getattr(run, "file_paths_json", None),
+        "applied": bool(getattr(run, "applied", False)),
+        "apply_error": getattr(run, "apply_error", None),
+        "tests_ran": bool(getattr(run, "tests_ran", False)),
+        "tests_ok": bool(getattr(run, "tests_ok", False)),
+        "test_output": getattr(run, "test_output", None),
+        "sandbox_path": getattr(run, "sandbox_path", None),
+        "created_at": getattr(run, "created_at", None).isoformat() if getattr(run, "created_at", None) else None,
+    }
+
+
+@router.post("/repo/pr/generate")
+async def repo_pr_generate(
+    request: Request,
+    body: PRGenerateBody,
+    db: Session = Depends(get_db),
+):
+    """
+    Commit 1 capability:
+    - Generate patch only (no apply, no PR).
+    - Validate patch with the same validator used by apply workflow.
+    """
+    _guard_debug(request)
+
+    if not settings.LLM_ENABLED:
+        raise HTTPException(status_code=400, detail="LLM is disabled (LLM_ENABLED=false).")
+
+    try:
+        gen = await generate_unified_diff(
+            db=db,
+            snapshot_id=int(body.snapshot_id),
+            finding_id=int(body.finding_id) if body.finding_id is not None else None,
+            objective=body.objective,
+        )
+    except PatchGenerationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Patch generation failed: {e!r}")
+
+    # Validate (uses allowlist + caps)
+    v = validate_unified_diff(db, int(body.snapshot_id), str(gen["patch_text"]))
+
+    return {
+        "snapshot_id": body.snapshot_id,
+        "finding_id": body.finding_id,
+        "objective": gen.get("objective"),
+        "validation": v,
+        "patch_text": gen["patch_text"],
+        "snippets_used": gen.get("snippets_used", []),
+    }
+
+
+@router.post("/repo/pr/dry_run")
+async def repo_pr_dry_run(
+    request: Request,
+    body: PRWorkflowBody,
+    db: Session = Depends(get_db),
+):
+    """
+    Commit 2 capability:
+    - If patch_text missing: generate it.
+    - Apply in sandbox (requires ENABLE_PATCH_WORKFLOW=true)
+    - Run tests (run_tests=true by default)
+    - Does NOT open PR.
+    """
+    _guard_debug(request)
+
+    if not patch_workflow_enabled():
+        raise HTTPException(status_code=400, detail="Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
+
+    patch_text = (body.patch_text or "").strip()
+    if not patch_text:
+        if not settings.LLM_ENABLED:
+            raise HTTPException(status_code=400, detail="LLM is disabled and patch_text not provided.")
+        try:
+            gen = await generate_unified_diff(
+                db=db,
+                snapshot_id=int(body.snapshot_id),
+                finding_id=int(body.finding_id) if body.finding_id is not None else None,
+                objective=body.objective,
+            )
+            patch_text = str(gen["patch_text"])
+        except PatchGenerationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    run = await apply_unified_diff_in_sandbox(
+        db=db,
+        snapshot_id=int(body.snapshot_id),
+        patch_text=patch_text,
+        run_tests=bool(body.run_tests),
+    )
+
+    return {
+        "snapshot_id": body.snapshot_id,
+        "mode": "dry_run",
+        "patch_text": patch_text,
+        "run": _serialize_patch_run(run),
+    }
+
+
+@router.post("/repo/pr/run")
+async def repo_pr_run(
+    request: Request,
+    body: PRWorkflowBody,
+    db: Session = Depends(get_db),
+):
+    """
+    Full Level 3:
+    - generate patch (if needed)
+    - validate/apply/tests
+    - open PR (requires ENABLE_PR_WORKFLOW=true and PR_WORKFLOW_DRY_RUN=false)
+    """
+    _guard_debug(request)
+
+    if not patch_workflow_enabled():
+        raise HTTPException(status_code=400, detail="Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
+
+    if not pr_workflow_enabled():
+        raise HTTPException(status_code=400, detail="PR workflow disabled (ENABLE_PR_WORKFLOW=false).")
+
+    if pr_workflow_dry_run():
+        raise HTTPException(
+            status_code=400,
+            detail="PR workflow is in DRY RUN mode (PR_WORKFLOW_DRY_RUN=true). Set it to false to actually open PRs.",
+        )
+
+    patch_text = (body.patch_text or "").strip()
+    if not patch_text:
+        if not settings.LLM_ENABLED:
+            raise HTTPException(status_code=400, detail="LLM is disabled and patch_text not provided.")
+        try:
+            gen = await generate_unified_diff(
+                db=db,
+                snapshot_id=int(body.snapshot_id),
+                finding_id=int(body.finding_id) if body.finding_id is not None else None,
+                objective=body.objective,
+            )
+            patch_text = str(gen["patch_text"])
+        except PatchGenerationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    run = await apply_unified_diff_in_sandbox(
+        db=db,
+        snapshot_id=int(body.snapshot_id),
+        patch_text=patch_text,
+        run_tests=bool(body.run_tests),
+    )
+
+    if not getattr(run, "valid", False):
+        return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
+
+    if not getattr(run, "applied", False):
+        return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
+
+    if bool(body.run_tests) and not getattr(run, "tests_ok", False):
+        return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
+
+    title = (body.pr_title or "").strip()
+    if not title:
+        # reasonable default
+        title = "Automated fix from Goal Autopilot"
+
+    pr = await open_pull_request_from_patch_run(
+        db=db,
+        snapshot_id=int(body.snapshot_id),
+        patch_run_id=int(getattr(run, "id")),
+        title=title,
+        body=(body.pr_body or None),
+    )
+
+    return {
+        "snapshot_id": body.snapshot_id,
+        "mode": "run",
+        "patch_text": patch_text,
+        "run": _serialize_patch_run(run),
+        "pr": {
+            "id": getattr(pr, "id", None),
+            "pr_number": getattr(pr, "pr_number", None),
+            "pr_url": getattr(pr, "pr_url", None),
+            "branch": getattr(pr, "branch", None),
+            "title": getattr(pr, "title", None),
+        },
+    }

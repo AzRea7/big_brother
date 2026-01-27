@@ -512,3 +512,139 @@ def debug_repo_pr_create(
     except Exception:
         JOBS_TOTAL.labels(job="repo_pr_create", status="error").inc()
         raise
+
+# -------------------------------------------------------------------
+# ✅ Level 3 PR workflow convenience endpoints (dry_run + run)
+# -------------------------------------------------------------------
+
+class PRDryRunRequest(BaseModel):
+    snapshot_id: int
+    patch_text: str
+    run_tests: bool = True
+
+
+class PRRunRequest(BaseModel):
+    snapshot_id: int
+    patch_text: str
+    title: str
+    body: str | None = None
+    base_branch: str = "main"
+    run_tests: bool = True
+
+
+@router.post("/pr/dry_run")
+async def debug_repo_pr_dry_run(
+    request: Request,
+    payload: PRDryRunRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Dry-run the Level 3 pipeline:
+      1) validate unified diff
+      2) apply in sandbox
+      3) optionally run tests
+    Returns validate + apply output. Never opens a PR.
+    """
+    _guard_debug(request)
+
+    if validate_unified_diff is None or apply_unified_diff_in_sandbox is None:
+        raise HTTPException(status_code=501, detail="Patch workflow not wired yet (services/patch_workflow.py missing).")
+
+    # 1) validate
+    JOBS_TOTAL.labels(job="repo_pr_dry_run_validate", status="start").inc()
+    try:
+        v = validate_unified_diff(db=db, snapshot_id=payload.snapshot_id, patch_text=payload.patch_text)  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_dry_run_validate", status="ok").inc()
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_dry_run_validate", status="error").inc()
+        raise
+
+    # If your validator returns {"ok": False, ...}, hard stop
+    if isinstance(v, dict) and v.get("ok") is False:
+        return {"ok": False, "stage": "validate", "validate": v, "apply": None}
+
+    # 2) apply (+ optional tests)
+    JOBS_TOTAL.labels(job="repo_pr_dry_run_apply", status="start").inc()
+    try:
+        a = await apply_unified_diff_in_sandbox(
+            db=db,
+            snapshot_id=payload.snapshot_id,
+            patch_text=payload.patch_text,
+            run_tests=bool(payload.run_tests),
+        )  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_dry_run_apply", status="ok").inc()
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_dry_run_apply", status="error").inc()
+        raise
+
+    return {"ok": True, "validate": v, "apply": a}
+
+
+@router.post("/pr/run")
+async def debug_repo_pr_run(
+    request: Request,
+    payload: PRRunRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Full Level 3 pipeline:
+      1) validate unified diff
+      2) apply in sandbox
+      3) run tests (recommended: keep run_tests=True)
+      4) open PR (requires ENABLE_PR_WORKFLOW=true and PR_WORKFLOW_DRY_RUN=false)
+    """
+    _guard_debug(request)
+
+    if validate_unified_diff is None or apply_unified_diff_in_sandbox is None or open_pull_request_from_patch_run is None:
+        raise HTTPException(status_code=501, detail="PR workflow not wired yet (services/patch_workflow.py missing).")
+
+    # 1) validate
+    JOBS_TOTAL.labels(job="repo_pr_run_validate", status="start").inc()
+    try:
+        v = validate_unified_diff(db=db, snapshot_id=payload.snapshot_id, patch_text=payload.patch_text)  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_run_validate", status="ok").inc()
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_run_validate", status="error").inc()
+        raise
+
+    if isinstance(v, dict) and v.get("ok") is False:
+        return {"ok": False, "stage": "validate", "validate": v, "apply": None, "pr": None}
+
+    # 2) apply (+ tests)
+    JOBS_TOTAL.labels(job="repo_pr_run_apply", status="start").inc()
+    try:
+        a = await apply_unified_diff_in_sandbox(
+            db=db,
+            snapshot_id=payload.snapshot_id,
+            patch_text=payload.patch_text,
+            run_tests=bool(payload.run_tests),
+        )  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_run_apply", status="ok").inc()
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_run_apply", status="error").inc()
+        raise
+
+    # pull patch_run_id out of apply response (supports a few common shapes)
+    patch_run_id = None
+    if isinstance(a, dict):
+        patch_run_id = a.get("patch_run_id") or a.get("run_id") or a.get("id")
+    if patch_run_id is None:
+        raise HTTPException(status_code=500, detail=f"apply_unified_diff_in_sandbox did not return patch_run_id. Got: {a}")
+
+    # 3) open PR (service itself enforces hard gates)
+    JOBS_TOTAL.labels(job="repo_pr_run_open_pr", status="start").inc()
+    try:
+        pr = open_pull_request_from_patch_run(
+            db=db,
+            snapshot_id=payload.snapshot_id,
+            patch_run_id=int(patch_run_id),
+            title=payload.title,
+            body=payload.body,
+            base_branch=payload.base_branch,
+        )  # type: ignore[misc]
+        JOBS_TOTAL.labels(job="repo_pr_run_open_pr", status="ok").inc()
+    except Exception:
+        JOBS_TOTAL.labels(job="repo_pr_run_open_pr", status="error").inc()
+        raise
+
+    return {"ok": True, "validate": v, "apply": a, "pr": pr}
