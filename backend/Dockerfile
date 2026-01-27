@@ -5,8 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# ✅ Add git + certs (needed for PR workflow + GitHub HTTPS)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
+    git \
+    ca-certificates \
+    curl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

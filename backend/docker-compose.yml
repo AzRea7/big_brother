@@ -23,19 +23,22 @@ services:
     env_file:
       - .env
     environment:
-      # Repo sync config (kept from your current compose)
+      # Repo sync config
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITHUB_REPO=${GITHUB_REPO:-AzRea7/OneHaven}
       - GITHUB_BRANCH=${GITHUB_BRANCH:-main}
       - REPO_LOCAL_PATH=${REPO_LOCAL_PATH:-/repos/OneHaven/onehaven}
 
-      # Prod DB default (override in .env if you want)
+      # DB: use service name "postgres"
       - DB_URL=${DB_URL:-postgresql+psycopg://goal:goal@postgres:5432/goal_autopilot}
+
+      # Optional but recommended: make git non-interactive inside container
+      - GIT_TERMINAL_PROMPT=0
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      # Windows example mount (keep yours, update if your path differs)
+      # Mount repo read-only (good safety)
       - C:/Users/austin/onehaven:/repos/OneHaven:ro
     depends_on:
       postgres:
