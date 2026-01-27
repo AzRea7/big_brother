@@ -1,141 +1,166 @@
 # backend/app/services/patch_workflow.py
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RepoPatchRun, RepoPullRequest, RepoSnapshot
-from .repo_materialize import materialize_snapshot_to_dir
+from .repo_materialize import materialize_snapshot_to_disk
+
+_DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$", re.MULTILINE)
 
 
-_DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
+def patch_workflow_enabled() -> bool:
+    # Patch apply is its own dangerous capability. Keep it independently gated.
+    return bool(getattr(settings, "ENABLE_PATCH_WORKFLOW", False))
 
 
-def _pr_workflow_enabled() -> bool:
+def pr_workflow_enabled() -> bool:
     return bool(getattr(settings, "ENABLE_PR_WORKFLOW", False))
 
 
-def _require_enabled() -> None:
-    if not _pr_workflow_enabled():
-        raise RuntimeError("PR workflow is disabled (ENABLE_PR_WORKFLOW=false)")
+def pr_workflow_dry_run() -> bool:
+    return bool(getattr(settings, "PR_WORKFLOW_DRY_RUN", True))
 
 
-def _count_lines_changed(patch_text: str) -> int:
-    changed = 0
-    for line in patch_text.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            changed += 1
-        if line.startswith("-") and not line.startswith("---"):
-            changed += 1
-    return changed
+def _github_token() -> str:
+    tok = str(getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+    if not tok:
+        raise RuntimeError("GITHUB_TOKEN is required to open PRs.")
+    return tok
 
 
-def _run_cmd(cmd: str, cwd: str, timeout_s: int) -> tuple[bool, str]:
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        return proc.returncode == 0, out.strip()
-    except Exception as e:
-        return False, f"Command failed: {e!r}"
+def _pr_allowlist_dirs() -> list[str]:
+    # Settings uses PR_ALLOWLIST_DIRS in your config snippet. :contentReference[oaicite:4]{index=4}
+    dirs = getattr(settings, "PR_ALLOWLIST_DIRS", None)
+    if isinstance(dirs, list) and dirs:
+        return [str(d).strip() for d in dirs if str(d).strip()]
+    return []
 
 
-def validate_unified_diff(
-    *,
-    db: Optional[Session] = None,        # accepted for route compatibility
-    snapshot_id: Optional[int] = None,   # accepted for route compatibility
-    patch_text: str,
-) -> dict[str, Any]:
+def _reject_path(path: str) -> Optional[str]:
+    p = (path or "").strip()
+    if not p:
+        return "Empty path in diff."
+    if p.startswith("/") or p.startswith("\\"):
+        return f"Absolute paths not allowed: {p}"
+    if ".." in p.replace("\\", "/").split("/"):
+        return f"Path traversal not allowed: {p}"
+    return None
+
+
+def _extract_paths(patch_text: str) -> list[str]:
+    out: list[str] = []
+    for m in _DIFF_HEADER_RE.finditer(patch_text or ""):
+        a_path = m.group(1).strip()
+        b_path = m.group(2).strip()
+        if a_path and a_path not in out:
+            out.append(a_path)
+        if b_path and b_path not in out:
+            out.append(b_path)
+    return out
+
+
+def _count_changed_lines(patch_text: str) -> int:
+    s = (patch_text or "").splitlines()
+    n = 0
+    for line in s:
+        if line.startswith("+++ ") or line.startswith("--- ") or line.startswith("@@"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            n += 1
+    return n
+
+
+def validate_unified_diff(db: Session, snapshot_id: int, patch_text: str) -> dict[str, object]:
     """
-    Gate C (mutation safety):
-      - unified diff structure
-      - allowlist dirs
-      - cap files + lines
-
-    Returns a dict your routes can return directly.
+    Validates unified diff content and returns a dict compatible with your API schemas:
+      { valid, error, files_changed, lines_changed, file_paths }
     """
-    _require_enabled()
+    s = (patch_text or "").strip()
+    if not s:
+        return {"valid": False, "error": "Empty patch_text.", "files_changed": 0, "lines_changed": 0, "file_paths": []}
 
-    patch_text = str(patch_text or "")
-    if not patch_text.strip():
-        return {"ok": False, "error": "Empty patch", "files_changed": 0, "lines_changed": 0, "file_paths": []}
-
-    if "diff --git " not in patch_text:
+    matches = list(_DIFF_HEADER_RE.finditer(s))
+    if not matches:
         return {
-            "ok": False,
-            "error": "Patch must be a unified diff (missing 'diff --git')",
+            "valid": False,
+            "error": "Patch missing 'diff --git a/... b/...'.",
             "files_changed": 0,
             "lines_changed": 0,
             "file_paths": [],
         }
+
+    allow_dirs = _pr_allowlist_dirs()
+    max_files = int(getattr(settings, "PR_MAX_FILES_CHANGED", 8) or 8)
+    max_lines = int(getattr(settings, "PR_MAX_LINES_CHANGED", 400) or 400)
 
     file_paths: list[str] = []
-    for line in patch_text.splitlines():
-        m = _DIFF_FILE_RE.match(line)
-        if m:
-            file_paths.append(m.group(1))
+    files_changed = 0
 
-    # dedupe preserve order
-    file_paths = list(dict.fromkeys(file_paths))
-    if not file_paths:
-        return {
-            "ok": False,
-            "error": "Could not parse any '+++ b/<path>' file entries",
-            "files_changed": 0,
-            "lines_changed": 0,
-            "file_paths": [],
-        }
+    for m in matches:
+        a_path = m.group(1).strip()
+        b_path = m.group(2).strip()
 
-    allow = list(getattr(settings, "PR_ALLOWLIST_DIRS", ["backend/"]))
-    for p in file_paths:
-        if not any(p.startswith(a) for a in allow):
-            return {
-                "ok": False,
-                "error": f"File not in allowlist: {p}",
-                "files_changed": 0,
-                "lines_changed": 0,
-                "file_paths": file_paths,
-            }
+        err = _reject_path(a_path) or _reject_path(b_path)
+        if err:
+            return {"valid": False, "error": err, "files_changed": 0, "lines_changed": 0, "file_paths": []}
 
-    files_changed = len(file_paths)
-    max_files = int(getattr(settings, "PR_MAX_FILES_CHANGED", 8))
+        # allowlist: only allow touching safe subtrees
+        if allow_dirs:
+            ok = any(a_path.startswith(d) or b_path.startswith(d) for d in allow_dirs)
+            if not ok:
+                return {
+                    "valid": False,
+                    "error": f"Path not in allowlist dirs: {a_path} / {b_path}",
+                    "files_changed": 0,
+                    "lines_changed": 0,
+                    "file_paths": [],
+                }
+
+        files_changed += 1
+        if a_path not in file_paths:
+            file_paths.append(a_path)
+        if b_path not in file_paths:
+            file_paths.append(b_path)
+
     if files_changed > max_files:
         return {
-            "ok": False,
+            "valid": False,
             "error": f"Too many files changed: {files_changed} > {max_files}",
             "files_changed": files_changed,
             "lines_changed": 0,
             "file_paths": file_paths,
         }
 
-    lines_changed = _count_lines_changed(patch_text)
-    max_lines = int(getattr(settings, "PR_MAX_LINES_CHANGED", 400))
+    lines_changed = _count_changed_lines(s)
     if lines_changed > max_lines:
         return {
-            "ok": False,
-            "error": f"Too many lines changed: {lines_changed} > {max_lines}",
+            "valid": False,
+            "error": f"Too many changed lines: {lines_changed} > {max_lines}",
             "files_changed": files_changed,
             "lines_changed": lines_changed,
             "file_paths": file_paths,
         }
 
+    # Snapshot existence check (helps return a clean error instead of exploding later)
+    snap = db.query(RepoSnapshot).filter(RepoSnapshot.id == snapshot_id).first()
+    if not snap:
+        return {"valid": False, "error": f"Unknown snapshot_id={snapshot_id}", "files_changed": 0, "lines_changed": 0, "file_paths": []}
+
     return {
-        "ok": True,
+        "valid": True,
         "error": None,
         "files_changed": files_changed,
         "lines_changed": lines_changed,
@@ -143,226 +168,282 @@ def validate_unified_diff(
     }
 
 
+@dataclass(frozen=True)
+class _CmdResult:
+    ok: bool
+    out: str
+
+
+def _run(cmd: str, *, cwd: str, timeout_s: int) -> _CmdResult:
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+            check=False,
+            text=True,
+        )
+        out = (p.stdout or "").strip()
+        return _CmdResult(ok=(p.returncode == 0), out=out)
+    except subprocess.TimeoutExpired:
+        return _CmdResult(ok=False, out=f"Command timed out after {timeout_s}s: {cmd}")
+
+
 async def apply_unified_diff_in_sandbox(
-    *,
     db: Session,
     snapshot_id: int,
     patch_text: str,
+    *,
     run_tests: bool = True,
-) -> dict[str, Any]:
+) -> RepoPatchRun:
     """
-    Gate C continued:
-      - materialize snapshot into sandbox
-      - git apply patch
-      - optionally run tests command
-      - persist RepoPatchRun
+    Apply patch to a materialized snapshot (sandbox dir), run tests, persist a RepoPatchRun row.
     """
-    _require_enabled()
+    if not patch_workflow_enabled():
+        raise RuntimeError("Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
 
-    v = validate_unified_diff(db=db, snapshot_id=snapshot_id, patch_text=patch_text)
-    ok = bool(v.get("ok"))
-    err = v.get("error")
-    files_changed = v.get("files_changed")
-    lines_changed = v.get("lines_changed")
-    file_paths = v.get("file_paths") or []
+    v = validate_unified_diff(db, snapshot_id, patch_text)
+    valid = bool(v.get("valid"))
+    validation_error = v.get("error")
 
     run = RepoPatchRun(
         snapshot_id=snapshot_id,
-        patch_text=str(patch_text or ""),
-        valid=ok,
-        validation_error=str(err) if err else None,
-        files_changed=int(files_changed) if isinstance(files_changed, int) else None,
-        lines_changed=int(lines_changed) if isinstance(lines_changed, int) else None,
-        file_paths_json=None,
+        patch_text=patch_text,
+        valid=bool(valid),
+        validation_error=str(validation_error) if validation_error else None,
+        files_changed=int(v.get("files_changed") or 0),
+        lines_changed=int(v.get("lines_changed") or 0),
+        file_paths_json=json.dumps(v.get("file_paths") or []),
+        applied=False,
+        apply_error=None,
+        tests_ran=False,
+        tests_ok=False,
+        test_output=None,
         created_at=datetime.utcnow(),
     )
-    # store file_paths_json compactly
-    try:
-        import json
-        run.file_paths_json = json.dumps(file_paths, separators=(",", ":"))
-    except Exception:
-        run.file_paths_json = None
-
     db.add(run)
-    db.commit()  # run.id exists
-
-    if not ok:
-        return {
-            "run_id": int(run.id),
-            "valid": False,
-            "validation_error": err,
-            "applied": False,
-            "apply_error": None,
-            "tests_ran": False,
-            "tests_ok": False,
-            "test_output": None,
-        }
-
-    sandbox = tempfile.mkdtemp(prefix=f"repo_patch_{snapshot_id}_")
-    run.sandbox_path = sandbox
     db.commit()
+    db.refresh(run)
 
-    # Materialize repo snapshot into sandbox
-    await materialize_snapshot_to_dir(db, snapshot_id=snapshot_id, out_dir=sandbox)
+    if not valid:
+        return run
 
-    patch_path = os.path.join(sandbox, "_patch.diff")
-    with open(patch_path, "w", encoding="utf-8") as f:
-        f.write(str(patch_text or ""))
+    tmpdir = tempfile.mkdtemp(prefix=f"patchrun_{snapshot_id}_{run.id}_")
+    keep = bool(getattr(settings, "KEEP_PATCH_SANDBOX", False))
 
-    applied_ok, apply_out = _run_cmd(f"git apply --whitespace=nowarn {patch_path}", cwd=sandbox, timeout_s=60)
-    run.applied = bool(applied_ok)
-    run.apply_error = None if applied_ok else apply_out
-    run.diff_output = apply_out[:4000] if apply_out else None
-    db.commit()
+    try:
+        # Materialize snapshot into tmpdir
+        repo_root = materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id, dest_dir=tmpdir)
 
-    if not applied_ok:
-        return {
-            "run_id": int(run.id),
-            "valid": True,
-            "validation_error": None,
-            "applied": False,
-            "apply_error": apply_out,
-            "tests_ran": False,
-            "tests_ok": False,
-            "test_output": None,
-        }
+        # Apply patch via git apply (fast + strict)
+        # Initialize git so git apply works consistently
+        _run("git init", cwd=repo_root, timeout_s=30)
+        _run("git add -A", cwd=repo_root, timeout_s=30)
+        _run("git commit -m \"snapshot baseline\" --no-gpg-sign", cwd=repo_root, timeout_s=60)
 
-    if run_tests:
-        cmd = str(getattr(settings, "PR_TEST_CMD", "pytest -q") or "pytest -q")
-        timeout = int(getattr(settings, "PR_TIMEOUT_SECONDS", 900))
-        tests_ok, out = _run_cmd(cmd, cwd=sandbox, timeout_s=timeout)
-        run.tests_ran = True
-        run.tests_ok = bool(tests_ok)
-        run.test_output = (out or "")[:20000]
+        apply_res = _run("git apply --whitespace=nowarn -", cwd=repo_root, timeout_s=60)
+        if not apply_res.ok:
+            # try feeding patch through stdin correctly
+            try:
+                p = subprocess.run(
+                    "git apply --whitespace=nowarn -",
+                    cwd=repo_root,
+                    shell=True,
+                    input=patch_text,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
+                    check=False,
+                    text=True,
+                )
+                out = (p.stdout or "").strip()
+                if p.returncode != 0:
+                    raise RuntimeError(out or "git apply failed")
+            except Exception as e:
+                run.applied = False
+                run.apply_error = str(e)
+                db.commit()
+                return run
+
+        run.applied = True
+        run.apply_error = None
+        run.sandbox_path = repo_root
         db.commit()
 
-        return {
-            "run_id": int(run.id),
-            "valid": True,
-            "validation_error": None,
-            "applied": True,
-            "apply_error": None,
-            "tests_ran": True,
-            "tests_ok": bool(tests_ok),
-            "test_output": out,
-        }
+        if run_tests:
+            test_cmd = str(getattr(settings, "PR_TEST_CMD", "pytest -q") or "pytest -q")
+            timeout_s = int(getattr(settings, "PR_TIMEOUT_SECONDS", 900) or 900)
+            t = _run(test_cmd, cwd=repo_root, timeout_s=timeout_s)
 
-    return {
-        "run_id": int(run.id),
-        "valid": True,
-        "validation_error": None,
-        "applied": True,
-        "apply_error": None,
-        "tests_ran": False,
-        "tests_ok": False,
-        "test_output": None,
-    }
+            run.tests_ran = True
+            run.tests_ok = bool(t.ok)
+            run.test_output = t.out[:20000] if t.out else None
+            db.commit()
+
+        return run
+    finally:
+        if not keep:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _github_token() -> str:
-    tok = str(getattr(settings, "GITHUB_TOKEN", "") or "").strip()
-    if not tok:
-        raise RuntimeError("Missing GITHUB_TOKEN in settings/env.")
-    return tok
+def _parse_owner_repo(snapshot: RepoSnapshot) -> tuple[str, str]:
+    # Snapshot often stores repo like "AzRea7/OneHaven"
+    repo = str(getattr(snapshot, "repo", "") or "").strip()
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        return owner.strip(), name.strip()
+
+    owner = str(getattr(settings, "GITHUB_OWNER", "") or "").strip()
+    name = str(getattr(settings, "GITHUB_REPO", "") or "").strip()
+    if owner and name:
+        return owner, name
+
+    raise RuntimeError("Cannot determine GitHub owner/repo. Set snapshot.repo to 'owner/name' or set GITHUB_OWNER/GITHUB_REPO.")
 
 
-def _assert_pr_ready(run: RepoPatchRun) -> None:
-    """
-    Hard safety gate before opening a PR.
-    This is the difference between “workflow exists” and “Level 3 works safely”.
-    """
-    if not bool(run.valid):
-        raise RuntimeError(f"Patch run {run.id} is not valid: {run.validation_error or 'unknown'}")
-    if not bool(run.applied):
-        raise RuntimeError(f"Patch run {run.id} was not applied: {run.apply_error or 'unknown'}")
-    if not bool(run.tests_ran):
-        raise RuntimeError(f"Patch run {run.id} did not run tests; refusing to open PR.")
-    if not bool(run.tests_ok):
-        raise RuntimeError(f"Patch run {run.id} tests failed; refusing to open PR.")
+def _clone_for_pr(owner: str, repo: str, base_branch: str) -> str:
+    tok = _github_token()
+    url = f"https://x-access-token:{tok}@github.com/{owner}/{repo}.git"
+    tmpdir = tempfile.mkdtemp(prefix=f"prclone_{owner}_{repo}_")
+    r = _run(f"git clone --depth 1 --branch {base_branch} {url} .", cwd=tmpdir, timeout_s=300)
+    if not r.ok:
+        raise RuntimeError(f"git clone failed: {r.out}")
+    return tmpdir
 
 
-def open_pull_request_from_patch_run(
-    *,
+def _create_branch_name(patch_run_id: int) -> str:
+    return f"goal-autopilot/patchrun-{patch_run_id}"
+
+
+async def open_pull_request_from_patch_run(
     db: Session,
     snapshot_id: int,
     patch_run_id: int,
+    *,
     title: str,
-    body: str = "",
-    base_branch: str = "main",
-) -> dict[str, Any]:
+    body: Optional[str] = None,
+    base_branch: Optional[str] = None,
+) -> dict[str, object]:
     """
-    Open a PR ONLY after:
-      valid diff → applied → tests passed.
+    Opens a PR from an existing successful RepoPatchRun.
+    - Re-clones the repo from GitHub
+    - Applies the patch
+    - Runs tests (again, in the real repo checkout)
+    - Commits + pushes a branch
+    - Opens a PR via GitHub API
 
-    (We enforce this here, not in the route, so nobody can bypass it.)
+    Returns: { ok, pr_url, pr_number, error }
     """
-    _require_enabled()
+    if not pr_workflow_enabled():
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow disabled (ENABLE_PR_WORKFLOW=false)."}
 
-    snap = db.get(RepoSnapshot, int(snapshot_id))
+    if pr_workflow_dry_run():
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow dry-run enabled (PR_WORKFLOW_DRY_RUN=true). Set false to open PRs."}
+
+    snap = db.query(RepoSnapshot).filter(RepoSnapshot.id == snapshot_id).first()
     if not snap:
-        raise RuntimeError(f"Snapshot {snapshot_id} not found")
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": f"Unknown snapshot_id={snapshot_id}"}
 
-    run = db.get(RepoPatchRun, int(patch_run_id))
+    run = db.query(RepoPatchRun).filter(RepoPatchRun.id == patch_run_id).first()
     if not run or int(run.snapshot_id) != int(snapshot_id):
-        raise RuntimeError("Patch run not found for this snapshot")
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run not found for this snapshot."}
 
-    _assert_pr_ready(run)
+    if not run.valid or not run.applied or (run.tests_ran and not run.tests_ok):
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run is not in a green state (valid+applied+tests_ok required)."}
 
-    repo = str(snap.repo or "").strip()
-    if not repo:
-        raise RuntimeError("Snapshot repo missing")
+    owner, repo = _parse_owner_repo(snap)
+    base = base_branch or str(getattr(snap, "branch", "") or "main")
+    branch = _create_branch_name(run.id)
 
-    base = str(base_branch or snap.branch or "main").strip() or "main"
-    branch = f"autopilot/patch-run-{run.id}"
+    keep = bool(getattr(settings, "KEEP_PR_SANDBOX", False))
+    clone_dir = None
 
-    sandbox = run.sandbox_path
-    if not sandbox or not os.path.isdir(sandbox):
-        raise RuntimeError("Sandbox path missing; cannot push.")
+    try:
+        clone_dir = _clone_for_pr(owner, repo, base)
 
-    tok = _github_token()
+        # Create branch
+        r = _run(f"git checkout -b {branch}", cwd=clone_dir, timeout_s=60)
+        if not r.ok:
+            raise RuntimeError(f"git checkout -b failed: {r.out}")
 
-    # Create commit in sandbox
-    _run_cmd("git add -A", cwd=sandbox, timeout_s=60)
-    safe_title = str(title or "Autopilot patch").replace('"', '\\"')
-    ok, out = _run_cmd(f'git commit -m "{safe_title}"', cwd=sandbox, timeout_s=60)
-    if not ok:
-        raise RuntimeError(f"Failed to commit: {out}")
-
-    remote_url = f"https://{tok}@github.com/{repo}.git"
-    _run_cmd("git remote remove origin", cwd=sandbox, timeout_s=15)
-    _run_cmd(f"git remote add origin {remote_url}", cwd=sandbox, timeout_s=15)
-    _run_cmd(f"git checkout -b {branch}", cwd=sandbox, timeout_s=30)
-
-    ok, out = _run_cmd(f"git push -u origin {branch}", cwd=sandbox, timeout_s=120)
-    if not ok:
-        raise RuntimeError(f"Failed to push branch: {out}")
-
-    api = "https://api.github.com"
-    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
-    payload = {"title": str(title), "head": branch, "base": base, "body": str(body or "")}
-
-    with httpx.Client(timeout=30.0) as client:
-        r = client.post(f"{api}/repos/{repo}/pulls", headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Failed to open PR {r.status_code}: {r.text}")
-        pr = r.json()
-
-    pr_url = pr.get("html_url")
-    pr_number = pr.get("number")
-
-    db.add(
-        RepoPullRequest(
-            snapshot_id=int(snapshot_id),
-            patch_run_id=int(run.id),
-            repo=repo,
-            branch=branch,
-            pr_number=int(pr_number) if pr_number else None,
-            pr_url=str(pr_url) if pr_url else None,
-            title=str(title),
-            body=str(body or "") if body is not None else None,
-            created_at=datetime.utcnow(),
+        # Apply patch
+        p = subprocess.run(
+            "git apply --whitespace=nowarn -",
+            cwd=clone_dir,
+            shell=True,
+            input=run.patch_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+            text=True,
         )
-    )
-    db.commit()
+        out = (p.stdout or "").strip()
+        if p.returncode != 0:
+            raise RuntimeError(out or "git apply failed in PR clone")
 
-    return {"ok": True, "pr_url": pr_url, "pr_number": pr_number, "branch": branch}
+        # Run tests again in the real checkout
+        test_cmd = str(getattr(settings, "PR_TEST_CMD", "pytest -q") or "pytest -q")
+        timeout_s = int(getattr(settings, "PR_TIMEOUT_SECONDS", 900) or 900)
+        t = _run(test_cmd, cwd=clone_dir, timeout_s=timeout_s)
+        if not t.ok:
+            raise RuntimeError(f"Tests failed in PR clone:\n{t.out}")
+
+        # Commit
+        _run("git add -A", cwd=clone_dir, timeout_s=30)
+        c = _run(f"git commit -m {json.dumps(title)} --no-gpg-sign", cwd=clone_dir, timeout_s=60)
+        if not c.ok:
+            raise RuntimeError(f"git commit failed: {c.out}")
+
+        sha = _run("git rev-parse HEAD", cwd=clone_dir, timeout_s=30).out.strip()[:64]
+        run.commit_sha = sha
+
+        # Push
+        push = _run(f"git push -u origin {branch}", cwd=clone_dir, timeout_s=180)
+        if not push.ok:
+            raise RuntimeError(f"git push failed: {push.out}")
+
+        # Open PR via API
+        tok = _github_token()
+        api = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
+        payload = {"title": title, "head": branch, "base": base, "body": body or ""}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(api, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"GitHub PR create failed {resp.status_code}: {resp.text}")
+            data = resp.json()
+
+        pr_url = str(data.get("html_url") or "")
+        pr_number = int(data.get("number") or 0) or None
+
+        run.pr_url = pr_url or None
+        run.pr_number = pr_number
+        run.pr_branch = branch
+        db.commit()
+
+        db.add(
+            RepoPullRequest(
+                snapshot_id=snapshot_id,
+                patch_run_id=run.id,
+                pr_url=pr_url,
+                pr_number=pr_number,
+                created_at=datetime.utcnow(),
+            )
+        )
+        db.commit()
+
+        return {"ok": True, "pr_url": pr_url, "pr_number": pr_number, "error": None}
+
+    except Exception as e:
+        run.pr_error = str(e)[:2000] if run else None
+        db.commit()
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": str(e)}
+
+    finally:
+        if clone_dir and not keep:
+            shutil.rmtree(clone_dir, ignore_errors=True)

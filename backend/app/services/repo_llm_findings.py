@@ -9,27 +9,19 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from ..ai.llm import chat_completion_json
+from ..config import settings
+from ..models import RepoFile, RepoFinding, Task
 
-# ✅ FIX: repo_findings_user may not exist in app.ai.prompts in your current repo state.
-# We import it opportunistically and provide a safe fallback builder.
+# Prompt import: keep stable even if your prompts module changes.
 from ..ai.prompts import REPO_FINDINGS_SYSTEM  # type: ignore
 
 try:
-    # If your prompts.py defines this, we use it (best case).
     from ..ai.prompts import repo_findings_user  # type: ignore
 except Exception:
 
     def repo_findings_user(context: str) -> str:
-        """
-        Fallback prompt builder used when app.ai.prompts.repo_findings_user is missing.
-
-        IMPORTANT:
-        - Returns a single user prompt string.
-        - Keeps output format requirements explicit so chat_completion_json can parse JSON reliably.
-        """
         return (
-            "You are analyzing a code repository snapshot. "
-            "Return STRICT JSON only with the following schema:\n"
+            "Return STRICT JSON only with schema:\n"
             "{\n"
             '  "findings": [\n'
             "    {\n"
@@ -38,7 +30,7 @@ except Exception:
             '      "title": "short title",\n'
             '      "path": "repo-relative file path",\n'
             '      "line": 1-or-null,\n'
-            '      "evidence": "what you saw (quote or describe briefly)",\n'
+            '      "evidence": "what you saw (brief)",\n'
             '      "recommendation": "what to change",\n'
             '      "acceptance": "how to verify (concrete command/check) - MUST be a sentence"\n'
             "    }\n"
@@ -54,10 +46,6 @@ except Exception:
         )
 
 
-from ..config import settings
-from ..models import RepoFile, RepoFinding, Task
-
-
 _SEVERITY_MAP = {
     "low": 2,
     "med": 3,
@@ -66,8 +54,6 @@ _SEVERITY_MAP = {
     "critical": 5,
 }
 
-# These categories are what you actually care about for “high signal” findings.
-# If the model emits other categories, we’ll map them into one of these.
 _ALLOWED_CATEGORIES = {
     "security",
     "auth",
@@ -80,10 +66,8 @@ _ALLOWED_CATEGORIES = {
     "docs",
 }
 
-# Model sometimes emits garbage like "false"/"true" into string fields.
 _BAD_LITERAL_STRINGS = {"false", "true", "null", "none", "n/a", "na"}
 
-# Bias file selection toward likely high-signal areas (without embeddings).
 _HIGH_SIGNAL_HINTS = [
     # auth/security
     "auth",
@@ -150,16 +134,8 @@ def _fingerprint(f: dict[str, Any]) -> str:
 
 
 def _coerce_severity(x: Any) -> int:
-    """
-    Normalize severity into int 1..5.
-    Accepts:
-      - int/float
-      - numeric strings: "4"
-      - words: low/med/high/critical
-    """
     if x is None:
         return 3
-
     if isinstance(x, (int, float)):
         v = int(x)
         return max(1, min(5, v))
@@ -167,7 +143,6 @@ def _coerce_severity(x: Any) -> int:
     s = str(x).strip().lower()
     if not s:
         return 3
-
     if s in _SEVERITY_MAP:
         return _SEVERITY_MAP[s]
 
@@ -179,12 +154,6 @@ def _coerce_severity(x: Any) -> int:
 
 
 def _normalize_acceptance(a: Any) -> str:
-    """
-    Fix the exact failure mode you saw: acceptance becomes boolean-ish junk like "false"
-    (or empty/too short). This keeps tasks DoD from turning into garbage.
-
-    We do NOT try to be clever; we just ensure the field is usable.
-    """
     s = str(a or "").strip()
     if not s or s.lower() in _BAD_LITERAL_STRINGS or len(s) < 8:
         return (
@@ -204,55 +173,34 @@ def _clean_text(v: Any, *, max_len: int) -> Optional[str]:
 
 
 def _normalize_category(cat: Any) -> str:
-    """
-    Model categories can drift ("style", "lint", "code quality", etc.).
-    We normalize into a stable set so downstream logic is deterministic.
-    """
     s = str(cat or "").strip().lower()
     if not s or s in _BAD_LITERAL_STRINGS:
         return "maintainability"
 
-    # Common aliases
     alias_map = {
         "authentication": "auth",
         "authorization": "auth",
-        "security": "security",
         "sec": "security",
-        "reliability": "reliability",
         "stability": "reliability",
-        "correctness": "correctness",
         "bug": "correctness",
-        "observability": "observability",
         "logging": "observability",
         "metrics": "observability",
-        "performance": "performance",
         "perf": "performance",
         "test": "testing",
         "tests": "testing",
-        "testing": "testing",
-        "docs": "docs",
         "documentation": "docs",
-        "maintainability": "maintainability",
         "refactor": "maintainability",
-        "style": "maintainability",  # collapse style into maintainability
+        "style": "maintainability",
         "lint": "maintainability",
         "formatting": "maintainability",
     }
     s = alias_map.get(s, s)
-
-    # If still unknown, collapse to maintainability
     if s not in _ALLOWED_CATEGORIES:
         return "maintainability"
     return s
 
 
 def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
-    """
-    Deterministic guardrails that stabilize output quality even when the model wobbles.
-
-    - If it smells like auth/secrets/keys -> raise severity floor.
-    - If it’s obviously style-only -> cap severity.
-    """
     title = (f.get("title") or "").lower()
     evidence = (f.get("evidence") or "").lower()
     rec = (f.get("recommendation") or "").lower()
@@ -260,10 +208,8 @@ def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
     cat = (f.get("category") or "").lower()
 
     joined = " ".join([title, evidence, rec, path, cat])
-
     sev = int(f.get("severity") or 3)
 
-    # Upgrade floor for security-ish signals
     security_tokens = [
         "api key",
         "x-api-key",
@@ -284,11 +230,9 @@ def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
     ]
     if any(t in joined for t in security_tokens):
         sev = max(sev, 3)
-        # If path itself is strongly auth-ish, bump further
         if any(p in path for p in ["auth", "security", "middleware", "deps.py", "oauth", "jwt"]):
             sev = max(sev, 4)
 
-    # Downgrade obvious style-only findings
     style_tokens = ["trailing whitespace", "whitespace", "formatting", "line too long", "rename variable", "typo"]
     if any(t in joined for t in style_tokens) and not any(t in joined for t in security_tokens):
         sev = min(sev, 2)
@@ -298,14 +242,6 @@ def _apply_guardrails(f: dict[str, Any]) -> dict[str, Any]:
 
 
 def _file_signal_score(rf: RepoFile) -> int:
-    """
-    Score a file by:
-      1) path hints (auth/db/middleware/tests/etc.)
-      2) early-content hints (avoid scanning full text)
-      3) size as a weak tie-breaker
-
-    This is deliberately cheap and deterministic.
-    """
     score = 0
     path = (getattr(rf, "path", "") or "").lower()
     if path:
@@ -325,17 +261,10 @@ def _file_signal_score(rf: RepoFile) -> int:
 
     size = int(getattr(rf, "size", 0) or 0)
     score += min(5, size // 20_000)
-
     return score
 
 
 def _pick_top_files(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> list[RepoFile]:
-    """
-    Prefer files that have content and are likely to contain high-signal issues.
-
-    Supports an explicit max_files override (e.g., routes passing max_files),
-    otherwise uses settings.REPO_TASK_MAX_FILES with safety clamps.
-    """
     q = (
         db.query(RepoFile)
         .filter(RepoFile.snapshot_id == snapshot_id)
@@ -345,28 +274,19 @@ def _pick_top_files(db: Session, snapshot_id: int, *, max_files: Optional[int] =
 
     scored: list[tuple[int, int, RepoFile]] = []
     for rf in files:
-        score = _file_signal_score(rf)
-        size = int(getattr(rf, "size", 0) or 0)
-        scored.append((score, size, rf))
+        scored.append((_file_signal_score(rf), int(getattr(rf, "size", 0) or 0), rf))
 
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     if max_files is None:
-        max_files = int(getattr(settings, "REPO_TASK_MAX_FILES", 20) or 20)
+        max_files = int(getattr(settings, "REPO_TASK_MAX_FILES", 18) or 18)
 
-    hard_cap = max(10, min(200, int(max_files)))
-    # still keep a sanity bound because prompt budgets exist
-    hard_cap = min(hard_cap, 60)
-    return [rf for _, _, rf in scored[:hard_cap]]
+    # Hard clamp: prompt budgets exist
+    n = max(10, min(60, int(max_files)))
+    return [rf for _, _, rf in scored[:n]]
 
 
 def _build_prompt_context(files: list[RepoFile]) -> str:
-    """
-    Build a bounded excerpt bundle.
-
-    Key design: excerpts are your “budget.” Too big -> truncation -> broken JSON.
-    So we obey REPO_TASK_MAX_TOTAL_CHARS strictly.
-    """
     chunks: list[str] = []
     total = 0
 
@@ -374,13 +294,10 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
     max_total = int(getattr(settings, "REPO_TASK_MAX_TOTAL_CHARS", 12_000) or 12_000)
 
     for rf in files:
-        text = rf.content_text or ""
-        excerpt = text[:max_excerpt]
-
+        excerpt = (rf.content_text or "")[:max_excerpt]
         block = f"\n--- FILE: {rf.path}\n{excerpt}\n"
         if total + len(block) > max_total:
             break
-
         chunks.append(block)
         total += len(block)
 
@@ -388,18 +305,6 @@ def _build_prompt_context(files: list[RepoFile]) -> str:
 
 
 def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
-    """
-    Drop un-actionable garbage:
-      - missing title
-      - missing file_path/path
-
-    Normalize:
-      - severity -> int 1..5
-      - category -> stable enum-ish bucket
-      - line_start/line -> int|None
-      - acceptance -> never boolean-ish junk
-      - evidence/recommendation lengths bounded
-    """
     if not isinstance(f, dict):
         return None
 
@@ -407,9 +312,8 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
     if not title:
         return None
 
-    path = f.get("file_path") or f.get("path")
-    path = str(path or "").strip()
-    if not path or path == "null":
+    path = str((f.get("file_path") or f.get("path") or "")).strip()
+    if not path or path.lower() == "null":
         return None
 
     sev = _coerce_severity(f.get("severity"))
@@ -423,55 +327,36 @@ def _normalize_finding(f: dict[str, Any]) -> dict[str, Any] | None:
         except Exception:
             line = None
 
-    evidence = _clean_text(f.get("evidence"), max_len=1600)
-    recommendation = _clean_text(f.get("recommendation"), max_len=1600)
-    acceptance = _normalize_acceptance(f.get("acceptance"))
-
     out = {
         "category": cat[:48],
         "severity": int(sev),
         "title": title[:240],
         "path": path,
         "line": line,
-        "evidence": evidence,
-        "recommendation": recommendation,
-        "acceptance": acceptance,
+        "evidence": _clean_text(f.get("evidence"), max_len=1600),
+        "recommendation": _clean_text(f.get("recommendation"), max_len=1600),
+        "acceptance": _normalize_acceptance(f.get("acceptance")),
     }
-
-    out = _apply_guardrails(out)
-    return out
+    return _apply_guardrails(out)
 
 
-async def scan_snapshot_to_findings(
-    db: Session,
-    snapshot_id: int,
-    *,
-    max_files: Optional[int] = None,
-) -> dict[str, int]:
-    """
-    Core worker: calls LLM and inserts RepoFinding rows.
-    Returns {inserted, total_findings}.
-
-    ✅ Supports max_files, so callers can tighten/expand prompt coverage safely.
-    """
+async def scan_snapshot_to_findings(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> dict[str, Any]:
     files = _pick_top_files(db, snapshot_id, max_files=max_files)
     context = _build_prompt_context(files)
 
-    # Prompt tightening: bias the model to high-signal categories and cap output.
     policy = (
         "PRIORITY POLICY:\n"
-        "- Prefer findings about: auth/security, secrets, DB/data integrity, retries/timeouts, validation, error handling, tests.\n"
+        "- Prefer: auth/security, secrets, DB integrity, retries/timeouts, validation, error handling, tests.\n"
         "- Avoid style/lint unless there are no other issues.\n"
         "- Keep findings <= 8.\n"
         "- Keep strings short.\n"
         "- acceptance MUST be a human sentence (not true/false).\n"
         "\n"
     )
-    user_prompt = repo_findings_user(policy + context)
 
     resp = await chat_completion_json(
         system=REPO_FINDINGS_SYSTEM,
-        user=user_prompt,
+        user=repo_findings_user(policy + context),
     )
 
     findings = resp.get("findings") or []
@@ -505,43 +390,33 @@ async def scan_snapshot_to_findings(
         if exists:
             continue
 
-        row = RepoFinding(
-            snapshot_id=snapshot_id,
-            path=f["path"],
-            line=f["line"],
-            category=f["category"],
-            severity=int(f["severity"]),
-            title=f["title"],
-            evidence=f["evidence"],
-            recommendation=f["recommendation"],
-            acceptance=f["acceptance"],
-            fingerprint=fp,
-            created_at=datetime.utcnow(),
+        db.add(
+            RepoFinding(
+                snapshot_id=snapshot_id,
+                path=f["path"],
+                line=f["line"],
+                category=f["category"],
+                severity=int(f["severity"]),
+                title=f["title"],
+                evidence=f["evidence"],
+                recommendation=f["recommendation"],
+                acceptance=f["acceptance"],
+                fingerprint=fp,
+                created_at=datetime.utcnow(),
+            )
         )
-        db.add(row)
         inserted += 1
 
     db.commit()
+    total = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
+    return {"snapshot_id": snapshot_id, "inserted": inserted, "total_findings": int(total), "mode": "repo_llm_findings"}
 
-    total_findings = db.query(RepoFinding).filter(RepoFinding.snapshot_id == snapshot_id).count()
-    return {"inserted": inserted, "total_findings": total_findings}
-
-
-# --------------------------------------------------------------------
-# Public API expected by services/repo_taskgen.py (compatibility preserved)
-# --------------------------------------------------------------------
 
 async def run_llm_scan(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> dict[str, Any]:
-    """
-    Original public entrypoint (used by older routes).
-    """
     return await scan_snapshot_to_findings(db, snapshot_id, max_files=max_files)
 
 
 async def run_llm_repo_scan(db: Session, snapshot_id: int, *, max_files: Optional[int] = None) -> dict[str, Any]:
-    """
-    Compatibility alias: some routes/services import this name.
-    """
     return await run_llm_scan(db, snapshot_id, max_files=max_files)
 
 
@@ -577,31 +452,20 @@ def list_findings(db: Session, snapshot_id: int, limit: int = 50, offset: int = 
     }
 
 
-def tasks_from_findings(
-    db: Session,
-    snapshot_id: int,
-    project: str,
-    *,
-    limit: int = 12,
-) -> dict[str, Any]:
-    """
-    Convert RepoFinding rows into real Task rows.
-    Deterministic; doesn't need an LLM.
-
-    ✅ Supports limit, because your debug route calls tasks_from_findings(..., limit=...).
-    """
+def tasks_from_findings(db: Session, snapshot_id: int, project: str, *, limit: int = 12) -> dict[str, Any]:
     try:
-        limit_n = int(limit)
+        n = int(limit)
     except Exception:
-        limit_n = 12
-    limit_n = max(1, min(200, limit_n))
+        n = 12
+    n = max(1, min(200, n))
 
-    q = (
+    findings = (
         db.query(RepoFinding)
         .filter(RepoFinding.snapshot_id == snapshot_id)
         .order_by(RepoFinding.severity.desc(), RepoFinding.id.desc())
+        .limit(n)
+        .all()
     )
-    findings = q.limit(limit_n).all()
 
     created = 0
     skipped = 0

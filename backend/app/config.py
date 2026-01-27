@@ -15,9 +15,6 @@ class Settings(BaseSettings):
     # -----------------------
     TZ: str = "America/Detroit"
     PORT: int = 8000
-
-    # Used in email links. In dev you can leave it as localhost.
-    # In production, set to your real domain (https://goal.yourdomain.com).
     PUBLIC_BASE_URL: str = "http://127.0.0.1:8000"
 
     DB_URL: str = "sqlite:///./data/app.db"
@@ -32,21 +29,20 @@ class Settings(BaseSettings):
     # -----------------------
     # Scheduler controls
     # -----------------------
-    MORNING_PLAN_HOUR: int = 8
-    MORNING_PLAN_MINUTE: int = 0
+    MORNING_PLAN_HOUR: int = Field(default=8, validation_alias="DAILY_PLAN_HOUR")
+    MORNING_PLAN_MINUTE: int = Field(default=0, validation_alias="DAILY_PLAN_MINUTE")
 
     MIDDAY_NUDGE_HOUR: int = 13
     MIDDAY_NUDGE_MINUTE: int = 0
-
-    # Repo pipeline schedule
-    REPO_SYNC_HOUR: int = 6
-    REPO_SYNC_MINUTE: int = 0
-    REPO_SYNC_PROJECT: str = "haven"
 
     # What the scheduler sends
     DAILY_PLAN_MODE: str = "single"  # single | split
     DAILY_PLAN_PROJECT: str = "onestream"  # haven | onestream | (ignored in split)
 
+    # Repo pipeline schedule
+    REPO_SYNC_HOUR: int = 6
+    REPO_SYNC_MINUTE: int = 0
+    REPO_SYNC_PROJECT: str = "haven"
     # -----------------------
     # LLM
     # -----------------------
@@ -125,7 +121,9 @@ class Settings(BaseSettings):
     # -----------------------
     # --- PR workflow (Level 3) ---
     # -----------------------
+    ENABLE_PATCH_WORKFLOW: bool = False
     ENABLE_PR_WORKFLOW: bool = True
+    PR_WORKFLOW_DRY_RUN: bool = True
 
     # Paths allowed to be modified by PR workflow (relative to repo root)
     PR_ALLOWLIST_DIRS: List[str] = Field(default_factory=lambda: ["backend/", "onehaven/backend/"])
@@ -138,6 +136,16 @@ class Settings(BaseSettings):
     PR_TEST_CMD: str = "pytest -q"
     PR_TIMEOUT_SECONDS: int = 900
 
+    ENABLE_PATCH_WORKFLOW: bool = False
+
+    # Optional: keep temp dirs for debugging
+    KEEP_PATCH_SANDBOX: bool = False
+    KEEP_PR_SANDBOX: bool = False
+
+    # Optional: fallback if snapshot.repo is not "owner/name"
+    GITHUB_OWNER: str = ""
+    GITHUB_REPO: str = ""
+    GITHUB_TOKEN: str = ""
     # -----------------------
     # GitHub sync exclusions
     # -----------------------
