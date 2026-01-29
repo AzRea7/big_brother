@@ -1,178 +1,130 @@
 # backend/app/services/pr_workflow.py
 from __future__ import annotations
 
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import RepoPatchRun
-from .repo_materialize import materialize_snapshot_to_dir  # existing service in your repo
 
-
-_DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
+# New canonical implementation lives here:
+from .patch_workflow import (
+    apply_unified_diff_in_sandbox,
+    patch_workflow_enabled,
+    pr_workflow_enabled,
+    pr_workflow_dry_run,
+    validate_unified_diff as _validate_unified_diff_dict,
+)
 
 
 def _require_enabled() -> None:
-    if not settings.ENABLE_PR_WORKFLOW:
-        raise RuntimeError("PR workflow is disabled (ENABLE_PR_WORKFLOW=false)")
+    # Keep legacy behavior: this file historically gated "PR workflow" as a whole.
+    # In the new design, patch apply and PR open are separately gated.
+    if not patch_workflow_enabled():
+        raise RuntimeError("Patch workflow is disabled (ENABLE_PATCH_WORKFLOW=false)")
+    # Note: we do NOT require PR workflow enabled unless opening PRs.
 
 
-def _count_lines_changed(patch_text: str) -> int:
-    changed = 0
-    for line in patch_text.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            changed += 1
-        if line.startswith("-") and not line.startswith("---"):
-            changed += 1
-    return changed
-
-
-def validate_unified_diff(patch_text: str) -> Tuple[bool, Optional[str], int, int, List[str]]:
+def validate_unified_diff(db: Session, snapshot_id: int, patch_text: str) -> Dict[str, object]:
     """
-    Validates:
-    - looks like unified diff
-    - only modifies files in allowlisted dirs
-    - caps number of files/lines
-    Returns: (ok, error, files_changed, lines_changed, file_paths)
+    Canonical validator shape used by API:
+      { valid, error, files_changed, lines_changed, file_paths }
+    Delegates to patch_workflow.validate_unified_diff.
     """
     _require_enabled()
+    return _validate_unified_diff_dict(db=db, snapshot_id=int(snapshot_id), patch_text=str(patch_text))
 
-    if not patch_text.strip():
+
+def validate_unified_diff_tuple(patch_text: str) -> Tuple[bool, Optional[str], int, int, List[str]]:
+    """
+    Legacy tuple validator for any old callers:
+      (ok, error, files_changed, lines_changed, file_paths)
+
+    Note: This variant cannot check snapshot existence or DB-backed allowlists,
+    so it is best-effort only.
+    """
+    s = (patch_text or "").strip()
+    if not s:
         return False, "Empty patch", 0, 0, []
-
-    if "diff --git " not in patch_text:
+    if "diff --git " not in s:
         return False, "Patch must be a unified diff (missing 'diff --git')", 0, 0, []
 
+    # minimal parse (fallback)
     file_paths: List[str] = []
-    for line in patch_text.splitlines():
-        m = _DIFF_FILE_RE.match(line)
-        if m:
-            file_paths.append(m.group(1))
+    for line in s.splitlines():
+        if line.startswith("+++ b/"):
+            file_paths.append(line[len("+++ b/") :].strip())
 
-    file_paths = list(dict.fromkeys(file_paths))  # dedupe preserve order
+    # dedupe preserve order
+    seen = set()
+    file_paths = [p for p in file_paths if not (p in seen or seen.add(p))]
+
     if not file_paths:
         return False, "Could not parse any '+++ b/<path>' file entries", 0, 0, []
 
-    # Allowlist
-    allow = settings.PR_ALLOWLIST_DIRS
-    for p in file_paths:
-        if not any(p.startswith(a) for a in allow):
-            return False, f"File not in allowlist: {p}", 0, 0, file_paths
-
     files_changed = len(file_paths)
-    if files_changed > settings.PR_MAX_FILES_CHANGED:
-        return False, f"Too many files changed: {files_changed} > {settings.PR_MAX_FILES_CHANGED}", files_changed, 0, file_paths
 
-    lines_changed = _count_lines_changed(patch_text)
-    if lines_changed > settings.PR_MAX_LINES_CHANGED:
-        return False, f"Too many lines changed: {lines_changed} > {settings.PR_MAX_LINES_CHANGED}", files_changed, lines_changed, file_paths
+    # rough line count
+    lines_changed = 0
+    for line in s.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            lines_changed += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            lines_changed += 1
 
     return True, None, files_changed, lines_changed, file_paths
 
 
-def _run_cmd(cmd: str, cwd: str, timeout_s: int) -> Tuple[bool, str]:
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        return proc.returncode == 0, out.strip()
-    except Exception as e:
-        return False, f"Command failed: {e!r}"
+def _serialize_patch_run(run: RepoPatchRun) -> Dict[str, Any]:
+    return {
+        "run_id": getattr(run, "id", None),
+        "snapshot_id": getattr(run, "snapshot_id", None),
+        "valid": bool(getattr(run, "valid", False)),
+        "validation_error": getattr(run, "validation_error", None),
+        "files_changed": int(getattr(run, "files_changed", 0) or 0),
+        "lines_changed": int(getattr(run, "lines_changed", 0) or 0),
+        "file_paths_json": getattr(run, "file_paths_json", None),
+        "applied": bool(getattr(run, "applied", False)),
+        "apply_error": getattr(run, "apply_error", None),
+        "tests_ran": bool(getattr(run, "tests_ran", False)),
+        "tests_ok": bool(getattr(run, "tests_ok", False)),
+        "test_output": getattr(run, "test_output", None),
+        "sandbox_path": getattr(run, "sandbox_path", None),
+        "created_at": getattr(run, "created_at", None).isoformat() if getattr(run, "created_at", None) else None,
+    }
 
 
-async def apply_patch_and_test(db: Session, snapshot_id: int, patch_text: str, run_tests: bool = True) -> Dict:
+async def apply_patch_and_test(db: Session, snapshot_id: int, patch_text: str, run_tests: bool = True) -> Dict[str, Any]:
+    """
+    Legacy entrypoint kept for compatibility.
+
+    New canonical flow:
+      apply_unified_diff_in_sandbox() persists RepoPatchRun and returns it.
+    """
     _require_enabled()
 
-    ok, err, files_changed, lines_changed, _paths = validate_unified_diff(patch_text)
+    run = await apply_unified_diff_in_sandbox(
+        db=db,
+        snapshot_id=int(snapshot_id),
+        patch_text=str(patch_text),
+        run_tests=bool(run_tests),
+    )
 
-    run = RepoPatchRun(snapshot_id=snapshot_id, patch_text=patch_text, valid=ok, validation_error=err)
-    db.add(run)
-    db.commit()  # run.id exists
-
-    if not ok:
-        return {
-            "run_id": run.id,
-            "valid": False,
-            "validation_error": err,
-            "applied": False,
-            "apply_error": None,
-            "tests_ran": False,
-            "tests_ok": False,
-            "test_output": None,
-        }
-
-    sandbox = tempfile.mkdtemp(prefix=f"repo_patch_{snapshot_id}_")
-    run.sandbox_path = sandbox
-    db.commit()
-
-    try:
-        # Materialize repo snapshot into sandbox
-        await materialize_snapshot_to_dir(db, snapshot_id=snapshot_id, out_dir=sandbox)
-
-        # Apply patch
-        patch_path = os.path.join(sandbox, "_patch.diff")
-        with open(patch_path, "w", encoding="utf-8") as f:
-            f.write(patch_text)
-
-        applied_ok, apply_out = _run_cmd(f"git apply --whitespace=nowarn {patch_path}", cwd=sandbox, timeout_s=60)
-        run.applied = applied_ok
-        run.apply_error = None if applied_ok else apply_out
-        db.commit()
-
-        if not applied_ok:
-            return {
-                "run_id": run.id,
-                "valid": True,
-                "validation_error": None,
-                "applied": False,
-                "apply_error": apply_out,
-                "tests_ran": False,
-                "tests_ok": False,
-                "test_output": None,
-            }
-
-        # Run tests (optional)
-        if run_tests:
-            tests_ok, out = _run_cmd(settings.PR_TEST_CMD, cwd=sandbox, timeout_s=settings.PR_TIMEOUT_SECONDS)
-            run.tests_ran = True
-            run.tests_ok = tests_ok
-            run.test_output = out
-            db.commit()
-
-            return {
-                "run_id": run.id,
-                "valid": True,
-                "validation_error": None,
-                "applied": True,
-                "apply_error": None,
-                "tests_ran": True,
-                "tests_ok": tests_ok,
-                "test_output": out,
-            }
-
-        return {
-            "run_id": run.id,
-            "valid": True,
-            "validation_error": None,
-            "applied": True,
-            "apply_error": None,
-            "tests_ran": False,
-            "tests_ok": False,
-            "test_output": None,
-        }
-
-    finally:
-        # Keep sandbox by default for debugging; you can later add cleanup logic.
-        pass
+    return {
+        "run_id": getattr(run, "id", None),
+        "valid": bool(getattr(run, "valid", False)),
+        "validation_error": getattr(run, "validation_error", None),
+        "applied": bool(getattr(run, "applied", False)),
+        "apply_error": getattr(run, "apply_error", None),
+        "tests_ran": bool(getattr(run, "tests_ran", False)),
+        "tests_ok": bool(getattr(run, "tests_ok", False)),
+        "test_output": getattr(run, "test_output", None),
+        "run": _serialize_patch_run(run),
+        "workflow_flags": {
+            "patch_workflow_enabled": patch_workflow_enabled(),
+            "pr_workflow_enabled": pr_workflow_enabled(),
+            "pr_workflow_dry_run": pr_workflow_dry_run(),
+            "pr_test_cmd": getattr(settings, "PR_TEST_CMD", None),
+        },
+    }

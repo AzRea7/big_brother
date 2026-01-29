@@ -32,7 +32,7 @@ from ..services.repo_findings import (
     tasks_from_findings,
 )
 
-# NEW: Level 3 diff generation + workflow
+# Level 3
 from ..services.patch_generator import generate_unified_diff, PatchGenerationError
 from ..services.patch_workflow import (
     patch_workflow_enabled,
@@ -47,14 +47,8 @@ router = APIRouter(prefix="/debug", tags=["debug"])
 
 
 def _guard_debug(request: Request) -> None:
-    """
-    Enforce production safety:
-    - Optionally disable debug endpoints entirely in prod
-    - Require X-API-Key for access
-    """
     if not debug_is_allowed():
         raise HTTPException(status_code=404, detail="Not found")
-
     require_api_key(request.headers.get("X-API-Key"))
 
 
@@ -182,9 +176,6 @@ def repo_signals_summary(
     snapshot_id: int = Query(..., ge=1),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """
-    SINGLE merged "Signals Summary" endpoint.
-    """
     _guard_debug(request)
 
     files = db.query(RepoFile).filter(RepoFile.snapshot_id == snapshot_id).all()
@@ -261,10 +252,6 @@ async def repo_chunks_embed(
 
 
 def _serialize_chunk_hit(h: Any) -> dict[str, Any]:
-    """
-    Serialize ChunkHit dataclass (or dict-ish) into a stable JSON object.
-    Works whether repo_chunks.search_chunks returns dataclass instances or dicts.
-    """
     if isinstance(h, dict):
         return {
             "id": h.get("id"),
@@ -441,7 +428,6 @@ class PRGenerateBody(BaseModel):
 
 class PRWorkflowBody(BaseModel):
     snapshot_id: int
-    # You can either provide patch_text, OR ask it to generate from finding/objective.
     patch_text: Optional[str] = None
     finding_id: Optional[int] = None
     objective: Optional[str] = None
@@ -475,11 +461,6 @@ async def repo_pr_generate(
     body: PRGenerateBody,
     db: Session = Depends(get_db),
 ):
-    """
-    Commit 1 capability:
-    - Generate patch only (no apply, no PR).
-    - Validate patch with the same validator used by apply workflow.
-    """
     _guard_debug(request)
 
     if not settings.LLM_ENABLED:
@@ -497,7 +478,6 @@ async def repo_pr_generate(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Patch generation failed: {e!r}")
 
-    # Validate (uses allowlist + caps)
     v = validate_unified_diff(db, int(body.snapshot_id), str(gen["patch_text"]))
 
     return {
@@ -516,13 +496,6 @@ async def repo_pr_dry_run(
     body: PRWorkflowBody,
     db: Session = Depends(get_db),
 ):
-    """
-    Commit 2 capability:
-    - If patch_text missing: generate it.
-    - Apply in sandbox (requires ENABLE_PATCH_WORKFLOW=true)
-    - Run tests (run_tests=true by default)
-    - Does NOT open PR.
-    """
     _guard_debug(request)
 
     if not patch_workflow_enabled():
@@ -553,6 +526,11 @@ async def repo_pr_dry_run(
     return {
         "snapshot_id": body.snapshot_id,
         "mode": "dry_run",
+        "workflow_flags": {
+            "patch_workflow_enabled": patch_workflow_enabled(),
+            "pr_workflow_enabled": pr_workflow_enabled(),
+            "pr_workflow_dry_run": pr_workflow_dry_run(),
+        },
         "patch_text": patch_text,
         "run": _serialize_patch_run(run),
     }
@@ -564,12 +542,6 @@ async def repo_pr_run(
     body: PRWorkflowBody,
     db: Session = Depends(get_db),
 ):
-    """
-    Full Level 3:
-    - generate patch (if needed)
-    - validate/apply/tests
-    - open PR (requires ENABLE_PR_WORKFLOW=true and PR_WORKFLOW_DRY_RUN=false)
-    """
     _guard_debug(request)
 
     if not patch_workflow_enabled():
@@ -606,19 +578,15 @@ async def repo_pr_run(
         run_tests=bool(body.run_tests),
     )
 
+    # Hard gates (professional standard):
     if not getattr(run, "valid", False):
         return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
-
     if not getattr(run, "applied", False):
         return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
-
     if bool(body.run_tests) and not getattr(run, "tests_ok", False):
         return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
 
-    title = (body.pr_title or "").strip()
-    if not title:
-        # reasonable default
-        title = "Automated fix from Goal Autopilot"
+    title = (body.pr_title or "").strip() or "Automated fix from Goal Autopilot"
 
     pr = await open_pull_request_from_patch_run(
         db=db,
@@ -628,16 +596,11 @@ async def repo_pr_run(
         body=(body.pr_body or None),
     )
 
+    # NOTE: open_pull_request_from_patch_run returns a dict in your implementation.
     return {
         "snapshot_id": body.snapshot_id,
         "mode": "run",
         "patch_text": patch_text,
         "run": _serialize_patch_run(run),
-        "pr": {
-            "id": getattr(pr, "id", None),
-            "pr_number": getattr(pr, "pr_number", None),
-            "pr_url": getattr(pr, "pr_url", None),
-            "branch": getattr(pr, "branch", None),
-            "title": getattr(pr, "title", None),
-        },
+        "pr": pr,
     }

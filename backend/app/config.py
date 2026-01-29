@@ -152,9 +152,35 @@ class Settings(BaseSettings):
     PATCH_MAX_CHARS: int = Field(default=200_000, validation_alias="PATCH_MAX_CHARS")
 
     # Accept either comma-separated string or list in env; easiest is comma-separated.
-    PATCH_ALLOWLIST: List[str] = Field(default_factory=list, validation_alias="PATCH_ALLOWLIST")
-    PATCH_DENYLIST: List[str] = Field(default_factory=list, validation_alias="PATCH_DENYLIST")
+    PATCH_ALLOWLIST_DIRS: List[str] = ["backend/", "onehaven/backend/"]
+    PATCH_DENYLIST_PATTERNS: List[str] = [
+        r"(^|/)secrets\.py$",
+        r"(^|/)secret(s)?/.*",
+        r"\.env",
+        r"(^|/)\.github/workflows/.*",
+        r"(^|/)Dockerfile$",
+        r"(^|/)docker-compose(\.ya?ml)?$",
+        r"(^|/)terraform/.*",
+        r"(^|/)k8s/.*",
+    ]
+    PATCH_MAX_FILES_CHANGED: int = 3
+    PATCH_LLM_TEMPERATURE: float = 0.1
+    PATCH_LLM_MAX_TOKENS: int = 2600
+    PATCH_FORBID_NEW_FILES: bool = True
+    PATCH_REQUIRE_FINDING_PATH_ONLY: bool = True
 
+    # PR/Patch apply workflow validator safety (independent of generator)
+    PR_DENYLIST_PATTERNS: List[str] = [
+        r"(^|/)secrets\.py$",
+        r"(^|/)secret(s)?/.*",
+        r"\.env",
+        r"(^|/)\.github/workflows/.*",
+    ]
+    PR_FORBID_NEW_FILES: bool = True
+
+    # Optional: test command for sandbox
+    PR_TEST_COMMAND: str = "pytest -q"
+    PR_TEST_TIMEOUT_S: int = 600
     PATCH_RAG_TOP_K: int = Field(default=6, validation_alias="PATCH_RAG_TOP_K")
     PATCH_LLM_MAX_TOKENS: int = Field(default=2600, validation_alias="PATCH_LLM_MAX_TOKENS")
     PATCH_LLM_TEMPERATURE: float = Field(default=0.1, validation_alias="PATCH_LLM_TEMPERATURE")

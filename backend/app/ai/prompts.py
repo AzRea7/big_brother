@@ -30,6 +30,18 @@ Output format MUST be EXACTLY:
 - one sentence
 """
 
+SYSTEM_PROMPT_PATCH_GENERATOR = """
+You are an expert software engineer producing code changes as a unified diff.
+
+Rules you MUST follow:
+- Output ONLY a unified diff patch. No prose. No markdown. No commentary.
+- Keep changes minimal, targeted, and consistent with the codebase style.
+- Do not change unrelated formatting.
+- Do not add dependencies unless explicitly necessary.
+- Respect allowlist/denylist constraints from the user prompt.
+- If you cannot comply, output an EMPTY string.
+""".strip()
+
 USER_PROMPT_TEMPLATE = """You are Goal Autopilot, a helpful planning assistant.
 
 You will be given:

@@ -18,6 +18,7 @@ from ..config import settings
 from ..models import RepoPatchRun, RepoPullRequest, RepoSnapshot
 from .repo_materialize import materialize_snapshot_to_disk
 
+# Matches: diff --git a/path b/path
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$", re.MULTILINE)
 
 
@@ -42,7 +43,6 @@ def _github_token() -> str:
 
 
 def _pr_allowlist_dirs() -> list[str]:
-    # Settings uses PR_ALLOWLIST_DIRS in your config snippet. :contentReference[oaicite:4]{index=4}
     dirs = getattr(settings, "PR_ALLOWLIST_DIRS", None)
     if isinstance(dirs, list) and dirs:
         return [str(d).strip() for d in dirs if str(d).strip()]
@@ -85,7 +85,7 @@ def _count_changed_lines(patch_text: str) -> int:
 
 def validate_unified_diff(db: Session, snapshot_id: int, patch_text: str) -> dict[str, object]:
     """
-    Validates unified diff content and returns a dict compatible with your API schemas:
+    Validates unified diff content and returns:
       { valid, error, files_changed, lines_changed, file_paths }
     """
     s = (patch_text or "").strip()
@@ -154,7 +154,7 @@ def validate_unified_diff(db: Session, snapshot_id: int, patch_text: str) -> dic
             "file_paths": file_paths,
         }
 
-    # Snapshot existence check (helps return a clean error instead of exploding later)
+    # Snapshot existence check (prevents FK explosions later)
     snap = db.query(RepoSnapshot).filter(RepoSnapshot.id == snapshot_id).first()
     if not snap:
         return {"valid": False, "error": f"Unknown snapshot_id={snapshot_id}", "files_changed": 0, "lines_changed": 0, "file_paths": []}
@@ -174,12 +174,13 @@ class _CmdResult:
     out: str
 
 
-def _run(cmd: str, *, cwd: str, timeout_s: int) -> _CmdResult:
+def _run(cmd: str, *, cwd: str, timeout_s: int, input_text: Optional[str] = None) -> _CmdResult:
     try:
         p = subprocess.run(
             cmd,
             cwd=cwd,
             shell=True,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout_s,
@@ -209,20 +210,23 @@ async def apply_unified_diff_in_sandbox(
     valid = bool(v.get("valid"))
     validation_error = v.get("error")
 
+    # IMPORTANT: only insert a RepoPatchRun after we know snapshot exists (validator checks)
     run = RepoPatchRun(
         snapshot_id=snapshot_id,
+        created_at=datetime.utcnow(),
         patch_text=patch_text,
-        valid=bool(valid),
-        validation_error=str(validation_error) if validation_error else None,
         files_changed=int(v.get("files_changed") or 0),
         lines_changed=int(v.get("lines_changed") or 0),
         file_paths_json=json.dumps(v.get("file_paths") or []),
+        valid=bool(valid),
+        validation_error=str(validation_error) if validation_error else None,
         applied=False,
         apply_error=None,
         tests_ran=False,
         tests_ok=False,
         test_output=None,
-        created_at=datetime.utcnow(),
+        sandbox_path=None,
+        diff_output=None,
     )
     db.add(run)
     db.commit()
@@ -235,38 +239,20 @@ async def apply_unified_diff_in_sandbox(
     keep = bool(getattr(settings, "KEEP_PATCH_SANDBOX", False))
 
     try:
-        # Materialize snapshot into tmpdir
         repo_root = materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id, dest_dir=tmpdir)
 
-        # Apply patch via git apply (fast + strict)
-        # Initialize git so git apply works consistently
+        # Initialize git so `git apply` behaves consistently
         _run("git init", cwd=repo_root, timeout_s=30)
         _run("git add -A", cwd=repo_root, timeout_s=30)
-        _run("git commit -m \"snapshot baseline\" --no-gpg-sign", cwd=repo_root, timeout_s=60)
+        _run('git commit -m "snapshot baseline" --no-gpg-sign', cwd=repo_root, timeout_s=60)
 
-        apply_res = _run("git apply --whitespace=nowarn -", cwd=repo_root, timeout_s=60)
+        # Apply patch (via stdin)
+        apply_res = _run("git apply --whitespace=nowarn -", cwd=repo_root, timeout_s=60, input_text=patch_text)
         if not apply_res.ok:
-            # try feeding patch through stdin correctly
-            try:
-                p = subprocess.run(
-                    "git apply --whitespace=nowarn -",
-                    cwd=repo_root,
-                    shell=True,
-                    input=patch_text,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=60,
-                    check=False,
-                    text=True,
-                )
-                out = (p.stdout or "").strip()
-                if p.returncode != 0:
-                    raise RuntimeError(out or "git apply failed")
-            except Exception as e:
-                run.applied = False
-                run.apply_error = str(e)
-                db.commit()
-                return run
+            run.applied = False
+            run.apply_error = (apply_res.out or "git apply failed")[:20000]
+            db.commit()
+            return run
 
         run.applied = True
         run.apply_error = None
@@ -280,17 +266,17 @@ async def apply_unified_diff_in_sandbox(
 
             run.tests_ran = True
             run.tests_ok = bool(t.ok)
-            run.test_output = t.out[:20000] if t.out else None
+            run.test_output = (t.out or "")[:20000] if t.out else None
             db.commit()
 
         return run
+
     finally:
         if not keep:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _parse_owner_repo(snapshot: RepoSnapshot) -> tuple[str, str]:
-    # Snapshot often stores repo like "AzRea7/OneHaven"
     repo = str(getattr(snapshot, "repo", "") or "").strip()
     if "/" in repo:
         owner, name = repo.split("/", 1)
@@ -308,6 +294,7 @@ def _clone_for_pr(owner: str, repo: str, base_branch: str) -> str:
     tok = _github_token()
     url = f"https://x-access-token:{tok}@github.com/{owner}/{repo}.git"
     tmpdir = tempfile.mkdtemp(prefix=f"prclone_{owner}_{repo}_")
+
     r = _run(f"git clone --depth 1 --branch {base_branch} {url} .", cwd=tmpdir, timeout_s=300)
     if not r.ok:
         raise RuntimeError(f"git clone failed: {r.out}")
@@ -329,84 +316,69 @@ async def open_pull_request_from_patch_run(
 ) -> dict[str, object]:
     """
     Opens a PR from an existing successful RepoPatchRun.
-    - Re-clones the repo from GitHub
-    - Applies the patch
-    - Runs tests (again, in the real repo checkout)
-    - Commits + pushes a branch
-    - Opens a PR via GitHub API
 
-    Returns: { ok, pr_url, pr_number, error }
+    Returns: { ok, pr_url, pr_number, error, branch }
     """
     if not pr_workflow_enabled():
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow disabled (ENABLE_PR_WORKFLOW=false)."}
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow disabled (ENABLE_PR_WORKFLOW=false).", "branch": None}
 
     if pr_workflow_dry_run():
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow dry-run enabled (PR_WORKFLOW_DRY_RUN=true). Set false to open PRs."}
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "PR workflow dry-run enabled (PR_WORKFLOW_DRY_RUN=true). Set false to open PRs.", "branch": None}
 
     snap = db.query(RepoSnapshot).filter(RepoSnapshot.id == snapshot_id).first()
     if not snap:
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": f"Unknown snapshot_id={snapshot_id}"}
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": f"Unknown snapshot_id={snapshot_id}", "branch": None}
 
     run = db.query(RepoPatchRun).filter(RepoPatchRun.id == patch_run_id).first()
-    if not run or int(run.snapshot_id) != int(snapshot_id):
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run not found for this snapshot."}
+    if not run or int(getattr(run, "snapshot_id", 0) or 0) != int(snapshot_id):
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run not found for this snapshot.", "branch": None}
 
     if not run.valid or not run.applied or (run.tests_ran and not run.tests_ok):
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run is not in a green state (valid+applied+tests_ok required)."}
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": "Patch run is not green (valid+applied+tests_ok required).", "branch": None}
 
     owner, repo = _parse_owner_repo(snap)
     base = base_branch or str(getattr(snap, "branch", "") or "main")
-    branch = _create_branch_name(run.id)
+    branch = _create_branch_name(int(run.id))
 
     keep = bool(getattr(settings, "KEEP_PR_SANDBOX", False))
-    clone_dir = None
+    clone_dir: Optional[str] = None
 
     try:
         clone_dir = _clone_for_pr(owner, repo, base)
 
-        # Create branch
         r = _run(f"git checkout -b {branch}", cwd=clone_dir, timeout_s=60)
         if not r.ok:
             raise RuntimeError(f"git checkout -b failed: {r.out}")
 
-        # Apply patch
-        p = subprocess.run(
-            "git apply --whitespace=nowarn -",
-            cwd=clone_dir,
-            shell=True,
-            input=run.patch_text,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-            check=False,
-            text=True,
-        )
-        out = (p.stdout or "").strip()
-        if p.returncode != 0:
-            raise RuntimeError(out or "git apply failed in PR clone")
+        # apply patch
+        a = _run("git apply --whitespace=nowarn -", cwd=clone_dir, timeout_s=60, input_text=str(run.patch_text))
+        if not a.ok:
+            raise RuntimeError(a.out or "git apply failed in PR clone")
 
-        # Run tests again in the real checkout
+        # run tests again in the real checkout
         test_cmd = str(getattr(settings, "PR_TEST_CMD", "pytest -q") or "pytest -q")
         timeout_s = int(getattr(settings, "PR_TIMEOUT_SECONDS", 900) or 900)
         t = _run(test_cmd, cwd=clone_dir, timeout_s=timeout_s)
         if not t.ok:
             raise RuntimeError(f"Tests failed in PR clone:\n{t.out}")
 
-        # Commit
+        # commit + push
         _run("git add -A", cwd=clone_dir, timeout_s=30)
+
+        # json.dumps handles quoting safely for shell
         c = _run(f"git commit -m {json.dumps(title)} --no-gpg-sign", cwd=clone_dir, timeout_s=60)
         if not c.ok:
             raise RuntimeError(f"git commit failed: {c.out}")
 
         sha = _run("git rev-parse HEAD", cwd=clone_dir, timeout_s=30).out.strip()[:64]
-        run.commit_sha = sha
+        if sha:
+            setattr(run, "commit_sha", sha)
 
-        # Push
         push = _run(f"git push -u origin {branch}", cwd=clone_dir, timeout_s=180)
         if not push.ok:
             raise RuntimeError(f"git push failed: {push.out}")
 
-        # Open PR via API
+        # open PR via GitHub API
         tok = _github_token()
         api = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
@@ -421,28 +393,41 @@ async def open_pull_request_from_patch_run(
         pr_url = str(data.get("html_url") or "")
         pr_number = int(data.get("number") or 0) or None
 
-        run.pr_url = pr_url or None
-        run.pr_number = pr_number
-        run.pr_branch = branch
+        # persist on run (if your model has these columns)
+        if hasattr(run, "pr_url"):
+            run.pr_url = pr_url or None
+        if hasattr(run, "pr_number"):
+            run.pr_number = pr_number
+        if hasattr(run, "pr_branch"):
+            run.pr_branch = branch
         db.commit()
 
-        db.add(
-            RepoPullRequest(
-                snapshot_id=snapshot_id,
-                patch_run_id=run.id,
-                pr_url=pr_url,
-                pr_number=pr_number,
-                created_at=datetime.utcnow(),
+        # persist a PR row (if your model/table exists)
+        try:
+            db.add(
+                RepoPullRequest(
+                    snapshot_id=snapshot_id,
+                    patch_run_id=int(run.id),
+                    pr_url=pr_url,
+                    pr_number=pr_number,
+                    created_at=datetime.utcnow(),
+                )
             )
-        )
-        db.commit()
+            db.commit()
+        except Exception:
+            db.rollback()
 
-        return {"ok": True, "pr_url": pr_url, "pr_number": pr_number, "error": None}
+        return {"ok": True, "pr_url": pr_url, "pr_number": pr_number, "error": None, "branch": branch}
 
     except Exception as e:
-        run.pr_error = str(e)[:2000] if run else None
-        db.commit()
-        return {"ok": False, "pr_url": None, "pr_number": None, "error": str(e)}
+        # best-effort error persistence (don’t crash imports/routes)
+        try:
+            if hasattr(run, "pr_error"):
+                run.pr_error = str(e)[:2000]
+            db.commit()
+        except Exception:
+            db.rollback()
+        return {"ok": False, "pr_url": None, "pr_number": None, "error": str(e), "branch": branch}
 
     finally:
         if clone_dir and not keep:
