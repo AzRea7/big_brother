@@ -250,7 +250,6 @@ def ensure_schema(engine: Engine) -> None:
 
     # Optional: FTS5 for chunk retrieval
     if _sqlite_has_fts5(engine):
-        # NOTE: include symbols_json for better retrieval context. This stays compatible with older data.
         _ensure(
             engine,
             """
@@ -291,9 +290,6 @@ def ensure_schema(engine: Engine) -> None:
 
     # -----------------------
     # Level 2.5: repo_chunk_embeddings (cosine rerank)
-    #
-    # Kept embedding_norm because you already had it in your schema.
-    # If your SQLAlchemy model doesn't include it yet, it's harmless as a nullable column.
     # -----------------------
     if "repo_chunk_embeddings" not in tables:
         _ensure(
@@ -313,7 +309,6 @@ def ensure_schema(engine: Engine) -> None:
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_chunk ON repo_chunk_embeddings(chunk_id)")
         _ensure(engine, "CREATE INDEX IF NOT EXISTS idx_repo_chunk_embeddings_model ON repo_chunk_embeddings(model)")
     else:
-        # best-effort add columns if table already exists
         for col, ddl in [
             ("chunk_id", "INTEGER"),
             ("model", "VARCHAR(120)"),
@@ -329,9 +324,6 @@ def ensure_schema(engine: Engine) -> None:
 
     # -----------------------
     # Level 3: Patch runs + Pull requests
-    #
-    # These must exist for the gated PR workflow to be "working" end-to-end:
-    # validate diff -> apply in sandbox -> run tests -> only then open PR.
     # -----------------------
 
     # ---- repo_patch_runs ----
@@ -345,6 +337,12 @@ def ensure_schema(engine: Engine) -> None:
               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
               patch_text TEXT NOT NULL,
+
+              -- NEW: traceability + PR metadata
+              finding_id INTEGER,
+              objective TEXT,
+              suggested_pr_title VARCHAR(300),
+              suggested_pr_body TEXT,
 
               files_changed INTEGER,
               lines_changed INTEGER,
@@ -371,16 +369,27 @@ def ensure_schema(engine: Engine) -> None:
             ("snapshot_id", "INTEGER"),
             ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
             ("patch_text", "TEXT"),
+
+            # NEW columns
+            ("finding_id", "INTEGER"),
+            ("objective", "TEXT"),
+            ("suggested_pr_title", "VARCHAR(300)"),
+            ("suggested_pr_body", "TEXT"),
+
             ("files_changed", "INTEGER"),
             ("lines_changed", "INTEGER"),
             ("file_paths_json", "TEXT"),
+
             ("valid", "BOOLEAN DEFAULT 0"),
             ("validation_error", "TEXT"),
+
             ("applied", "BOOLEAN DEFAULT 0"),
             ("apply_error", "TEXT"),
+
             ("tests_ran", "BOOLEAN DEFAULT 0"),
             ("tests_ok", "BOOLEAN DEFAULT 0"),
             ("test_output", "TEXT"),
+
             ("sandbox_path", "VARCHAR(800)"),
             ("diff_output", "TEXT"),
         ]:

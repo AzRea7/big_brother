@@ -166,7 +166,7 @@ class RepoFinding(Base):
     category: Mapped[str] = mapped_column(String(48), nullable=False)
     severity: Mapped[int] = mapped_column(Integer, default=3, nullable=False)  # 1..5
 
-    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    title: Mapped[str] = mapped_column(String(220), nullable=False)
     evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     acceptance: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -245,11 +245,18 @@ class RepoPatchRun(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     snapshot_id: Mapped[int] = mapped_column(ForeignKey("repo_snapshots.id"), nullable=False)
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Inputs
     patch_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # NEW: attach the “why” + generator anchor for auditing and PR writing
+    finding_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    objective: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # NEW: PR metadata (so PRs don’t suck)
+    suggested_pr_title: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    suggested_pr_body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Gate C metadata (needed for auditing + safety)
     files_changed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -293,3 +300,4 @@ class RepoPullRequest(Base):
 
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    

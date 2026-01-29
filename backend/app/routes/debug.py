@@ -1,4 +1,5 @@
 # backend/app/routes/debug.py
+# FULL FILE with the PR metadata wired through /repo/pr/generate and /repo/pr/dry_run and /repo/pr/run
 from __future__ import annotations
 
 from collections import defaultdict
@@ -33,14 +34,14 @@ from ..services.repo_findings import (
 )
 
 # Level 3
-from ..services.patch_generator import generate_unified_diff, PatchGenerationError
+from ..services.patch_generator import PatchGenerationError, generate_unified_diff
 from ..services.patch_workflow import (
-    patch_workflow_enabled,
-    pr_workflow_enabled,
-    pr_workflow_dry_run,
-    validate_unified_diff,
     apply_unified_diff_in_sandbox,
     open_pull_request_from_patch_run,
+    patch_workflow_enabled,
+    pr_workflow_dry_run,
+    pr_workflow_enabled,
+    validate_unified_diff,
 )
 
 router = APIRouter(prefix="/debug", tags=["debug"])
@@ -426,7 +427,29 @@ class PRGenerateBody(BaseModel):
     objective: Optional[str] = None
 
 
+class PRApplyBody(BaseModel):
+    snapshot_id: int
+    patch_text: str
+    run_tests: bool = True
+    finding_id: Optional[int] = None
+    objective: Optional[str] = None
+    suggested_pr_title: Optional[str] = None
+    suggested_pr_body: Optional[str] = None
+
+
+class PROpenBody(BaseModel):
+    patch_run_id: int
+    title: Optional[str] = None
+    body: Optional[str] = None
+
+
 class PRWorkflowBody(BaseModel):
+    """
+    Convenience endpoint payload:
+    - If patch_text not provided, it will generate from (finding_id/objective).
+    - Then apply in sandbox (optionally tests).
+    - Optionally open PR (if enabled and not dry_run).
+    """
     snapshot_id: int
     patch_text: Optional[str] = None
     finding_id: Optional[int] = None
@@ -452,6 +475,10 @@ def _serialize_patch_run(run: Any) -> dict[str, Any]:
         "test_output": getattr(run, "test_output", None),
         "sandbox_path": getattr(run, "sandbox_path", None),
         "created_at": getattr(run, "created_at", None).isoformat() if getattr(run, "created_at", None) else None,
+        "finding_id": getattr(run, "finding_id", None),
+        "objective": getattr(run, "objective", None),
+        "suggested_pr_title": getattr(run, "suggested_pr_title", None),
+        "suggested_pr_body": getattr(run, "suggested_pr_body", None),
     }
 
 
@@ -461,6 +488,9 @@ async def repo_pr_generate(
     body: PRGenerateBody,
     db: Session = Depends(get_db),
 ):
+    """
+    Generate a unified diff for a finding (or objective) and return validation results + suggested PR metadata.
+    """
     _guard_debug(request)
 
     if not settings.LLM_ENABLED:
@@ -487,7 +517,81 @@ async def repo_pr_generate(
         "validation": v,
         "patch_text": gen["patch_text"],
         "snippets_used": gen.get("snippets_used", []),
+        # NEW: surface these so your jq works
+        "suggested_pr_title": gen.get("suggested_pr_title"),
+        "suggested_pr_body": gen.get("suggested_pr_body"),
     }
+
+
+@router.post("/repo/pr/validate")
+def repo_pr_validate(
+    request: Request,
+    snapshot_id: int = Query(..., ge=1),
+    patch_text: str = "",
+    db: Session = Depends(get_db),
+):
+    """
+    Validate a diff against PR policy (allowlist, max files/lines, etc).
+    Useful for debugging why a diff is rejected.
+    """
+    _guard_debug(request)
+
+    pt = (patch_text or "").strip()
+    if not pt:
+        raise HTTPException(status_code=400, detail="patch_text is required.")
+
+    return validate_unified_diff(db, int(snapshot_id), pt)
+
+
+@router.post("/repo/pr/apply")
+async def repo_pr_apply(
+    request: Request,
+    body: PRApplyBody,
+    db: Session = Depends(get_db),
+):
+    """
+    Apply a diff in the sandbox and optionally run tests.
+    Returns the RepoPatchRun summary.
+    """
+    _guard_debug(request)
+
+    if not patch_workflow_enabled():
+        raise HTTPException(status_code=400, detail="Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
+
+    run = await apply_unified_diff_in_sandbox(
+        db=db,
+        snapshot_id=int(body.snapshot_id),
+        patch_text=(body.patch_text or "").strip(),
+        run_tests=bool(body.run_tests),
+        finding_id=int(body.finding_id) if body.finding_id is not None else None,
+        objective=body.objective,
+        suggested_pr_title=body.suggested_pr_title,
+        suggested_pr_body=body.suggested_pr_body,
+    )
+
+    return {"snapshot_id": body.snapshot_id, "run": _serialize_patch_run(run)}
+
+
+@router.post("/repo/pr/open")
+async def repo_pr_open(
+    request: Request,
+    body: PROpenBody,
+    db: Session = Depends(get_db),
+):
+    """
+    Open a PR from an existing patch run.
+    """
+    _guard_debug(request)
+
+    if not pr_workflow_enabled():
+        raise HTTPException(status_code=400, detail="PR workflow disabled (ENABLE_PR_WORKFLOW=false).")
+
+    return await open_pull_request_from_patch_run(
+        db=db,
+        patch_run_id=int(body.patch_run_id),
+        title=body.title,
+        body=body.body,
+    )
 
 
 @router.post("/repo/pr/dry_run")
@@ -496,12 +600,18 @@ async def repo_pr_dry_run(
     body: PRWorkflowBody,
     db: Session = Depends(get_db),
 ):
+    """
+    Convenience: generate (if needed) -> apply -> test.
+    Does NOT open PR (even if PR workflow is enabled). Use /repo/pr/open for that.
+    """
     _guard_debug(request)
 
     if not patch_workflow_enabled():
         raise HTTPException(status_code=400, detail="Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
 
     patch_text = (body.patch_text or "").strip()
+    gen: dict[str, Any] | None = None
+
     if not patch_text:
         if not settings.LLM_ENABLED:
             raise HTTPException(status_code=400, detail="LLM is disabled and patch_text not provided.")
@@ -521,6 +631,10 @@ async def repo_pr_dry_run(
         snapshot_id=int(body.snapshot_id),
         patch_text=patch_text,
         run_tests=bool(body.run_tests),
+        finding_id=int(body.finding_id) if body.finding_id is not None else None,
+        objective=(gen.get("objective") if gen else body.objective),
+        suggested_pr_title=(gen.get("suggested_pr_title") if gen else None),
+        suggested_pr_body=(gen.get("suggested_pr_body") if gen else None),
     )
 
     return {
@@ -532,6 +646,8 @@ async def repo_pr_dry_run(
             "pr_workflow_dry_run": pr_workflow_dry_run(),
         },
         "patch_text": patch_text,
+        "suggested_pr_title": (gen.get("suggested_pr_title") if gen else None),
+        "suggested_pr_body": (gen.get("suggested_pr_body") if gen else None),
         "run": _serialize_patch_run(run),
     }
 
@@ -542,6 +658,10 @@ async def repo_pr_run(
     body: PRWorkflowBody,
     db: Session = Depends(get_db),
 ):
+    """
+    Convenience: generate (if needed) -> apply -> test -> open PR.
+    Hard-gated: must be enabled, and must not be in dry_run mode.
+    """
     _guard_debug(request)
 
     if not patch_workflow_enabled():
@@ -557,6 +677,8 @@ async def repo_pr_run(
         )
 
     patch_text = (body.patch_text or "").strip()
+    gen: dict[str, Any] | None = None
+
     if not patch_text:
         if not settings.LLM_ENABLED:
             raise HTTPException(status_code=400, detail="LLM is disabled and patch_text not provided.")
@@ -576,9 +698,13 @@ async def repo_pr_run(
         snapshot_id=int(body.snapshot_id),
         patch_text=patch_text,
         run_tests=bool(body.run_tests),
+        finding_id=int(body.finding_id) if body.finding_id is not None else None,
+        objective=(gen.get("objective") if gen else body.objective),
+        suggested_pr_title=(gen.get("suggested_pr_title") if gen else None),
+        suggested_pr_body=(gen.get("suggested_pr_body") if gen else None),
     )
 
-    # Hard gates (professional standard):
+    # hard gates
     if not getattr(run, "valid", False):
         return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
     if not getattr(run, "applied", False):
@@ -586,17 +712,15 @@ async def repo_pr_run(
     if bool(body.run_tests) and not getattr(run, "tests_ok", False):
         return {"snapshot_id": body.snapshot_id, "mode": "run", "patch_text": patch_text, "run": _serialize_patch_run(run), "pr": None}
 
-    title = (body.pr_title or "").strip() or "Automated fix from Goal Autopilot"
+    title = (body.pr_title or "").strip() or (getattr(run, "suggested_pr_title", None) or "").strip() or "Automated fix from Goal Autopilot"
 
     pr = await open_pull_request_from_patch_run(
         db=db,
-        snapshot_id=int(body.snapshot_id),
         patch_run_id=int(getattr(run, "id")),
         title=title,
         body=(body.pr_body or None),
     )
 
-    # NOTE: open_pull_request_from_patch_run returns a dict in your implementation.
     return {
         "snapshot_id": body.snapshot_id,
         "mode": "run",
