@@ -26,13 +26,19 @@ class PatchGenerationError(RuntimeError):
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$", re.MULTILINE)
 _PLUSPLUS_RE = re.compile(r"^\+\+\+ b/(.+?)\s*$", re.MULTILINE)
 
+# Only lines valid in a unified diff; anything else is junk that can break git apply.
+_VALID_DIFF_LINE_RE = re.compile(
+    r"^(diff --git |index |--- |\+\+\+ |@@ |\+|-| |\\ No newline at end of file$)"
+)
+
 
 def _llm_temperature() -> float:
     return float(getattr(settings, "PATCH_LLM_TEMPERATURE", 0.1) or 0.1)
 
 
 def _llm_max_tokens() -> int:
-    return int(getattr(settings, "PATCH_LLM_MAX_TOKENS", 2600) or 2600)
+    # give room for complete hunks
+    return int(getattr(settings, "PATCH_LLM_MAX_TOKENS", 3600) or 3600)
 
 
 def _max_files() -> int:
@@ -88,6 +94,7 @@ def _path_allowed(path: str, allow_dirs: list[str], deny_patterns: list[str]) ->
             if re.search(pat, p_norm):
                 return False
         except re.error:
+            # invalid regex -> safest is deny
             return False
 
     return True
@@ -125,15 +132,13 @@ def _reject_new_files(patch_text: str) -> Optional[str]:
 def _extract_unified_diff_from_model_output(text: str) -> str:
     """
     Models often prepend explanations or wrap diffs in fences.
-    We aggressively extract the first real unified diff starting at 'diff --git'.
-
-    If the output contains no 'diff --git', return "".
+    Extract the first real unified diff starting at 'diff --git'.
     """
     raw = (text or "").strip()
     if not raw:
         return ""
 
-    # Strip common ``` fences while keeping content
+    # Strip ``` fences while keeping content
     if raw.startswith("```"):
         raw = raw.strip("`").strip()
         lines = raw.splitlines()
@@ -151,12 +156,64 @@ def _extract_unified_diff_from_model_output(text: str) -> str:
     return diff.strip()
 
 
+def _sanitize_unified_diff(patch_text: str) -> str:
+    """
+    Prevent trailing junk; keep only valid unified diff lines.
+    Stops at first non-diff line.
+    """
+    s = (patch_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return ""
+
+    idx = s.find("diff --git")
+    if idx == -1:
+        return ""
+    s = s[idx:].lstrip()
+
+    lines = s.splitlines()
+    if not lines or not lines[0].lstrip().startswith("diff --git"):
+        return ""
+
+    kept: list[str] = []
+    for ln in lines:
+        if _VALID_DIFF_LINE_RE.match(ln):
+            kept.append(ln)
+        else:
+            break
+
+    out = "\n".join(kept).strip()
+    if out and not out.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def _count_changed_lines(patch_text: str) -> int:
+    """
+    Count real +/- change lines (exclude headers).
+    Must match patch_workflow.validate_unified_diff counting.
+    """
+    n = 0
+    for ln in (patch_text or "").splitlines():
+        if ln.startswith("diff --git") or ln.startswith("index ") or ln.startswith("--- ") or ln.startswith("+++ ") or ln.startswith("@@"):
+            continue
+        if ln.startswith("+") or ln.startswith("-"):
+            n += 1
+    return n
+
+
 def _basic_sanity_check(patch_text: str) -> None:
     s = (patch_text or "").strip()
     if not s:
         raise PatchGenerationError("Empty patch_text from model.")
     if "diff --git " not in s:
         raise PatchGenerationError("Model did not output a unified diff (missing 'diff --git').")
+
+    changed = _count_changed_lines(s)
+    if changed <= 0:
+        raise PatchGenerationError(
+            "Model produced a diff with 0 changed lines (+/-). "
+            "This is a header-only / incomplete diff and will not apply. Refusing to return it."
+        )
 
 
 def _build_system_prompt() -> str:
@@ -165,6 +222,8 @@ def _build_system_prompt() -> str:
         "You MUST output ONLY a unified git diff.\n"
         "The FIRST non-whitespace characters of your response MUST be: diff --git\n"
         "No explanations. No markdown. No code blocks.\n"
+        "Your diff MUST include complete hunks with '-' and/or '+' lines.\n"
+        "Your diff MUST change at least one line (a '+' or '-' line inside a hunk).\n"
         "Do NOT add or delete files.\n"
         "Do NOT modify CI/workflows, Docker/infra, secrets, keys, credentials.\n"
         "Keep changes minimal and tightly scoped.\n"
@@ -190,8 +249,9 @@ def _format_constraints_for_prompt(
         "- Your response MUST start with: diff --git\n"
         "- Do NOT touch any paths outside TARGET_PATHS.\n"
         "- Do NOT create or delete files.\n"
-        "- If you cannot implement the fix without violating rules, output an EMPTY diff (no changes):\n"
-        "  (i.e. output nothing at all)\n"
+        "- The diff MUST contain at least one actual '+' or '-' change line inside a hunk.\n"
+        "- Include enough unchanged context so 'git apply' can match.\n"
+        "- If you cannot implement the fix without violating rules, output NOTHING.\n"
     )
 
 
@@ -215,23 +275,39 @@ def _has_real_text(t: Any) -> bool:
     return isinstance(s, str) and len(s.strip()) >= 40
 
 
+def _extract_candidate_import_lines(snippets: list[dict[str, Any]]) -> list[str]:
+    """
+    Heuristic: pull likely import lines from snippet text to give the LLM anchors.
+    Great for 'unused import' fixes.
+    """
+    out: list[str] = []
+    for s in snippets:
+        txt = str(s.get("text") or "")
+        for ln in txt.splitlines():
+            lns = ln.strip()
+            if lns.startswith("import ") or lns.startswith("from "):
+                if lns not in out:
+                    out.append(lns)
+    return out[:25]
+
+
 async def _search_snippets_for_path(
     *,
     db: Session,
     snapshot_id: int,
     query: str,
     path_contains: str,
-    top_k: int = 5,
+    top_k: int = 12,
 ) -> list[dict[str, Any]]:
     target = _norm_path(path_contains)
 
-    async def _try_search(q: str) -> list[Any]:
+    async def _try_search(q: str, k: int) -> list[Any]:
         try:
             _, hits = await search_chunks(
                 db=db,
                 snapshot_id=snapshot_id,
                 query=q,
-                top_k=top_k,
+                top_k=k,
                 mode="auto",
                 path_contains=target,
                 include_text=True,  # if supported
@@ -242,25 +318,26 @@ async def _search_snippets_for_path(
                 db=db,
                 snapshot_id=snapshot_id,
                 query=q,
-                top_k=top_k,
+                top_k=k,
                 mode="auto",
                 path_contains=target,
             )
             return hits or []
 
-    hits = await _try_search(query)
+    hits = await _try_search(query, top_k)
 
     if not hits:
         base = os.path.basename(target)
         fallback_queries = [
-            "LLMClient",
-            "complete_json",
-            "provider",
+            "unused import",
+            "import",
+            "from",
+            "router",
             base if len(base) >= 2 else "",
-            " ".join([w for w in query.split()[:6] if len(w) >= 2]),
+            " ".join([w for w in query.split()[:8] if len(w) >= 2]),
         ]
         for fq in [x for x in fallback_queries if x.strip()]:
-            hits = await _try_search(fq)
+            hits = await _try_search(fq, top_k)
             if hits:
                 break
 
@@ -285,8 +362,10 @@ async def _search_snippets_for_path(
                 }
             )
 
+    # Keep only the exact target file
     snippets = [s for s in snippets if _norm_path(str(s.get("path") or "")) == target]
 
+    # Fallback: pull first N chunks for that file directly (stable anchoring)
     if not snippets or not any(_has_real_text(s.get("text")) for s in snippets):
         rows = (
             db.execute(
@@ -345,7 +424,6 @@ def _safe_json_dict(obj: Any) -> dict[str, Any]:
 
 def _fallback_pr_title(*, finding: RepoFinding) -> str:
     base = (str(getattr(finding, "title", "") or "").strip() or "Apply repo finding fix")
-    # keep it PR-friendly and short
     if len(base) > 90:
         base = base[:87].rstrip() + "..."
     return base
@@ -383,10 +461,7 @@ async def _generate_pr_metadata(
     patch_text: str,
 ) -> tuple[str, str]:
     """
-    Second bounded LLM call: produce PR title/body as JSON.
-
-    IMPORTANT: This must never return (None, None).
-    If the LLM fails or returns empty fields, we fall back to deterministic metadata.
+    Always returns non-empty title/body (fallbacks if LLM fails).
     """
     fallback_title = _fallback_pr_title(finding=finding)
     fallback_body = _fallback_pr_body(finding=finding, snap=snap, patch_text=patch_text)
@@ -424,7 +499,6 @@ async def _generate_pr_metadata(
         title = str(d.get("title") or "").strip()
         body = str(d.get("body") or "").strip()
 
-        # enforce guardrails
         if title:
             title = title[:300].strip()
         if body:
@@ -438,6 +512,23 @@ async def _generate_pr_metadata(
         return (title, body)
     except Exception:
         return (fallback_title, fallback_body)
+
+
+def _build_retry_hint(attempt: int) -> str:
+    if attempt <= 1:
+        return (
+            "Retry hint: your previous diff was incomplete (no '+' or '-' lines). "
+            "You MUST output a COMPLETE diff that actually removes or changes code."
+        )
+    if attempt == 2:
+        return (
+            "Retry hint: include enough unchanged context lines from the snippet so 'git apply' can match. "
+            "Remove the exact unused import line (use the anchor list below)."
+        )
+    return (
+        "Retry hint: your last output still did not include real hunk changes. "
+        "Use the exact import line text from the anchors; delete it in a proper hunk."
+    )
 
 
 async def generate_patch_for_finding(
@@ -484,7 +575,7 @@ async def generate_patch_for_finding(
         snapshot_id=snapshot_id,
         query=q,
         path_contains=finding_path,
-        top_k=5,
+        top_k=12,
     )
 
     if not snippets:
@@ -495,67 +586,109 @@ async def generate_patch_for_finding(
 
     objective_text = (objective or "").strip() or f"Implement the recommendation for the finding titled: {finding.title}"
 
-    user_prompt = (
-        f"{_format_constraints_for_prompt(allow_dirs=allow, deny_patterns=deny, target_paths=target_paths)}\n\n"
-        "Target finding:\n"
-        f"- id: {finding.id}\n"
-        f"- category: {finding.category}\n"
-        f"- severity: {finding.severity}\n"
-        f"- title: {finding.title}\n"
-        f"- path: {finding.path}\n"
-        f"- line: {finding.line}\n"
-        f"- evidence: {finding.evidence}\n"
-        f"- recommendation: {finding.recommendation}\n"
-        f"- acceptance: {getattr(finding, 'acceptance', None)}\n\n"
-        "Objective:\n"
-        f"{objective_text}\n\n"
-        f"{_format_context_for_prompt(snippets)}\n"
-        "IMPORTANT: Output ONLY a unified diff, and start your response with: diff --git\n"
-    )
-
-    llm = LLMClient()
-    raw_out = await llm.chat(
-        system=_build_system_prompt(),
-        user=user_prompt,
-        temperature=_llm_temperature(),
-        max_tokens=_llm_max_tokens(),
-        response_format={"type": "text"},
-        force_text_response_format=True,
-    )
-
-    raw_out = (raw_out or "").strip()
-    patch_text = _extract_unified_diff_from_model_output(raw_out)
-
-    if not patch_text:
-        raise PatchGenerationError(
-            "Model did not return a unified diff. "
-            "It must start with 'diff --git'. Try again or tighten the prompt/model."
+    import_anchors = _extract_candidate_import_lines(snippets)
+    anchors_text = ""
+    if import_anchors:
+        anchors_text = (
+            "Potential import lines in this file (anchors; use exact text if you remove one):\n"
+            + "\n".join([f"- {ln}" for ln in import_anchors])
+            + "\n\n"
         )
 
-    _basic_sanity_check(patch_text)
+    llm = LLMClient()
 
-    nf_err = _reject_new_files(patch_text)
-    if nf_err:
-        raise PatchGenerationError(nf_err)
+    patch_text: str = ""
+    last_err: str | None = None
 
-    touched = _extract_touched_paths(patch_text)
-    if not touched:
-        raise PatchGenerationError("Could not extract any touched paths from diff headers.")
+    # IMPORTANT FIX:
+    # The sanity check throws for header-only diffs. That MUST NOT abort the whole request.
+    # Instead: catch PatchGenerationError and keep retrying.
+    for attempt in range(1, 5):  # 4 attempts gives the model another swing
+        retry_hint = _build_retry_hint(attempt)
 
-    for p in touched:
-        if _norm_path(p) not in [_norm_path(tp) for tp in target_paths]:
-            raise PatchGenerationError(f"Generated patch touches non-target path: {p}")
+        user_prompt = (
+            f"{_format_constraints_for_prompt(allow_dirs=allow, deny_patterns=deny, target_paths=target_paths)}\n\n"
+            f"{retry_hint}\n\n"
+            "Target finding:\n"
+            f"- id: {finding.id}\n"
+            f"- category: {finding.category}\n"
+            f"- severity: {finding.severity}\n"
+            f"- title: {finding.title}\n"
+            f"- path: {finding.path}\n"
+            f"- line: {finding.line}\n"
+            f"- evidence: {finding.evidence}\n"
+            f"- recommendation: {finding.recommendation}\n"
+            f"- acceptance: {getattr(finding, 'acceptance', None)}\n\n"
+            "Objective:\n"
+            f"{objective_text}\n\n"
+            f"{anchors_text}"
+            f"{_format_context_for_prompt(snippets)}\n"
+            "IMPORTANT:\n"
+            "- Output ONLY a unified diff.\n"
+            "- Start your response with: diff --git\n"
+            "- Include complete hunks with '-' and/or '+' lines.\n"
+            "- Make the smallest change that fixes the finding.\n"
+        )
 
-    for p in touched:
-        if not _path_allowed(p, allow, deny):
-            raise PatchGenerationError(f"Generated patch touches disallowed path: {p}")
+        raw_out = await llm.chat(
+            system=_build_system_prompt(),
+            user=user_prompt,
+            temperature=_llm_temperature(),
+            max_tokens=_llm_max_tokens(),
+            response_format={"type": "text"},
+            force_text_response_format=True,
+        )
 
-    # PR metadata must never be null/empty now.
+        candidate = _extract_unified_diff_from_model_output((raw_out or "").strip())
+        candidate = _sanitize_unified_diff(candidate)
+
+        if not candidate:
+            last_err = "Model did not produce a diff starting with 'diff --git'."
+            continue
+
+        try:
+            _basic_sanity_check(candidate)
+        except PatchGenerationError as e:
+            # THIS is the critical behavior change.
+            # We capture and retry instead of failing the whole request on attempt 1.
+            last_err = str(e)
+            continue
+
+        nf_err = _reject_new_files(candidate)
+        if nf_err:
+            raise PatchGenerationError(nf_err)
+
+        touched = _extract_touched_paths(candidate)
+        if not touched:
+            last_err = "Could not extract touched paths from diff headers."
+            continue
+
+        for p in touched:
+            if _norm_path(p) not in [_norm_path(tp) for tp in target_paths]:
+                raise PatchGenerationError(f"Generated patch touches non-target path: {p}")
+            if not _path_allowed(p, allow, deny):
+                raise PatchGenerationError(f"Generated patch touches disallowed path: {p}")
+
+        patch_text = candidate
+        break
+
+    if not patch_text:
+        msg = (
+            "Model failed to produce a complete unified diff with actual changes (+/- lines). "
+            "Last error: "
+            + (last_err or "(unknown)")
+        )
+        raise PatchGenerationError(msg)
+
     pr_title, pr_body = await _generate_pr_metadata(
         finding=finding,
         snap=snap,
         patch_text=patch_text,
     )
+
+    # Absolute guarantee: never return nulls
+    pr_title = (pr_title or "").strip() or _fallback_pr_title(finding=finding)
+    pr_body = (pr_body or "").strip() or _fallback_pr_body(finding=finding, snap=snap, patch_text=patch_text)
 
     return {
         "snapshot_id": snapshot_id,

@@ -122,9 +122,9 @@ class Settings(BaseSettings):
     # -----------------------
     # --- PR workflow (Level 3) ---
     # -----------------------
-    ENABLE_PATCH_WORKFLOW: bool = False
+    ENABLE_PATCH_WORKFLOW: bool = True
     ENABLE_PR_WORKFLOW: bool = True
-    PR_WORKFLOW_DRY_RUN: bool = True
+    PR_WORKFLOW_DRY_RUN: bool = False
 
     # Paths allowed to be modified by PR workflow (relative to repo root)
     PR_ALLOWLIST_DIRS: List[str] = Field(default_factory=lambda: ["backend/", "onehaven/backend/"])
@@ -136,8 +136,6 @@ class Settings(BaseSettings):
     # Patch application/test settings
     PR_TEST_CMD: str = "pytest -q"
     PR_TIMEOUT_SECONDS: int = 900
-
-    ENABLE_PATCH_WORKFLOW: bool = False
 
     # Optional: keep temp dirs for debugging
     KEEP_PATCH_SANDBOX: bool = False
