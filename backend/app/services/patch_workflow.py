@@ -202,15 +202,62 @@ def _run(cmd: str, *, cwd: str, timeout_s: int, input_text: Optional[str] = None
         return _CmdResult(ok=False, out=f"Command timed out after {timeout_s}s: {cmd}")
 
 
+def _normalize_patch_text(patch_text: str) -> str:
+    """
+    Make git apply parsing reliable.
+
+    Fixes common real-world issues:
+    - UTF-8 BOM at start (can appear from copy/paste or model output)
+    - CRLF/CR line endings (Windows) -> LF
+    - Ensures trailing newline
+    - Trims surrounding whitespace without destroying internal structure
+    """
+    s = patch_text or ""
+    # Strip BOM if present
+    s = s.lstrip("\ufeff")
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Trim only outer whitespace
+    s = s.strip()
+    # Ensure newline at end
+    if s and not s.endswith("\n"):
+        s += "\n"
+    return s
+
+
 def _materialize_repo_root(db: Session, snapshot_id: int, tmpdir: str) -> str:
     """
-    Back-compat: older materialize_snapshot_to_disk() versions may not accept dest_dir.
-    We try dest_dir first; if it TypeErrors, we call the legacy signature.
+    Materialize snapshot into the sandbox dir.
+
+    Your error earlier showed materialize_snapshot_to_disk() requires a destination argument.
+    So we must pass tmpdir in a way compatible with multiple historical signatures.
+
+    Tries (in order):
+      1) dest_root=tmpdir
+      2) dest_dir=tmpdir
+      3) positional (db, snapshot_id, tmpdir)
+      4) last resort: call without dest ONLY if the function supports a default (some older versions do)
     """
+    # 1) canonical (recommended)
+    try:
+        return materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id, dest_root=tmpdir)
+    except TypeError:
+        pass
+
+    # 2) older keyword name
     try:
         return materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id, dest_dir=tmpdir)  # type: ignore[arg-type]
     except TypeError:
-        return materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id)
+        pass
+
+    # 3) positional legacy
+    try:
+        return materialize_snapshot_to_disk(db, snapshot_id, tmpdir)  # type: ignore[misc]
+    except TypeError:
+        pass
+
+    # 4) only works if dest_root is optional in that codebase version
+    return materialize_snapshot_to_disk(db=db, snapshot_id=snapshot_id)  # type: ignore[call-arg]
 
 
 async def apply_unified_diff_in_sandbox(
@@ -229,6 +276,8 @@ async def apply_unified_diff_in_sandbox(
     """
     if not patch_workflow_enabled():
         raise RuntimeError("Patch workflow disabled (ENABLE_PATCH_WORKFLOW=false).")
+
+    patch_text = _normalize_patch_text(patch_text)
 
     v = validate_unified_diff(db, snapshot_id, patch_text)
     valid = bool(v.get("valid"))
@@ -275,11 +324,20 @@ async def apply_unified_diff_in_sandbox(
         run.sandbox_path = repo_root
         db.commit()
 
+        # Write the patch with normalized newlines to avoid parser issues in git apply.
         patch_path = os.path.join(repo_root, "_patch.diff")
-        with open(patch_path, "w", encoding="utf-8") as f:
+        with open(patch_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(patch_text)
 
-        r = _run(f"git apply --whitespace=nowarn {patch_path}", cwd=repo_root, timeout_s=60)
+        # Preflight check gives a clearer error than apply when patches are malformed.
+        chk = _run("git apply --check --whitespace=nowarn _patch.diff", cwd=repo_root, timeout_s=60)
+        if not chk.ok:
+            run.applied = False
+            run.apply_error = chk.out
+            db.commit()
+            return run
+
+        r = _run("git apply --whitespace=nowarn _patch.diff", cwd=repo_root, timeout_s=60)
         run.applied = bool(r.ok)
         run.apply_error = None if r.ok else r.out
         db.commit()
@@ -342,12 +400,20 @@ async def open_pull_request_from_patch_run(
     repo = _github_repo()
     base_branch = _github_branch()
 
-    pr_title = (title or "").strip() or (getattr(run, "suggested_pr_title", None) or "").strip() or f"Fix: repo finding (snapshot {run.snapshot_id})"
-    pr_body = (body or "").strip() or (getattr(run, "suggested_pr_body", None) or "").strip() or (
-        "Automated patch from Goal Autopilot.\n\n"
-        "- Generated from repo finding\n"
-        "- Applied in sandbox\n"
-        "- Tests passed (if configured)\n"
+    pr_title = (
+        (title or "").strip()
+        or (getattr(run, "suggested_pr_title", None) or "").strip()
+        or f"Fix: repo finding (snapshot {run.snapshot_id})"
+    )
+    pr_body = (
+        (body or "").strip()
+        or (getattr(run, "suggested_pr_body", None) or "").strip()
+        or (
+            "Automated patch from Goal Autopilot.\n\n"
+            "- Generated from repo finding\n"
+            "- Applied in sandbox\n"
+            "- Tests passed (if configured)\n"
+        )
     )
 
     pr_body = (

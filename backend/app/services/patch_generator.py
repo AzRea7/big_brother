@@ -343,16 +343,54 @@ def _safe_json_dict(obj: Any) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {}
 
 
+def _fallback_pr_title(*, finding: RepoFinding) -> str:
+    base = (str(getattr(finding, "title", "") or "").strip() or "Apply repo finding fix")
+    # keep it PR-friendly and short
+    if len(base) > 90:
+        base = base[:87].rstrip() + "..."
+    return base
+
+
+def _fallback_pr_body(*, finding: RepoFinding, snap: RepoSnapshot, patch_text: str) -> str:
+    touched = _extract_touched_paths(patch_text)
+    touched_md = "\n".join([f"- `{p}`" for p in touched]) if touched else "- (unable to parse paths from diff)"
+
+    rec = str(getattr(finding, "recommendation", "") or "").strip()
+    if not rec:
+        rec = "Address an automated repo finding."
+
+    return (
+        "## Summary\n"
+        f"- Fix: **{str(getattr(finding, 'title', '') or '').strip() or 'Repo finding'}**\n\n"
+        "## Why\n"
+        f"- {rec}\n\n"
+        "## How Verified\n"
+        "- Not run. Recommended: run unit tests and targeted smoke checks for the touched area.\n\n"
+        "## Files Touched\n"
+        f"{touched_md}\n\n"
+        "## Traceability\n"
+        f"- Repo: {snap.repo}\n"
+        f"- Branch: {snap.branch}\n"
+        f"- Snapshot: {snap.id}\n"
+        f"- Finding: {finding.id}\n"
+    )
+
+
 async def _generate_pr_metadata(
     *,
     finding: RepoFinding,
     snap: RepoSnapshot,
     patch_text: str,
-) -> tuple[str | None, str | None]:
+) -> tuple[str, str]:
     """
     Second bounded LLM call: produce PR title/body as JSON.
-    Failure is non-fatal: returns (None, None).
+
+    IMPORTANT: This must never return (None, None).
+    If the LLM fails or returns empty fields, we fall back to deterministic metadata.
     """
+    fallback_title = _fallback_pr_title(finding=finding)
+    fallback_body = _fallback_pr_body(finding=finding, snap=snap, patch_text=patch_text)
+
     try:
         llm = LLMClient()
         patch_excerpt = _truncate(patch_text, 6000)
@@ -386,14 +424,20 @@ async def _generate_pr_metadata(
         title = str(d.get("title") or "").strip()
         body = str(d.get("body") or "").strip()
 
+        # enforce guardrails
         if title:
-            title = title[:300]
+            title = title[:300].strip()
         if body:
             body = body.strip()
 
-        return (title or None, body or None)
+        if not title:
+            title = fallback_title
+        if not body:
+            body = fallback_body
+
+        return (title, body)
     except Exception:
-        return (None, None)
+        return (fallback_title, fallback_body)
 
 
 async def generate_patch_for_finding(
@@ -506,7 +550,7 @@ async def generate_patch_for_finding(
         if not _path_allowed(p, allow, deny):
             raise PatchGenerationError(f"Generated patch touches disallowed path: {p}")
 
-    # NEW: generate PR title/body (non-fatal)
+    # PR metadata must never be null/empty now.
     pr_title, pr_body = await _generate_pr_metadata(
         finding=finding,
         snap=snap,
